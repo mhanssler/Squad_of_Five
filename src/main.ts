@@ -3,6 +3,12 @@ import { BootScene } from './scenes/BootScene';
 import { MenuScene } from './scenes/MenuScene';
 import { GameScene } from './scenes/GameScene';
 import { UIScene } from './scenes/UIScene';
+import { installEpicMusic } from './utils/EpicMusicManager';
+import { SoundManager } from './utils/SoundManager';
+
+// Preserve the existing scene and sound-effect API while replacing the simple
+// oscillator soundtrack with the layered cinematic playlist.
+installEpicMusic(SoundManager);
 
 const config: Phaser.Types.Core.GameConfig = {
   type: Phaser.AUTO,
