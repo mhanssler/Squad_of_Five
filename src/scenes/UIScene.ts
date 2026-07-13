@@ -33,6 +33,7 @@ interface SoldierInfo {
 }
 
 interface CharacterSelectionInfo {
+  team: Team;
   soldier: SoldierInfo;
   weapon: WeaponInfo;
   currentIndex: number;
@@ -191,6 +192,11 @@ export class UIScene extends Phaser.Scene {
   }
 
   private showTacReadout(info: CharacterSelectionInfo): void {
+    // The header otherwise keeps showing the previous turn while a new team picks a soldier.
+    const teamName = info.team === Team.RED ? 'Red' : 'Blue';
+    this.teamText.setText(`${teamName} Team — choose a soldier`);
+    this.teamText.setColor(info.team === Team.RED ? '#ff6666' : '#6666ff');
+
     // Clear existing panel
     this.tacReadoutPanel.removeAll(true);
     

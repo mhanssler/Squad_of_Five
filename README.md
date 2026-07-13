@@ -58,6 +58,7 @@ Menu:
 
 In-game (high level):
 
+- Space/Enter/Esc or click: skip the intro sequence
 - Left/Right: move
 - W/S: aim
 - Space or Left Mouse Button: fire (hold to charge, release to shoot)

@@ -26,4 +26,7 @@ const config: Phaser.Types.Core.GameConfig = {
   roundPixels: true,
 };
 
-new Phaser.Game(config);
+const game = new Phaser.Game(config);
+
+// Expose for debugging/automation (e.g. driving the game from devtools).
+(window as any).game = game;

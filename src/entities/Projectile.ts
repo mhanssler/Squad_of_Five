@@ -2,6 +2,12 @@ import Phaser from 'phaser';
 import { WeaponConfig, WeaponType } from '../systems/WeaponTypes';
 import { Terrain } from '../systems/Terrain';
 import { SoundManager } from '../utils/SoundManager';
+import type { Soldier } from './Soldier';
+
+// How long a newly fired explosive ignores its own shooter. Prevents point-blank self-detonation
+// at spawn (the muzzle sits inside the shooter's hit circle for downward aims) while still letting
+// a badly thrown grenade bounce back and punish you.
+const SHOOTER_GRACE_MS = 400;
 
 // Bullet weapon types - these do direct damage without explosions
 const BULLET_WEAPONS: WeaponType[] = [
@@ -11,6 +17,8 @@ const BULLET_WEAPONS: WeaponType[] = [
   WeaponType.SMG,
   WeaponType.MINIGUN,
   WeaponType.SHOTGUN,
+  WeaponType.CARBINE,
+  WeaponType.SLUG,
 ];
 
 // Play weapon sound based on type
@@ -23,12 +31,14 @@ function playWeaponSound(type: WeaponType): void {
       SoundManager.playPistolShot();
       break;
     case WeaponType.SMG:
+    case WeaponType.CARBINE:
       SoundManager.playSMGShot();
       break;
     case WeaponType.MINIGUN:
       SoundManager.playMinigunShot();
       break;
     case WeaponType.SHOTGUN:
+    case WeaponType.SLUG:
       SoundManager.playShotgunBlast();
       break;
     case WeaponType.SNIPER:
@@ -60,6 +70,8 @@ export class Projectile {
   private lastX: number;
   private lastY: number;
   private flightSound: { update: (vx: number, vy: number) => void; stop: () => void } | null = null;
+  private shooter: Soldier | null;
+  private spawnedAt: number;
 
   constructor(
     scene: Phaser.Scene,
@@ -68,11 +80,14 @@ export class Projectile {
     velocityX: number,
     velocityY: number,
     config: WeaponConfig,
-    terrain: Terrain
+    terrain: Terrain,
+    shooter: Soldier | null = null
   ) {
     this.scene = scene;
     this.config = config;
     this.terrain = terrain;
+    this.shooter = shooter;
+    this.spawnedAt = scene.time.now;
     this.isBullet = BULLET_WEAPONS.includes(config.type);
 
     // Create projectile sprite
@@ -190,15 +205,21 @@ export class Projectile {
   }
 
   private checkSoldierCollision(): void {
+    // Bullets can never hit their own shooter (they outrun the soldier instantly).
+    // Explosives only ignore the shooter during a short spawn grace window.
+    const withinGrace = this.scene.time.now - this.spawnedAt < SHOOTER_GRACE_MS;
+    const excludedSoldier = this.isBullet ? this.shooter : (withinGrace ? this.shooter : null);
+
     // Emit event for GameScene to check if projectile hit any soldiers
     // Pass current position, last position, and callback to handle hit
-    this.scene.events.emit('check-soldier-hit', 
-      this.lastX, 
-      this.lastY, 
-      this.sprite.x, 
+    this.scene.events.emit('check-soldier-hit',
+      this.lastX,
+      this.lastY,
+      this.sprite.x,
       this.sprite.y,
       this.config.damage,
       this.isBullet,
+      excludedSoldier,
       (hitX: number, hitY: number) => {
         // Callback when a soldier is hit
         if (this.isBullet) {
@@ -291,13 +312,16 @@ export class Projectile {
     // Create small impact effect (dust/sparks, no big explosion)
     this.createBulletImpactEffect(x, y);
 
-    // Emit hit event - bullets do direct damage in a tiny area
+    // Emit hit event - bullets do direct damage using their configured explosion radius.
+    // The shooter is passed so their own bullets' ground-impact splash can't chip them
+    // (explosives intentionally keep self-splash; bullets shouldn't).
     this.scene.events.emit(
-      'projectile-explode', 
-      x, 
-      y, 
-      5, // Very small impact radius for bullets
-      this.config.damage
+      'projectile-explode',
+      x,
+      y,
+      this.config.explosionRadius,
+      this.config.damage,
+      this.shooter
     );
 
     // Cleanup
@@ -397,6 +421,7 @@ export class FlameJet {
   private damagePerTick: number;
   private tickCount: number = 0;
   private maxTicks: number = 30; // About 1 second of flame
+  private shooter: Soldier | null;
 
   constructor(
     scene: Phaser.Scene,
@@ -405,10 +430,12 @@ export class FlameJet {
     angle: number,
     power: number,
     config: WeaponConfig,
-    terrain: Terrain
+    terrain: Terrain,
+    shooter: Soldier | null = null
   ) {
     this.scene = scene;
     this.terrain = terrain;
+    this.shooter = shooter;
     this.startX = x;
     this.startY = y;
     this.angle = Phaser.Math.DegToRad(angle);
@@ -490,27 +517,31 @@ export class FlameJet {
   }
 
   private dealDamageAlongPath(): void {
-    // Check multiple points along the flame path for soldier hits
+    // Find how far the flame reaches before terrain blocks it.
+    let effectiveRange = this.maxRange;
     const steps = 10;
     for (let i = 1; i <= steps; i++) {
       const distance = (i / steps) * this.maxRange;
       const x = this.startX + Math.cos(this.angle) * distance;
       const y = this.startY + Math.sin(this.angle) * distance;
-
-      // Stop if we hit terrain
       if (this.terrain.isPointSolid(x, y)) {
+        effectiveRange = distance;
         break;
       }
-
-      // Emit damage event at this point (small radius)
-      this.scene.events.emit(
-        'flame-damage',
-        x,
-        y,
-        25, // Damage radius
-        this.damagePerTick
-      );
     }
+
+    // One wave = one damage application per soldier caught in the cone.
+    // (Per-point events used to stack 2-4x on the same soldier, one-shotting anyone touched.)
+    // The shooter is excluded — the jet starts right at their own body and used to roast them.
+    this.scene.events.emit(
+      'flame-wave',
+      this.startX,
+      this.startY,
+      this.angle,
+      effectiveRange,
+      this.damagePerTick,
+      this.shooter
+    );
   }
 
   public getPosition(): { x: number; y: number } {
@@ -608,18 +639,19 @@ export function createProjectile(
   angle: number,
   power: number,
   config: WeaponConfig,
-  terrain: Terrain
+  terrain: Terrain,
+  shooter: Soldier | null = null
 ): Projectile | Projectile[] | FlameJet {
   const velocity = (power / 100) * config.projectileSpeed;
   const angleRad = Phaser.Math.DegToRad(angle);
 
   // Special handling for flamethrower
   if (config.type === WeaponType.FLAMER) {
-    return new FlameJet(scene, x, y, angle, power, config, terrain);
+    return new FlameJet(scene, x, y, angle, power, config, terrain, shooter);
   }
 
   // Rapid-fire weapons (rifle, SMG, pistol, minigun) - fire in sequence
-  const rapidFireWeapons = [WeaponType.RIFLE, WeaponType.SMG, WeaponType.PISTOL, WeaponType.MINIGUN];
+  const rapidFireWeapons = [WeaponType.RIFLE, WeaponType.SMG, WeaponType.PISTOL, WeaponType.MINIGUN, WeaponType.CARBINE];
   
   if (config.pelletCount > 1 && rapidFireWeapons.includes(config.type)) {
     const projectiles: Projectile[] = [];
@@ -630,6 +662,7 @@ export function createProjectile(
     let fireDelay = 40;
     if (config.type === WeaponType.MINIGUN) fireDelay = 10;
     else if (config.type === WeaponType.SMG) fireDelay = 25;
+    else if (config.type === WeaponType.CARBINE) fireDelay = 32;
     else if (config.type === WeaponType.RIFLE) fireDelay = 35;
     else if (config.type === WeaponType.PISTOL) fireDelay = 70;
     
@@ -641,8 +674,8 @@ export function createProjectile(
         
         const velX = Math.cos(pelletAngle) * velocity;
         const velY = Math.sin(pelletAngle) * velocity;
-        
-        const projectile = new Projectile(scene, x, y, velX, velY, config, terrain);
+
+        const projectile = new Projectile(scene, x, y, velX, velY, config, terrain, shooter);
         projectiles.push(projectile);
 
         // Shot bookkeeping: emit for every spawned projectile.
@@ -686,8 +719,8 @@ export function createProjectile(
       
       const velX = Math.cos(pelletAngle) * velocity;
       const velY = Math.sin(pelletAngle) * velocity;
-      
-      const projectile = new Projectile(scene, x, y, velX, velY, config, terrain);
+
+      const projectile = new Projectile(scene, x, y, velX, velY, config, terrain, shooter);
       projectiles.push(projectile);
       scene.events.emit('projectile-spawned', projectile);
     }
@@ -700,7 +733,7 @@ export function createProjectile(
     // Single projectile (sniper, grenade, rocket, mortar)
     const velX = Math.cos(angleRad) * velocity;
     const velY = Math.sin(angleRad) * velocity;
-    const projectile = new Projectile(scene, x, y, velX, velY, config, terrain);
+    const projectile = new Projectile(scene, x, y, velX, velY, config, terrain, shooter);
     scene.events.emit('projectile-spawned', projectile);
     
     // Play weapon sound for single-shot weapons

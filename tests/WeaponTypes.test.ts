@@ -14,11 +14,14 @@ describe('WeaponTypes', () => {
       expect(WeaponType.PISTOL).toBe('pistol');
       expect(WeaponType.SMG).toBe('smg');
       expect(WeaponType.MINIGUN).toBe('minigun');
+      expect(WeaponType.CARBINE).toBe('carbine');
+      expect(WeaponType.SLUG).toBe('slug');
+      expect(WeaponType.DEMO).toBe('demo');
     });
 
-    it('should have exactly 10 weapon types', () => {
+    it('should have exactly 13 weapon types', () => {
       const weaponTypes = Object.values(WeaponType);
-      expect(weaponTypes.length).toBe(10);
+      expect(weaponTypes.length).toBe(13);
     });
   });
 
@@ -180,14 +183,23 @@ describe('WeaponTypes', () => {
 
 describe('Weapon balance sanity checks', () => {
   it('bullet weapons should have low/no explosion radius', () => {
-    const bulletWeapons = [WeaponType.RIFLE, WeaponType.SNIPER, WeaponType.PISTOL, WeaponType.SMG, WeaponType.MINIGUN, WeaponType.SHOTGUN];
+    const bulletWeapons = [
+      WeaponType.RIFLE,
+      WeaponType.SNIPER,
+      WeaponType.PISTOL,
+      WeaponType.SMG,
+      WeaponType.MINIGUN,
+      WeaponType.SHOTGUN,
+      WeaponType.CARBINE,
+      WeaponType.SLUG,
+    ];
     for (const type of bulletWeapons) {
       expect(WEAPONS[type].explosionRadius).toBeLessThanOrEqual(20);
     }
   });
 
   it('explosive weapons should have larger explosion radius', () => {
-    const explosiveWeapons = [WeaponType.GRENADE, WeaponType.ROCKET, WeaponType.MORTAR];
+    const explosiveWeapons = [WeaponType.GRENADE, WeaponType.ROCKET, WeaponType.MORTAR, WeaponType.DEMO];
     for (const type of explosiveWeapons) {
       expect(WEAPONS[type].explosionRadius).toBeGreaterThanOrEqual(50);
     }

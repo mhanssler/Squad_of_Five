@@ -7,12 +7,25 @@ import { WeaponConfig, WeaponType, WEAPONS } from '../systems/WeaponTypes';
 import { SoundManager } from '../utils/SoundManager';
 
 // Base movement distance (modified by weapon weight)
-const BASE_MOVEMENT_DISTANCE = 200;
+const BASE_MOVEMENT_DISTANCE = 320;
 const POWER_MIN = 10;
-// Power charge rate (0-100) per second. Lower = easier to time shots.
-const POWER_CHARGE_PER_SECOND = 30;
+// Power now cycles while held, making release timing matter instead of always settling at max.
+// ~2.6s to full charge: fast charge made overshooting the intended power too easy.
+const POWER_CHARGE_UP_PER_SECOND = 35;
+const POWER_CHARGE_DOWN_PER_SECOND = 45;
 
-type SupplyDropType = 'medkit' | 'airstrike' | 'artillery';
+// Mouse aim is smoothed toward the pointer direction instead of snapping, and ignores
+// pointer positions right on top of the soldier where the angle flips wildly.
+const MOUSE_AIM_TURN_SPEED_DEG_PER_SEC = 240;
+const MOUSE_AIM_DEADZONE_PX = 26;
+
+// Normalize an angle in degrees to [-180, 180].
+function wrapDeg(angle: number): number {
+  return ((angle + 180) % 360 + 360) % 360 - 180;
+}
+const DEFAULT_MOVE_SPEED = 180;
+
+type SupplyDropType = 'medkit' | 'airstrike' | 'artillery' | 'armor' | 'munitions';
 
 const SUPPLY_DROP_HP = 50;
 const SUPPLY_DROP_RADIUS = 26; // Approx collision radius for damage checks
@@ -86,6 +99,13 @@ type SupplyDrop = {
   hp: number;
 };
 
+type AIShotPlan = {
+  target: Soldier;
+  angle: number;
+  power: number;
+  score: number;
+};
+
 export class GameScene extends Phaser.Scene {
   // Battlefield dimensions (wider than viewport). Configurable via MenuScene.
   private worldWidth: number = 2560;
@@ -126,7 +146,8 @@ export class GameScene extends Phaser.Scene {
   private eKey!: Phaser.Input.Keyboard.Key;
   private tabKey!: Phaser.Input.Keyboard.Key;
   private nKey!: Phaser.Input.Keyboard.Key;
-  private gKey!: Phaser.Input.Keyboard.Key;
+private gKey!: Phaser.Input.Keyboard.Key;
+  private shiftKey!: Phaser.Input.Keyboard.Key;
   private bKey!: Phaser.Input.Keyboard.Key;
   private hKey!: Phaser.Input.Keyboard.Key;
   private xKey!: Phaser.Input.Keyboard.Key;
@@ -139,9 +160,12 @@ export class GameScene extends Phaser.Scene {
   // Aiming (completely separate from movement)
   private aimAngle: number = -45; // Degrees, -90 is straight up
   private power: number = 50; // 0-100
+  private powerChargeDirection: 1 | -1 = 1;
   private lastAimInput: 'mouse' | 'keys' = 'keys';
+  private mouseAimTargetAngle: number | null = null; // Smoothed toward, never snapped
   private isCharging: boolean = false;
   private aimLine!: Phaser.GameObjects.Graphics;
+  private aimPowerText!: Phaser.GameObjects.Text;
   private hasFired: boolean = false;
   private isTurnEnding: boolean = false; // Prevent double endTurn calls
 
@@ -178,6 +202,17 @@ export class GameScene extends Phaser.Scene {
 
   // State flags
   private isResetting: boolean = false;
+
+  // Intro sequence (bombardment + paradrop) — skippable so restarts aren't a 15s wait.
+  private introToken: number = 0;
+  private introDone: boolean = true;
+  private introSkipped: boolean = false;
+  private introHintText: Phaser.GameObjects.Text | null = null;
+  private introOverlayObjects: Phaser.GameObjects.GameObject[] = [];
+  private paraDropPlans: Array<{ x: number; team: Team; name: string; index: number; weaponId: string; spawned: boolean }> = [];
+  private activeDescents: Array<{ soldier: Soldier; parachute: Phaser.GameObjects.Container; landingY: number }> = [];
+  private soldiersExpected: number = 10;
+  private soldiersLanded: number = 0;
 
   // Balance events / airdrops
   private supplyDrops: SupplyDrop[] = [];
@@ -229,6 +264,17 @@ export class GameScene extends Phaser.Scene {
     this.aimLine = this.add.graphics();
     this.aimLine.setDepth(100);
 
+    // Numeric power readout shown while charging (precision was hard with just the bar)
+    this.aimPowerText = this.add.text(0, 0, '', {
+      font: 'bold 13px Arial',
+      color: '#ffffff',
+      stroke: '#000000',
+      strokeThickness: 3,
+    });
+    this.aimPowerText.setOrigin(0.5, 1);
+    this.aimPowerText.setDepth(150);
+    this.aimPowerText.setVisible(false);
+
     // Create selection indicator
     this.selectionIndicator = this.add.graphics();
     this.selectionIndicator.setDepth(101);
@@ -267,7 +313,8 @@ export class GameScene extends Phaser.Scene {
     this.eKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.E);
     this.tabKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.TAB);
     this.nKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.N);
-    this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
+this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
+    this.shiftKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.SHIFT);
     this.bKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.B);
     this.hKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.H);
     this.xKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.X);
@@ -289,7 +336,7 @@ export class GameScene extends Phaser.Scene {
     this.events.on('projectile-explode', this.handleExplosion, this);
     
     // Listen for flame damage (flamethrower)
-    this.events.on('flame-damage', this.handleFlameDamage, this);
+    this.events.on('flame-wave', this.handleFlameWave, this);
     
     // Listen for flame jet ending
     this.events.on('flame-jet-ended', this.handleFlameJetEnded, this);
@@ -310,7 +357,7 @@ export class GameScene extends Phaser.Scene {
     // Setup mouse controls
     this.setupMouseControls();
 
-    // In-game music (classical / cello). Menu music is stopped when GameScene starts.
+    // In-game music. Menu music is stopped when GameScene starts.
     SoundManager.init();
     SoundManager.startCelloMusic();
 
@@ -323,6 +370,12 @@ export class GameScene extends Phaser.Scene {
   private setupMouseControls(): void {
     // Right-click or middle-click drag to pan camera
     this.input.on('pointerdown', (pointer: Phaser.Input.Pointer) => {
+      // Any click during the intro skips it.
+      if (!this.introDone && pointer.leftButtonDown()) {
+        this.skipIntro();
+        return;
+      }
+
       if (pointer.rightButtonDown() || pointer.middleButtonDown()) {
         // While a shot is in flight, keep the camera tracking the projectile.
         if (this.isShotResolving()) return;
@@ -359,6 +412,7 @@ export class GameScene extends Phaser.Scene {
       if (pointer.leftButtonDown() && !this.isSelectingCharacter && this.currentSoldier && !this.hasFired) {
         this.isMouseCharging = true;
         this.power = POWER_MIN;
+        this.powerChargeDirection = 1;
         this.lastAimInput = 'mouse';
         this.mouseChargeTurnId = this.turnId;
         this.mouseChargeSoldier = this.currentSoldier;
@@ -382,16 +436,18 @@ export class GameScene extends Phaser.Scene {
         );
       }
       
-      // Mouse aiming - update aim angle based on mouse position (no restrictions)
+      // Mouse aiming - set the smoothed aim target from the pointer direction.
+      // Pointer positions right on top of the soldier are ignored (angle flips wildly there).
       if (this.currentSoldier && !this.isSelectingCharacter && !this.isDraggingCamera && !this.isAirstrikeTargeting) {
-        this.lastAimInput = 'mouse';
         const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
         const origin = this.getAimOrigin();
         if (!origin) return;
         const dx = worldPoint.x - origin.x;
         const dy = worldPoint.y - origin.y;
-        this.aimAngle = Phaser.Math.RadToDeg(Math.atan2(dy, dx));
-        // No clamp - allow aiming in any direction the mouse points
+        if (Math.hypot(dx, dy) >= MOUSE_AIM_DEADZONE_PX) {
+          this.lastAimInput = 'mouse';
+          this.mouseAimTargetAngle = Phaser.Math.RadToDeg(Math.atan2(dy, dx));
+        }
       }
     });
     
@@ -452,6 +508,23 @@ export class GameScene extends Phaser.Scene {
     this.clearShotResolution();
     this.clearChargeState();
 
+    // Clean up any intro-sequence leftovers (quote overlay, descending paratroopers).
+    SoundManager.stopSpeech();
+    this.introOverlayObjects.forEach(o => {
+      try { o.destroy(); } catch (e) { /* ignored */ }
+    });
+    this.introOverlayObjects = [];
+    this.activeDescents.forEach(d => {
+      this.tweens.killTweensOf(d.soldier.sprite);
+      this.tweens.killTweensOf(d.parachute);
+      try { d.parachute.destroy(); } catch (e) { /* ignored */ }
+    });
+    this.activeDescents = [];
+    if (this.introHintText) {
+      this.introHintText.destroy();
+      this.introHintText = null;
+    }
+
     // Clear any active supply drops
     this.supplyDrops.forEach(d => {
       try { d.crate.destroy(); } catch (e) { /* ignored */ }
@@ -500,45 +573,188 @@ export class GameScene extends Phaser.Scene {
   private initializeTeams(): void {
     // First, run artillery bombardment to "create" the battlefield
     // Then drop paratroopers after bombardment completes
+    this.introToken++;
+    this.introDone = false;
+    this.introSkipped = false;
+    this.soldiersLanded = 0;
+    this.activeDescents = [];
+    this.buildParaDropPlans();
+    this.soldiersExpected = this.paraDropPlans.length;
+    this.showIntroSkipHint();
     this.startArtilleryBombardment();
   }
 
+  // Decide where every paratrooper will land up front, so a skipped intro can
+  // place them instantly instead of waiting for the planes.
+  private buildParaDropPlans(): void {
+    this.paraDropPlans = [];
+
+    const zoneMargin = 80;
+    const zoneWidth = Math.min(550, Math.floor(this.worldWidth * 0.28));
+    const redDropZone = { minX: zoneMargin, maxX: Math.min(this.worldWidth - zoneMargin, zoneMargin + zoneWidth) };
+    const blueDropZone = { minX: Math.max(zoneMargin, this.worldWidth - zoneMargin - zoneWidth), maxX: this.worldWidth - zoneMargin };
+
+    const redNames = ['Sarge', 'Gunner', 'Boom', 'Buck', 'Ghost'];
+    const blueNames = ['Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo'];
+
+    redNames.forEach((name, index) => {
+      this.paraDropPlans.push({
+        x: Phaser.Math.Between(redDropZone.minX, redDropZone.maxX),
+        team: Team.RED,
+        name,
+        index,
+        weaponId: this.redSquad[index] || 'rifle',
+        spawned: false,
+      });
+    });
+
+    blueNames.forEach((name, index) => {
+      this.paraDropPlans.push({
+        x: Phaser.Math.Between(blueDropZone.minX, blueDropZone.maxX),
+        team: Team.BLUE,
+        name,
+        index,
+        weaponId: this.blueSquad[index] || 'rifle',
+        spawned: false,
+      });
+    });
+  }
+
+  private showIntroSkipHint(): void {
+    if (this.introHintText) this.introHintText.destroy();
+
+    this.introHintText = this.add.text(this.cameras.main.width / 2, this.cameras.main.height - 36, 'SPACE or CLICK to skip intro', {
+      font: 'bold 15px Arial',
+      color: '#ffffff',
+      stroke: '#000000',
+      strokeThickness: 4,
+      backgroundColor: '#00000066',
+      padding: { x: 10, y: 5 },
+    });
+    this.introHintText.setOrigin(0.5);
+    this.introHintText.setScrollFactor(0);
+    this.introHintText.setDepth(1001);
+
+    this.tweens.add({
+      targets: this.introHintText,
+      alpha: 0.45,
+      duration: 700,
+      yoyo: true,
+      repeat: -1,
+      ease: 'Sine.easeInOut',
+    });
+  }
+
+  private skipIntro(): void {
+    if (this.introDone || this.introSkipped) return;
+    this.introSkipped = true;
+
+    SoundManager.stopSpeech();
+
+    // Clear the quote overlay immediately.
+    this.introOverlayObjects.forEach(o => {
+      try { o.destroy(); } catch (e) { /* ignored */ }
+    });
+    this.introOverlayObjects = [];
+
+    // Snap any soldier mid-descent straight onto the ground.
+    [...this.activeDescents].forEach(entry => {
+      this.tweens.killTweensOf(entry.soldier.sprite);
+      this.finishLanding(entry, true);
+    });
+
+    // Spawn everyone who hasn't even left the plane yet.
+    this.paraDropPlans.forEach(plan => {
+      if (plan.spawned) return;
+      plan.spawned = true;
+      this.spawnSoldierOnGround(plan);
+    });
+
+    this.transitionFromIntro();
+  }
+
+  private spawnSoldierOnGround(plan: { x: number; team: Team; name: string; index: number; weaponId: string }): void {
+    const landingY = this.terrain.getSurfaceY(plan.x) - 15;
+    const soldier = new Soldier(this, plan.x, landingY, plan.team, plan.name, plan.index, true, plan.weaponId as WeaponType);
+    this.soldiers.push(soldier);
+
+    const body = soldier.sprite.body as Phaser.Physics.Arcade.Body;
+    body.setVelocity(0, 0);
+    body.setAllowGravity(false);
+
+    this.soldiersLanded++;
+    this.maybeFinishIntro();
+  }
+
+  private maybeFinishIntro(): void {
+    if (this.introDone) return;
+    if (this.soldiersLanded < this.soldiersExpected) return;
+
+    if (this.introSkipped) {
+      this.transitionFromIntro();
+      return;
+    }
+
+    // Everyone landed naturally — give it a beat, then hand over control.
+    const token = this.introToken;
+    this.time.delayedCall(900, () => {
+      if (token !== this.introToken) return;
+      this.transitionFromIntro();
+    });
+  }
+
+  private transitionFromIntro(): void {
+    if (this.introDone) return;
+    this.introDone = true;
+
+    if (this.introHintText) {
+      this.introHintText.destroy();
+      this.introHintText = null;
+    }
+
+    this.startCharacterSelection();
+  }
+
   private startArtilleryBombardment(): void {
+    const token = this.introToken;
+
     // Display epic WWI quote during bombardment
     this.displayBombardmentQuote();
-    
+
     // Create several artillery impacts across the battlefield
     // This makes it look like artillery shaped the battlefield before troops arrive
     const impactLocations: { x: number; delay: number; radius: number }[] = [];
-    
-    // Generate 8-12 random impact points across the middle of the battlefield
-    const numImpacts = 8 + Math.floor(Math.random() * 5);
-    
+
+    // Generate 6-9 random impact points across the middle of the battlefield
+    const numImpacts = 6 + Math.floor(Math.random() * 4);
+
     for (let i = 0; i < numImpacts; i++) {
       // Spread impacts across the battlefield, avoiding team spawn areas
       const x = 600 + Math.random() * (this.worldWidth - 1200);
-      const delay = 200 + i * 400 + Math.random() * 200; // Stagger impacts
+      const delay = 200 + i * 300 + Math.random() * 150; // Stagger impacts
       const radius = 35 + Math.random() * 30; // Varied crater sizes
       impactLocations.push({ x, delay, radius });
     }
-    
+
     // Add a few impacts near team positions (but not too close)
-    impactLocations.push({ x: 750 + Math.random() * 150, delay: numImpacts * 400 + 200, radius: 40 });
-    impactLocations.push({ x: 1700 + Math.random() * 150, delay: numImpacts * 400 + 600, radius: 45 });
-    
+    impactLocations.push({ x: 750 + Math.random() * 150, delay: numImpacts * 300 + 200, radius: 40 });
+    impactLocations.push({ x: 1700 + Math.random() * 150, delay: numImpacts * 300 + 500, radius: 45 });
+
     // Sort by delay for proper sequencing
     impactLocations.sort((a, b) => a.delay - b.delay);
-    
+
     // Create each artillery impact
     impactLocations.forEach((impact) => {
       this.time.delayedCall(impact.delay, () => {
+        if (token !== this.introToken || this.introSkipped) return;
         this.createArtilleryImpact(impact.x, impact.radius);
       });
     });
-    
+
     // After all bombardment is done, start paratrooper drop
-    const totalBombardmentTime = impactLocations[impactLocations.length - 1].delay + 800;
+    const totalBombardmentTime = impactLocations[impactLocations.length - 1].delay + 600;
     this.time.delayedCall(totalBombardmentTime, () => {
+      if (token !== this.introToken || this.introSkipped) return;
       this.startParatrooperDrop();
     });
   }
@@ -591,7 +807,12 @@ export class GameScene extends Phaser.Scene {
     authorText.setDepth(500);
     authorText.setScrollFactor(0); // Fixed to camera
     authorText.setAlpha(0);
-    
+
+    // Track for instant cleanup if the intro is skipped.
+    this.introOverlayObjects.push(overlay, quoteText, authorText);
+
+    const token = this.introToken;
+
     // Fade in quote
     this.tweens.add({
       targets: [overlay, quoteText, authorText],
@@ -599,22 +820,24 @@ export class GameScene extends Phaser.Scene {
       duration: 1000,
       ease: 'Power2',
     });
-    
+
     // Speak the quote in Churchill-style voice
     this.time.delayedCall(500, () => {
+      if (token !== this.introToken || this.introSkipped) return;
       SoundManager.speakQuote(quote.text, quote.author);
     });
-    
+
     // Fade out after bombardment
     this.time.delayedCall(6000, () => {
+      if (!overlay.active) return;
       this.tweens.add({
         targets: [overlay, quoteText, authorText],
         alpha: 0,
         duration: 1500,
         onComplete: () => {
-          overlay.destroy();
-          quoteText.destroy();
-          authorText.destroy();
+          if (overlay.active) overlay.destroy();
+          if (quoteText.active) quoteText.destroy();
+          if (authorText.active) authorText.destroy();
         }
       });
     });
@@ -709,38 +932,31 @@ export class GameScene extends Phaser.Scene {
     });
   }
 
-  private startParatrooperDrop(): void {
+private startParatrooperDrop(): void {
+    const token = this.introToken;
+
     // Play plane engine sounds
-    SoundManager.playPlaneEngine(6);
+    SoundManager.playPlaneEngine(5);
     this.time.delayedCall(500, () => {
-      SoundManager.playPlaneEngine(6);
+      if (token !== this.introToken || this.introSkipped) return;
+      SoundManager.playPlaneEngine(5);
     });
-    
-    // Red team drop zone (left side) - scale with world width
-    const zoneMargin = 100;
-    const zoneWidth = Math.min(650, Math.floor(this.worldWidth * 0.26));
-    const redDropZone = { minX: zoneMargin, maxX: Math.min(this.worldWidth - zoneMargin, zoneMargin + zoneWidth) };
-    const redNames = ['Sarge', 'Gunner', 'Boom', 'Buck', 'Ghost'];
-    
-    // Blue team drop zone (right side) - scale with world width
-    const blueDropZone = { minX: Math.max(zoneMargin, this.worldWidth - zoneMargin - zoneWidth), maxX: this.worldWidth - zoneMargin };
-    const blueNames = ['Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo'];
-    
+
     // Create planes
     const redPlane = this.createPlane(-100, 80, true); // Flying right
     const bluePlane = this.createPlane(this.worldWidth + 100, 120, false); // Flying left
-    
+
     // Calculate drop timing based on plane speed and target positions
-    const planeDuration = 6000;
+    const planeDuration = 5000;
     const redPlaneStart = -100;
     const redPlaneEnd = this.worldWidth + 200;
     const redPlaneSpeed = (redPlaneEnd - redPlaneStart) / planeDuration;
-    
+
     const bluePlaneStart = this.worldWidth + 100;
     const bluePlaneEnd = -200;
     const bluePlaneSpeed = (bluePlaneEnd - bluePlaneStart) / planeDuration;
-    
-    // Fly red plane across and drop troops
+
+    // Fly planes across
     this.tweens.add({
       targets: redPlane,
       x: redPlaneEnd,
@@ -748,27 +964,7 @@ export class GameScene extends Phaser.Scene {
       ease: 'Linear',
       onComplete: () => redPlane.destroy(),
     });
-    
-    // Drop red team soldiers when plane reaches their drop position
-    redNames.forEach((name, index) => {
-      const dropX = Phaser.Math.Between(redDropZone.minX, redDropZone.maxX);
-      // Calculate when plane's BACK (tail) reaches the drop position
-      // Plane tail is about 55 pixels behind center, so drop when tail passes dropX
-      const planeBackOffset = 55;
-      const timeToReachDrop = (dropX + planeBackOffset - redPlaneStart) / redPlaneSpeed;
-      const dropDelay = Math.max(200, timeToReachDrop + index * 100); // Small stagger between soldiers
-      
-      // Get weapon type from squad selection
-      const weaponTypeId = this.redSquad[index] || 'rifle';
-      
-      this.time.delayedCall(dropDelay, () => {
-        // Get current plane position for the drop
-        const planeY = redPlane.y;
-        this.dropParatrooper(dropX, planeY + 20, Team.RED, name, index, weaponTypeId);
-      });
-    });
-    
-    // Fly blue plane across and drop troops
+
     this.tweens.add({
       targets: bluePlane,
       x: bluePlaneEnd,
@@ -776,23 +972,24 @@ export class GameScene extends Phaser.Scene {
       ease: 'Linear',
       onComplete: () => bluePlane.destroy(),
     });
-    
-    // Drop blue team soldiers when plane reaches their drop position
-    blueNames.forEach((name, index) => {
-      const dropX = Phaser.Math.Between(blueDropZone.minX, blueDropZone.maxX);
-      // Calculate when plane's BACK (tail) reaches the drop position
-      // Blue plane flies left, so tail trails to the right
-      const planeBackOffset = 55;
-      const timeToReachDrop = Math.abs((dropX - planeBackOffset - bluePlaneStart) / bluePlaneSpeed);
-      const dropDelay = Math.max(200, timeToReachDrop + index * 100);
-      
-      // Get weapon type from squad selection
-      const weaponTypeId = this.blueSquad[index] || 'rifle';
-      
+
+    // Drop each planned soldier when their plane's tail passes the drop position
+    // (plane tail is about 55 pixels behind center).
+    const planeBackOffset = 55;
+
+    this.paraDropPlans.forEach(plan => {
+      const isRed = plan.team === Team.RED;
+      const timeToReachDrop = isRed
+        ? (plan.x + planeBackOffset - redPlaneStart) / redPlaneSpeed
+        : Math.abs((plan.x - planeBackOffset - bluePlaneStart) / bluePlaneSpeed);
+      const dropDelay = Math.max(200, timeToReachDrop + plan.index * 100); // Small stagger between soldiers
+
       this.time.delayedCall(dropDelay, () => {
-        // Get current plane position for the drop
-        const planeY = bluePlane.y;
-        this.dropParatrooper(dropX, planeY + 20, Team.BLUE, name, index, weaponTypeId);
+        if (token !== this.introToken) return;
+        if (plan.spawned) return; // Already placed by a skip
+        plan.spawned = true;
+        const planeY = isRed ? redPlane.y : bluePlane.y;
+        this.dropParatrooper(plan.x, planeY + 20, plan.team, plan.name, plan.index, plan.weaponId);
       });
     });
   }
@@ -882,8 +1079,11 @@ export class GameScene extends Phaser.Scene {
     
     // Calculate descent time based on distance (slower = more realistic)
     const fallDistance = landingY - startY;
-    const descentDuration = Math.max(1500, fallDistance * 4); // ~4ms per pixel, min 1.5s
-    
+    const descentDuration = Math.max(1200, fallDistance * 3.2);
+
+    const descent = { soldier, parachute, landingY };
+    this.activeDescents.push(descent);
+
     // Animate soldier descent with tween (no physics!)
     this.tweens.add({
       targets: soldier.sprite,
@@ -895,26 +1095,46 @@ export class GameScene extends Phaser.Scene {
         parachute.setPosition(soldier.sprite.x, soldier.sprite.y - 30);
       },
       onComplete: () => {
-        // Landing! Detach parachute
-        this.tweens.killTweensOf(parachute); // Stop swing animation
-        
-        this.tweens.add({
-          targets: parachute,
-          y: parachute.y - 50,
-          alpha: 0,
-          duration: 500,
-          onComplete: () => parachute.destroy(),
-        });
-        
-        // Keep gravity OFF - soldiers stay grounded via terrain collision only
-        body.setImmovable(false);
-        body.setAllowGravity(false); // GRAVITY STAYS OFF
-        body.setVelocity(0, 0);
-        
-        // Ensure soldier is exactly on terrain surface
-        soldier.sprite.y = landingY;
+        this.finishLanding(descent, false);
       },
     });
+  }
+
+  private finishLanding(
+    descent: { soldier: Soldier; parachute: Phaser.GameObjects.Container; landingY: number },
+    instant: boolean
+  ): void {
+    const idx = this.activeDescents.indexOf(descent);
+    if (idx === -1) return; // Already finished
+    this.activeDescents.splice(idx, 1);
+
+    const { soldier, parachute, landingY } = descent;
+
+    // Detach parachute
+    this.tweens.killTweensOf(parachute);
+    if (instant) {
+      parachute.destroy();
+    } else {
+      this.tweens.add({
+        targets: parachute,
+        y: parachute.y - 50,
+        alpha: 0,
+        duration: 500,
+        onComplete: () => parachute.destroy(),
+      });
+    }
+
+    // Keep gravity OFF - soldiers stay grounded via terrain collision only
+    const body = soldier.sprite.body as Phaser.Physics.Arcade.Body;
+    body.setImmovable(false);
+    body.setAllowGravity(false); // GRAVITY STAYS OFF
+    body.setVelocity(0, 0);
+
+    // Ensure soldier is exactly on terrain surface
+    soldier.sprite.y = landingY;
+
+    this.soldiersLanded++;
+    this.maybeFinishIntro();
   }
 
   private createStarryBackground(): void {
@@ -953,10 +1173,14 @@ export class GameScene extends Phaser.Scene {
     this.cameras.main.setZoom(Math.min(0.6, Math.max(0.35, zoomToFitWidth)));
     this.cameras.main.centerOn(this.worldWidth / 2, this.worldHeight / 2);
     this.cameras.main.stopFollow();
-    
-    // After 15 seconds (enough time for bombardment + paratroopers to land), start character selection
-    this.time.delayedCall(15000, () => {
-      this.startCharacterSelection();
+
+    // Normally the intro hands over control as soon as everyone has landed
+    // (see maybeFinishIntro). This is only a safety net so a lost callback
+    // can never leave the player stuck watching the sky.
+    const token = this.introToken;
+    this.time.delayedCall(16000, () => {
+      if (token !== this.introToken) return;
+      this.transitionFromIntro();
     });
   }
 
@@ -1113,6 +1337,44 @@ export class GameScene extends Phaser.Scene {
     this.startTurn();
   }
 
+  private getCloseRangeMovementFloor(type: WeaponType): number {
+    switch (type) {
+      case WeaponType.FLAMER:
+        return 360;
+      case WeaponType.SHOTGUN:
+        return 340;
+      case WeaponType.SMG:
+      case WeaponType.CARBINE:
+        return 390;
+      case WeaponType.PISTOL:
+        return 380;
+      case WeaponType.SLUG:
+        return 340;
+      case WeaponType.DEMO:
+        return 300;
+      default:
+        return 0;
+    }
+  }
+
+  private getSoldierMoveSpeed(type: WeaponType): number {
+    switch (type) {
+      case WeaponType.FLAMER:
+      case WeaponType.SHOTGUN:
+        return 220;
+      case WeaponType.SMG:
+      case WeaponType.CARBINE:
+      case WeaponType.PISTOL:
+        return 235;
+      case WeaponType.SLUG:
+        return 215;
+      case WeaponType.DEMO:
+        return 190;
+      default:
+        return DEFAULT_MOVE_SPEED;
+    }
+  }
+
   private deselectSoldier(): void {
     // Return to character selection mode
     this.isSelectingCharacter = true;
@@ -1177,9 +1439,11 @@ export class GameScene extends Phaser.Scene {
       // Base movement divided by weight, then add mobility bonus (percentage of base)
       const baseMovement = Math.floor(BASE_MOVEMENT_DISTANCE / weight);
       const bonusMovement = Math.floor(BASE_MOVEMENT_DISTANCE * mobilityBonus);
-      this.maxMovement = baseMovement + bonusMovement;
+      const movementFloor = this.getCloseRangeMovementFloor(this.currentSoldier.getWeaponType());
+      this.maxMovement = Math.max(baseMovement + bonusMovement, movementFloor);
       this.movementUsed = 0;
       this.startX = this.currentSoldier.x;
+      this.currentSoldier.setMoveSpeed(this.getSoldierMoveSpeed(this.currentSoldier.getWeaponType()));
       
       // Zoom in and pan to current soldier
       this.tweens.add({
@@ -1199,7 +1463,9 @@ export class GameScene extends Phaser.Scene {
 
     // Reset aiming
     this.aimAngle = -45;
+    this.mouseAimTargetAngle = null;
     this.power = 50;
+    this.powerChargeDirection = 1;
     this.isCharging = false;
     this.isMouseCharging = false;
 
@@ -1230,12 +1496,24 @@ export class GameScene extends Phaser.Scene {
       this.adjustZoom(-0.2);
     }
 
+    // Intro can be skipped with SPACE/ENTER/ESC (mouse click handled in setupMouseControls).
+    if (!this.introDone) {
+      if (
+        Phaser.Input.Keyboard.JustDown(this.spaceKey) ||
+        Phaser.Input.Keyboard.JustDown(this.enterKey) ||
+        Phaser.Input.Keyboard.JustDown(this.escKey)
+      ) {
+        this.skipIntro();
+      }
+    }
+
     // Always maintain terrain collision. Terrain is not an Arcade collider, so if we skip this
     // (e.g. during character selection between turns), units can fall / phase into the dirt.
     this.soldiers.forEach(soldier => {
       if (soldier.isAlive()) {
-        soldier.update();
-        this.terrain.checkCollision(soldier.sprite);
+        soldier.update(dt, this.terrain);
+        const grounded = this.terrain.checkCollision(soldier.sprite);
+        soldier.setGrounded(grounded);
         this.checkOutOfBounds(soldier);
       }
     });
@@ -1366,9 +1644,10 @@ export class GameScene extends Phaser.Scene {
       if (this.aimAngle > 180) this.aimAngle -= 360;
     }
 
-    // If the mouse was the last aim input, continuously recompute aim angle from the current pointer world position.
-    // This keeps the predicted impact point stable even if the camera/soldier shifts while the mouse is stationary.
-    if (this.lastAimInput === 'mouse' && !this.isDraggingCamera && !this.isAirstrikeTargeting) {
+    // If the mouse was the last aim input, keep the aim target in sync with the pointer —
+    // but NOT while the player is panning the camera (A/D or drag). Panning used to drag
+    // the aim with the scrolling world, making shots impossible to line up.
+    if (this.lastAimInput === 'mouse' && !this.isDraggingCamera && !this.isPanningCamera && !this.isAirstrikeTargeting) {
       const pointer = this.input.activePointer;
       if (pointer) {
         const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
@@ -1376,7 +1655,21 @@ export class GameScene extends Phaser.Scene {
         if (!origin) return;
         const dx = worldPoint.x - origin.x;
         const dy = worldPoint.y - origin.y;
-        this.aimAngle = Phaser.Math.RadToDeg(Math.atan2(dy, dx));
+        if (Math.hypot(dx, dy) >= MOUSE_AIM_DEADZONE_PX) {
+          this.mouseAimTargetAngle = Phaser.Math.RadToDeg(Math.atan2(dy, dx));
+        }
+      }
+    }
+
+    // Rotate the aim toward the mouse target at a capped speed instead of snapping.
+    // Small corrections land instantly; big pointer swings sweep over deliberately.
+    if (this.lastAimInput === 'mouse' && this.mouseAimTargetAngle !== null) {
+      const maxStep = MOUSE_AIM_TURN_SPEED_DEG_PER_SEC * dt;
+      const diff = wrapDeg(this.mouseAimTargetAngle - this.aimAngle);
+      if (Math.abs(diff) <= maxStep) {
+        this.aimAngle = this.mouseAimTargetAngle;
+      } else {
+        this.aimAngle = wrapDeg(this.aimAngle + Math.sign(diff) * maxStep);
       }
     }
 
@@ -1389,11 +1682,11 @@ export class GameScene extends Phaser.Scene {
       if (!this.isCharging) {
         this.isCharging = true;
         this.power = POWER_MIN; // Start at minimum power
+        this.powerChargeDirection = 1;
         this.keyboardChargeTurnId = this.turnId;
         this.keyboardChargeSoldier = this.currentSoldier;
       }
-      // Continuously increase power while holding space
-      this.power = Math.min(100, this.power + POWER_CHARGE_PER_SECOND * dt);
+      this.updateChargePower(dt);
     }
 
     // Only fire on space release if we were actually charging (not from grapple)
@@ -1410,7 +1703,7 @@ export class GameScene extends Phaser.Scene {
     
     // Handle mouse charging (left mouse button held) - also check not grappling
     if (this.isMouseCharging && !this.hasFired && !this.currentSoldier.isCurrentlyGrappling()) {
-      this.power = Math.min(100, this.power + POWER_CHARGE_PER_SECOND * dt);
+      this.updateChargePower(dt);
     }
 
     // End turn manually (only after firing, and only once the shot is fully resolved).
@@ -1418,7 +1711,7 @@ export class GameScene extends Phaser.Scene {
       this.endTurn();
     }
 
-    // Handle grappling hook (G key) - completely separate from firing
+// Handle grappling hook (G key) - completely separate from firing
     // Only allow if: not fired, not charging, not already grappling
     if (Phaser.Input.Keyboard.JustDown(this.gKey) && 
         !this.hasFired && 
@@ -1428,13 +1721,33 @@ export class GameScene extends Phaser.Scene {
         !this.currentSoldier.isCurrentlyGrappling()) {
       // Use aim angle and power to determine grapple target
       const angleRad = Phaser.Math.DegToRad(this.aimAngle);
-      const grappleDistance = 150 + this.power * 1.5; // 150-300 range
+      const grappleDistance = 150 + this.power * 2.5; // 150-400 range (increased)
       const targetX = this.currentSoldier.x + Math.cos(angleRad) * grappleDistance;
       const targetY = this.currentSoldier.y + Math.sin(angleRad) * grappleDistance;
       
-      // Try to grapple - this counts as using movement (requires terrain hit)
-      if (this.currentSoldier.startGrapple(targetX, targetY, this.terrain)) {
+      // Check for Shift+G (jetpack mode - no terrain required)
+      const isJetpackMode = this.shiftKey.isDown;
+      
+      // Try to grapple - jetpack mode doesn't require terrain
+      if (this.currentSoldier.startGrapple(targetX, targetY, this.terrain, !isJetpackMode)) {
         this.movementUsed = this.maxMovement; // Uses all movement
+      }
+    }
+
+    // Shift+G for jetpack mode (separate check for just Shift+G without regular G trigger)
+    if (Phaser.Input.Keyboard.JustDown(this.gKey) && this.shiftKey.isDown &&
+        !this.hasFired && 
+        !this.isCharging && 
+        !this.isMouseCharging &&
+        !this.isHowitzerMode &&
+        !this.currentSoldier.isCurrentlyGrappling()) {
+      const angleRad = Phaser.Math.DegToRad(this.aimAngle);
+      const grappleDistance = 150 + this.power * 2.5;
+      const targetX = this.currentSoldier.x + Math.cos(angleRad) * grappleDistance;
+      const targetY = this.currentSoldier.y + Math.sin(angleRad) * grappleDistance;
+      
+      if (this.currentSoldier.startGrapple(targetX, targetY, this.terrain, false)) {
+        this.movementUsed = this.maxMovement;
       }
     }
 
@@ -1568,6 +1881,7 @@ export class GameScene extends Phaser.Scene {
     const soldier = this.selectableSoldiers[this.selectionIndex];
     const weapon = soldier.weapon;
     this.events.emit('character-selection', {
+      team: soldier.team,
       soldier: {
         name: soldier.name,
         health: soldier.getHealth(),
@@ -1607,15 +1921,32 @@ export class GameScene extends Phaser.Scene {
     return this.currentSoldier.weapon;
   }
 
+  private updateChargePower(dt: number): void {
+    const rate = this.powerChargeDirection > 0 ? POWER_CHARGE_UP_PER_SECOND : POWER_CHARGE_DOWN_PER_SECOND;
+    this.power += this.powerChargeDirection * rate * dt;
+
+    if (this.power >= 100) {
+      this.power = 100;
+      this.powerChargeDirection = -1;
+    } else if (this.power <= POWER_MIN) {
+      this.power = POWER_MIN;
+      this.powerChargeDirection = 1;
+    }
+  }
+
   private drawAimLine(): void {
     this.aimLine.clear();
 
     if (!this.currentSoldier || !this.currentSoldier.isAlive()) {
+      this.aimPowerText.setVisible(false);
       return;
     }
 
     // While designating an airstrike target, suppress the normal weapon trajectory UI.
-    if (this.isAirstrikeTargeting) return;
+    if (this.isAirstrikeTargeting) {
+      this.aimPowerText.setVisible(false);
+      return;
+    }
 
     const origin = this.getAimOrigin();
     const weaponConfig = this.getActiveWeaponConfig();
@@ -1635,10 +1966,10 @@ export class GameScene extends Phaser.Scene {
     const vx = Math.cos(angleRad) * speed;
     const vy = Math.sin(angleRad) * speed;
     
-    // Simulate trajectory with fine time steps
+// Simulate trajectory with fine time steps
     const trajectoryPoints: { x: number; y: number }[] = [];
     const timeStep = 0.016; // ~60fps simulation
-    const maxTime = 6.0; // Longer preview so long-range shots (e.g., mortar) still show impact
+    const maxTime = 12.0; // Longer preview for long-range shots (mortar, rocket)
     let t = 0;
     
     while (t < maxTime) {
@@ -1678,8 +2009,8 @@ export class GameScene extends Phaser.Scene {
     
     // Draw laser-style dotted trajectory line
     if (trajectoryPoints.length > 1) {
-      const dotSpacing = 8; // Fine pitch spacing between dots
-      const dotSize = 2; // Small dot size for laser look
+      const dotSpacing = 10; // Slightly wider spacing for clarity
+      const dotSize = 3; // Larger dot size for better visibility
       let accumulatedDistance = 0;
       
       for (let i = 1; i < trajectoryPoints.length; i++) {
@@ -1696,15 +2027,15 @@ export class GameScene extends Phaser.Scene {
           
           // Calculate fade: dots fade out further along trajectory
           const totalDist = accumulatedDistance + localDist;
-          const maxDist = 800; // Fade over this distance
-          const alpha = Math.max(0.2, 1 - totalDist / maxDist);
+          const maxDist = 1200; // Fade over longer distance for long-range weapons
+          const alpha = Math.max(0.3, 1 - totalDist / maxDist);
           
-          // Laser red color with glow effect
-          this.aimLine.fillStyle(0xff0000, alpha * 0.9);
+          // Bright trajectory color with glow effect
+          this.aimLine.fillStyle(0xff2222, alpha * 0.95);
           this.aimLine.fillCircle(dotX, dotY, dotSize);
           
           // Inner bright core
-          this.aimLine.fillStyle(0xff4444, alpha);
+          this.aimLine.fillStyle(0xff6666, alpha);
           this.aimLine.fillCircle(dotX, dotY, dotSize * 0.6);
           
           localDist += dotSpacing;
@@ -1717,10 +2048,37 @@ export class GameScene extends Phaser.Scene {
         const lastPoint = trajectoryPoints[trajectoryPoints.length - 1];
         
         // Crosshair at impact point
-        this.aimLine.lineStyle(1, 0xff0000, 0.6);
-        this.aimLine.strokeCircle(lastPoint.x, lastPoint.y, 8);
-        this.aimLine.lineBetween(lastPoint.x - 12, lastPoint.y, lastPoint.x + 12, lastPoint.y);
-        this.aimLine.lineBetween(lastPoint.x, lastPoint.y - 12, lastPoint.x, lastPoint.y + 12);
+        this.aimLine.lineStyle(2, 0xff0000, 0.8);
+        this.aimLine.strokeCircle(lastPoint.x, lastPoint.y, 10);
+        this.aimLine.lineBetween(lastPoint.x - 16, lastPoint.y, lastPoint.x + 16, lastPoint.y);
+        this.aimLine.lineBetween(lastPoint.x, lastPoint.y - 16, lastPoint.x, lastPoint.y + 16);
+        
+        // Show explosion radius for explosive weapons (non-bullet types)
+        const isExplosive = weaponConfig.type !== WeaponType.RIFLE && 
+                           weaponConfig.type !== WeaponType.SNIPER && 
+                           weaponConfig.type !== WeaponType.PISTOL && 
+                           weaponConfig.type !== WeaponType.SMG && 
+                           weaponConfig.type !== WeaponType.MINIGUN && 
+                           weaponConfig.type !== WeaponType.CARBINE && 
+                           weaponConfig.type !== WeaponType.SHOTGUN && 
+                           weaponConfig.type !== WeaponType.SLUG &&
+                           weaponConfig.type !== WeaponType.FLAMER;
+        
+        if (isExplosive && weaponConfig.explosionRadius > 10) {
+          // Draw explosion radius ring
+          this.aimLine.lineStyle(2, 0xff8800, 0.6);
+          this.aimLine.strokeCircle(lastPoint.x, lastPoint.y, weaponConfig.explosionRadius);
+          
+          // Fill with low opacity to show blast zone
+          this.aimLine.fillStyle(0xff6600, 0.1);
+          this.aimLine.fillCircle(lastPoint.x, lastPoint.y, weaponConfig.explosionRadius);
+          
+          // Draw damage info
+          this.aimLine.fillStyle(0xffaa00, 0.9);
+          this.aimLine.fillCircle(lastPoint.x, lastPoint.y - weaponConfig.explosionRadius - 20, 12);
+          this.aimLine.fillStyle(0x000000, 1);
+          this.aimLine.fillCircle(lastPoint.x, lastPoint.y - weaponConfig.explosionRadius - 20, 8);
+        }
       }
     }
     
@@ -1751,6 +2109,15 @@ export class GameScene extends Phaser.Scene {
     
     this.aimLine.fillStyle(color, 1);
     this.aimLine.fillRect(barX, barY, barWidth * (this.power / 100), barHeight);
+
+    // Numeric readout while charging — the bar alone made precise power hard to judge.
+    if (this.isCharging || this.isMouseCharging) {
+      this.aimPowerText.setText(`${Math.round(this.power)}%`);
+      this.aimPowerText.setPosition(startX, barY - 6);
+      this.aimPowerText.setVisible(true);
+    } else {
+      this.aimPowerText.setVisible(false);
+    }
   }
 
   private fireProjectile(): void {
@@ -1881,7 +2248,7 @@ export class GameScene extends Phaser.Scene {
     this.isHowitzerMode = false;
 
     // Fire shell.
-    createProjectile(this, muzzleX, muzzleY, shotAngle, shotPower, HOWITZER_CONFIG, this.terrain);
+    createProjectile(this, muzzleX, muzzleY, shotAngle, shotPower, HOWITZER_CONFIG, this.terrain, shooter);
   }
 
   private enterHowitzerMode(): void {
@@ -2415,14 +2782,16 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
-  private handleExplosion(x: number, y: number, radius: number, baseDamage: number = 50): void {
+  private handleExplosion(x: number, y: number, radius: number, baseDamage: number = 50, shooter: Soldier | null = null): void {
     // Destroy terrain (skip for tiny bullet impacts)
     if (radius > 5) {
       this.terrain.destroyCircle(x, y, radius);
     }
 
-    // Damage soldiers in radius
+    // Damage soldiers in radius. `shooter` is only set for bullet impacts — their tiny
+    // splash never harms the one who fired (big explosives still self-damage as usual).
     this.soldiers.forEach(soldier => {
+      if (soldier === shooter) return;
       if (soldier.isAlive()) {
         const distance = Phaser.Math.Distance.Between(x, y, soldier.x, soldier.y);
         if (distance < radius) {
@@ -2432,10 +2801,11 @@ export class GameScene extends Phaser.Scene {
           // Apply knockback (reduced for bullets)
           if (radius > 10) {
             const angle = Phaser.Math.Angle.Between(x, y, soldier.x, soldier.y);
-            const knockback = (1 - distance / radius) * 400;
+            const strength = 1 - distance / radius;
+            const knockback = strength * 230;
             soldier.applyKnockback(
               Math.cos(angle) * knockback,
-              Math.sin(angle) * knockback
+              Phaser.Math.Clamp(Math.sin(angle) * knockback - strength * 45, -140, 110)
             );
           }
         }
@@ -2656,15 +3026,35 @@ export class GameScene extends Phaser.Scene {
     });
   }
 
-  private handleFlameDamage(x: number, y: number, radius: number, damage: number): void {
-    // Damage soldiers in flame radius (no terrain destruction, no knockback)
+  private handleFlameWave(
+    startX: number,
+    startY: number,
+    angle: number,
+    range: number,
+    damage: number,
+    shooter: Soldier | null = null
+  ): void {
+    // One wave damages each soldier in the flame corridor exactly once
+    // (no terrain destruction, no knockback). The shooter never burns themselves.
+    const endX = startX + Math.cos(angle) * range;
+    const endY = startY + Math.sin(angle) * range;
+    const corridorRadius = 25;
+
     this.soldiers.forEach(soldier => {
-      if (soldier.isAlive()) {
-        const distance = Phaser.Math.Distance.Between(x, y, soldier.x, soldier.y);
-        if (distance < radius) {
-          // Flame damage is direct, not distance-based
-          soldier.takeDamage(damage);
-        }
+      if (!soldier.isAlive() || soldier === shooter) return;
+
+      // Distance from the soldier to the flame ray segment.
+      const dx = endX - startX;
+      const dy = endY - startY;
+      const lenSq = dx * dx + dy * dy;
+      const t = lenSq > 0
+        ? Phaser.Math.Clamp(((soldier.x - startX) * dx + (soldier.y - startY) * dy) / lenSq, 0, 1)
+        : 0;
+      const closestX = startX + dx * t;
+      const closestY = startY + dy * t;
+
+      if (Phaser.Math.Distance.Between(soldier.x, soldier.y, closestX, closestY) <= corridorRadius) {
+        soldier.takeDamage(damage);
       }
     });
   }
@@ -2704,8 +3094,11 @@ export class GameScene extends Phaser.Scene {
 
     // Clear all aiming artifacts
     this.aimLine.clear();
+    this.aimPowerText.setVisible(false);
     this.power = 50;
+    this.powerChargeDirection = 1;
     this.aimAngle = -45;
+    this.mouseAimTargetAngle = null;
     this.cameras.main.stopFollow();
     this.currentSoldier = null;
 
@@ -2731,6 +3124,7 @@ export class GameScene extends Phaser.Scene {
   private clearChargeState(): void {
     this.isCharging = false;
     this.isMouseCharging = false;
+    this.powerChargeDirection = 1;
     this.mouseChargeTurnId = 0;
     this.mouseChargeSoldier = null;
     this.keyboardChargeTurnId = 0;
@@ -2750,6 +3144,12 @@ export class GameScene extends Phaser.Scene {
     this.nextBalanceEventTurn = info.turnNumber + interval;
 
     const favoredTeam = this.getLosingTeam();
+    if (info.turnNumber >= 6 && Math.random() < 0.22) {
+      this.showWorldBanner('STRAY BARRAGE');
+      this.triggerStrayBarrage();
+      return;
+    }
+
     const dropType = this.chooseSupplyDropType(favoredTeam);
 
     this.showWorldBanner('SUPPLY DROP INCOMING');
@@ -2791,14 +3191,53 @@ export class GameScene extends Phaser.Scene {
     // If the team is low, medkits become common.
     if (avgHealth < 55) {
       if (r < 0.55) return 'medkit';
-      if (r < 0.78) return 'artillery';
-      return 'airstrike';
+      if (r < 0.72) return 'armor';
+      if (r < 0.86) return 'artillery';
+      if (r < 0.96) return 'airstrike';
+      return 'munitions';
     }
 
     // Otherwise, a more even spread.
-    if (r < 0.40) return 'medkit';
-    if (r < 0.70) return 'artillery';
-    return 'airstrike';
+    if (r < 0.28) return 'medkit';
+    if (r < 0.48) return 'armor';
+    if (r < 0.68) return 'artillery';
+    if (r < 0.86) return 'airstrike';
+    return 'munitions';
+  }
+
+  private triggerStrayBarrage(): void {
+    const strikes = Phaser.Math.Between(3, 5);
+    const center = this.worldWidth * Phaser.Math.FloatBetween(0.32, 0.68);
+
+    for (let i = 0; i < strikes; i++) {
+      const x = Phaser.Math.Clamp(center + Phaser.Math.Between(-360, 360), 120, this.worldWidth - 120);
+      const surfaceY = this.terrain.getSurfaceY(x);
+      const warningY = Math.max(80, surfaceY - 70);
+      const delay = 650 + i * 420 + Phaser.Math.Between(0, 260);
+      const radius = Phaser.Math.Between(46, 68);
+      const damage = Phaser.Math.Between(28, 42);
+
+      const marker = this.add.graphics();
+      marker.setDepth(240);
+      marker.lineStyle(2, 0xff3333, 0.85);
+      marker.strokeCircle(x, warningY, radius * 0.55);
+      marker.lineBetween(x - 12, warningY, x + 12, warningY);
+      marker.lineBetween(x, warningY - 12, x, warningY + 12);
+
+      this.tweens.add({
+        targets: marker,
+        alpha: 0.25,
+        duration: 160,
+        yoyo: true,
+        repeat: Math.max(1, Math.floor(delay / 320)),
+      });
+
+      this.time.delayedCall(delay, () => {
+        marker.destroy();
+        SoundManager.playMortarExplosion();
+        this.handleExplosion(x, surfaceY - 8, radius, damage);
+      });
+    }
   }
 
   private showWorldBanner(text: string): void {
@@ -2894,6 +3333,8 @@ export class GameScene extends Phaser.Scene {
   private getSupplyDropLabel(type: SupplyDropType): string {
     if (type === 'medkit') return 'MEDKIT';
     if (type === 'artillery') return 'HOWITZER';
+    if (type === 'armor') return 'ARMOR';
+    if (type === 'munitions') return 'MUNITIONS';
     return 'AIRSTRIKE';
   }
 
@@ -2911,6 +3352,8 @@ export class GameScene extends Phaser.Scene {
     // Subtle type glow (helps spot it in caves/shadows)
     const glowColor =
       type === 'medkit' ? 0x44ff66 :
+      type === 'armor' ? 0x66ccff :
+      type === 'munitions' ? 0xff66cc :
       type === 'artillery' ? 0xffaa00 :
       0x66ffff;
     const glow = this.add.rectangle(0, 0, 52, 38, glowColor, 0.10);
@@ -3137,6 +3580,19 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
+    if (type === 'armor') {
+      soldier.addArmor(40);
+      this.showPowerupText(x, y - 20, 'ARMOR PLATES', 0x66ccff);
+      return;
+    }
+
+    if (type === 'munitions') {
+      soldier.addAirstrikeCharges(1);
+      soldier.addArtilleryCharges(1);
+      this.showPowerupText(x, y - 20, 'MUNITIONS CACHE', 0xff66cc);
+      return;
+    }
+
     soldier.addAirstrikeCharges(1);
     this.showPowerupText(x, y - 20, 'AIRSTRIKE READY (X)', 0x66ffff);
   }
@@ -3293,11 +3749,16 @@ export class GameScene extends Phaser.Scene {
         const reachedTurn = movedTurn >= this.maxMovement - 2;
         const nearBounds = soldier.x < 20 || soldier.x > this.worldWidth - 20;
 
+        // Probe the ground ahead — high-mobility AI units used to sprint straight
+        // off cliffs and bottomless craters, dying without ever taking a shot.
+        const aheadX = soldier.x + dir * 34;
+        const cliffAhead = this.terrain.findSurfaceYAtOrBelow(aheadX, soldier.y - 4, 300) === null;
+
         if (Math.abs(soldier.x - lastX) < 0.5) stuckTicks++;
         else stuckTicks = 0;
         lastX = soldier.x;
 
-        if (reachedLeg || reachedTurn || nearBounds || stuckTicks >= 8) {
+        if (reachedLeg || reachedTurn || nearBounds || cliffAhead || stuckTicks >= 8) {
           tick.destroy();
           finish();
         }
@@ -3325,15 +3786,21 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
-    const aimAndFire = (target: Soldier): void => {
+    const aimAndFire = (preferredTarget: Soldier): void => {
       if (token !== this.aiTurnToken) return;
       if (!this.currentSoldier || this.currentSoldier !== shooter || !shooter.isAlive()) return;
       if (!this.isTeamAI(shooter.team)) return;
       if (this.hasFired || this.isTurnEnding) return;
 
-      const shot = this.computeBestShot(shooter, target);
-      this.aimAngle = shot.angle;
-      this.power = shot.power;
+      const currentEnemies = this.soldiers.filter(s => s.isAlive() && s.team !== shooter.team);
+      const plan = this.chooseAIShotPlan(shooter, currentEnemies, preferredTarget);
+      if (!plan) {
+        if (!this.isTurnEnding) this.endTurn();
+        return;
+      }
+
+      this.aimAngle = plan.angle;
+      this.power = plan.power;
 
       // Show a brief aim line so it's readable that the AI is acting.
       this.drawAimLine();
@@ -3385,7 +3852,14 @@ export class GameScene extends Phaser.Scene {
       if (weaponType === WeaponType.FLAMER) {
         const desiredRange = 220;
         if (dist > desiredRange) desiredMove = dist - desiredRange;
-      } else if (weaponType === WeaponType.SHOTGUN || weaponType === WeaponType.SMG || weaponType === WeaponType.PISTOL) {
+      } else if (
+        weaponType === WeaponType.SHOTGUN ||
+        weaponType === WeaponType.SMG ||
+        weaponType === WeaponType.PISTOL ||
+        weaponType === WeaponType.CARBINE ||
+        weaponType === WeaponType.SLUG ||
+        weaponType === WeaponType.DEMO
+      ) {
         const desiredRange = 320;
         if (dist > desiredRange) desiredMove = dist - desiredRange;
       } else if (isBullet) {
@@ -3489,6 +3963,39 @@ export class GameScene extends Phaser.Scene {
     return best;
   }
 
+  private chooseAIShotPlan(shooter: Soldier, enemies: Soldier[], preferredTarget?: Soldier): AIShotPlan | null {
+    if (enemies.length === 0) return null;
+
+    const candidates = [...enemies].sort((a, b) => {
+      if (preferredTarget) {
+        if (a === preferredTarget) return -1;
+        if (b === preferredTarget) return 1;
+      }
+
+      const da = Phaser.Math.Distance.Between(shooter.x, shooter.y, a.x, a.y);
+      const db = Phaser.Math.Distance.Between(shooter.x, shooter.y, b.x, b.y);
+      return da - db;
+    });
+
+    let best: AIShotPlan | null = null;
+    for (const target of candidates) {
+      const shot = this.computeBestShot(shooter, target);
+      const preferredBias = target === preferredTarget ? -6 : 0;
+      const plan: AIShotPlan = {
+        target,
+        angle: shot.angle,
+        power: shot.power,
+        score: shot.score + preferredBias,
+      };
+
+      if (!best || plan.score < best.score) {
+        best = plan;
+      }
+    }
+
+    return best;
+  }
+
   private isBulletWeapon(type: WeaponType): boolean {
     return (
       type === WeaponType.RIFLE ||
@@ -3496,7 +4003,9 @@ export class GameScene extends Phaser.Scene {
       type === WeaponType.PISTOL ||
       type === WeaponType.SMG ||
       type === WeaponType.MINIGUN ||
-      type === WeaponType.SHOTGUN
+      type === WeaponType.SHOTGUN ||
+      type === WeaponType.CARBINE ||
+      type === WeaponType.SLUG
     );
   }
 
@@ -3512,7 +4021,7 @@ export class GameScene extends Phaser.Scene {
     return false;
   }
 
-  private computeBestShot(shooter: Soldier, target: Soldier): { angle: number; power: number } {
+  private computeBestShot(shooter: Soldier, target: Soldier): { angle: number; power: number; score: number } {
     const weapon = shooter.weapon;
     const startX = shooter.x;
     const startY = shooter.y - 10;
@@ -3528,7 +4037,7 @@ export class GameScene extends Phaser.Scene {
     if (weapon.type === WeaponType.FLAMER) {
       const clampedDist = Phaser.Math.Clamp(dist, 80, 200);
       const power = Phaser.Math.Clamp((clampedDist - 100), 10, 100);
-      return { angle: directAngle, power };
+      return { angle: directAngle, power, score: Math.max(0, dist - 190) };
     }
 
     const isBullet = this.isBulletWeapon(weapon.type);
@@ -3577,8 +4086,9 @@ export class GameScene extends Phaser.Scene {
 
       for (let power = minPower; power <= maxPower; power += powerStep) {
         const evalRes = this.evaluateShot(startX, startY, angle, power, weapon, targetX, targetY);
-        if (evalRes.score < bestScore) {
-          bestScore = evalRes.score;
+        const tacticalScore = this.scoreAIShotResult(shooter, target, weapon, evalRes);
+        if (tacticalScore < bestScore) {
+          bestScore = tacticalScore;
           bestAngle = angle;
           bestPower = power;
           // Early exit if we have a near-direct hit.
@@ -3591,7 +4101,7 @@ export class GameScene extends Phaser.Scene {
     // If search failed badly, fall back to a direct-ish shot.
     if (!Number.isFinite(bestScore) || bestScore > 220) {
       const fallbackPower = Phaser.Math.Clamp(85, minPower, maxPower);
-      return { angle: directAngle, power: fallbackPower };
+      return { angle: directAngle, power: fallbackPower, score: bestScore + 80 };
     }
 
     // Add a little imperfection so it doesn't feel like an aimbot.
@@ -3601,6 +4111,7 @@ export class GameScene extends Phaser.Scene {
     return {
       angle: Phaser.Math.Clamp(bestAngle + jitterAngle, -180, 180),
       power: Phaser.Math.Clamp(bestPower + jitterPower, minPower, maxPower),
+      score: bestScore,
     };
   }
 
@@ -3612,7 +4123,7 @@ export class GameScene extends Phaser.Scene {
     weapon: WeaponConfig,
     targetX: number,
     targetY: number
-  ): { score: number } {
+  ): { score: number; minDist: number; impactX: number | null; impactY: number | null } {
     const angleRad = Phaser.Math.DegToRad(angleDeg);
     const speed = (power / 100) * weapon.projectileSpeed;
 
@@ -3670,7 +4181,53 @@ export class GameScene extends Phaser.Scene {
       }
     }
 
-    return { score };
+    return { score, minDist, impactX, impactY };
+  }
+
+  private scoreAIShotResult(
+    shooter: Soldier,
+    target: Soldier,
+    weapon: WeaponConfig,
+    evalRes: { score: number; minDist: number; impactX: number | null; impactY: number | null }
+  ): number {
+    let score = evalRes.score;
+
+    if (weapon.explosionRadius > 12 && evalRes.impactX !== null && evalRes.impactY !== null) {
+      let expectedEnemyDamage = 0;
+      let expectedFriendlyDamage = 0;
+
+      for (const soldier of this.soldiers) {
+        if (!soldier.isAlive()) continue;
+
+        const distance = Phaser.Math.Distance.Between(evalRes.impactX, evalRes.impactY, soldier.x, soldier.y);
+        if (distance >= weapon.explosionRadius) continue;
+
+        const expectedDamage = Math.max(0, Math.round((1 - distance / weapon.explosionRadius) * weapon.damage));
+        if (expectedDamage <= 0) continue;
+
+        if (soldier.team !== shooter.team) {
+          expectedEnemyDamage += expectedDamage;
+          if (expectedDamage >= soldier.getHealth()) expectedEnemyDamage += 35;
+          if (soldier === target) expectedEnemyDamage += 12;
+        } else {
+          const friendlyWeight = soldier === shooter ? 2.8 : 2.0;
+          expectedFriendlyDamage += expectedDamage * friendlyWeight;
+        }
+      }
+
+      score -= expectedEnemyDamage * 1.25;
+      score += expectedFriendlyDamage * 1.75;
+    } else if (this.isBulletWeapon(weapon.type)) {
+      const healthPressure = Math.max(0, 100 - target.getHealth()) * 0.08;
+      score -= healthPressure;
+
+      if (evalRes.minDist <= 16) {
+        score -= Math.min(50, weapon.damage * Math.max(1, Math.min(weapon.pelletCount, 12)) * 0.18);
+        if (weapon.damage >= target.getHealth()) score -= 35;
+      }
+    }
+
+    return score;
   }
 
   // Getters for UI
@@ -3686,19 +4243,22 @@ export class GameScene extends Phaser.Scene {
   }
 
   private checkSoldierHit(
-    lastX: number, 
-    lastY: number, 
-    currentX: number, 
-    currentY: number, 
+    lastX: number,
+    lastY: number,
+    currentX: number,
+    currentY: number,
     damage: number,
     isBullet: boolean,
+    excludedSoldier: Soldier | null,
     onHit: (hitX: number, hitY: number) => void
   ): void {
     // Check if projectile path intersects with any soldier
     // Use line-circle intersection for accurate hit detection
-    
+
     for (const soldier of this.soldiers) {
       if (!soldier.isAlive()) continue;
+      // Skip the shooter (bullets always; explosives during their spawn grace window).
+      if (soldier === excludedSoldier) continue;
       
       // Soldier hitbox - slightly larger than visual for better gameplay
       const soldierX = soldier.x;
@@ -3723,8 +4283,8 @@ export class GameScene extends Phaser.Scene {
             soldier.takeDamage(damage);
             const angle = Math.atan2(dy || 0.001, dx || 0.001);
             soldier.applyKnockback(
-              Math.cos(angle) * 50,
-              Math.sin(angle) * 50 - 30
+              Math.cos(angle) * 24,
+              Math.sin(angle) * 18 - 14
             );
             this.createBulletHitEffect(lastX, lastY);
           }
@@ -3760,8 +4320,8 @@ export class GameScene extends Phaser.Scene {
             // Small knockback for bullets
             const angle = Math.atan2(dy, dx);
             soldier.applyKnockback(
-              Math.cos(angle) * 50,
-              Math.sin(angle) * 50 - 30
+              Math.cos(angle) * 24,
+              Math.sin(angle) * 18 - 14
             );
             
             // Create hit effect on soldier

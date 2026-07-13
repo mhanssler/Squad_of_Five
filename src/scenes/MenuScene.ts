@@ -1,32 +1,12 @@
 import Phaser from 'phaser';
 import { SoundManager } from '../utils/SoundManager';
-
-// All available soldier classes with their specialties
-export interface SoldierClass {
-  id: string;
-  name: string;
-  weapon: string;
-  description: string;
-  color: number;
-}
-
-export const SOLDIER_CLASSES: SoldierClass[] = [
-  { id: 'rifle', name: 'Rifleman', weapon: 'Assault Rifle', description: 'Balanced fighter with fast, accurate shots', color: 0xffd700 },
-  { id: 'grenade', name: 'Grenadier', weapon: 'Grenade', description: 'Lobbed explosives that bounce', color: 0x32cd32 },
-  { id: 'rocket', name: 'Rocketeer', weapon: 'Rocket Launcher', description: 'Heavy explosives, large blast radius', color: 0xff6347 },
-  { id: 'shotgun', name: 'Shotgunner', weapon: 'Shotgun', description: 'Spread fire, devastating up close', color: 0xc0c0c0 },
-  { id: 'sniper', name: 'Sniper', weapon: 'Sniper Rifle', description: 'Long range, high damage precision', color: 0x00ced1 },
-  { id: 'mortar', name: 'Mortar', weapon: 'Mortar', description: 'High arc indirect fire support', color: 0xffa500 },
-  { id: 'flamer', name: 'Flamer', weapon: 'Flamethrower', description: 'Short range area denial', color: 0xff4500 },
-  { id: 'pistol', name: 'Medic', weapon: 'Pistol', description: 'Light weapon, high mobility', color: 0x98fb98 },
-  { id: 'smg', name: 'Scout', weapon: 'SMG', description: 'Fast movement, rapid fire', color: 0x87ceeb },
-  { id: 'minigun', name: 'Heavy', weapon: 'Minigun', description: 'Slow but sustained firepower', color: 0xa9a9a9 },
-];
+import { getMenuClassGridPosition, MENU_ORDERED_CLASS_IDS, SOLDIER_CLASSES, type SoldierClass } from './MenuLayout';
 
 interface TeamSelection {
   selected: string[];
   currentIndex: number;
 }
+
 
 export class MenuScene extends Phaser.Scene {
   private redTeam: TeamSelection = { selected: [], currentIndex: 0 };
@@ -62,24 +42,24 @@ export class MenuScene extends Phaser.Scene {
 
   create(): void {
     // Background - WW2 camouflage pattern
-    this.cameras.main.setBackgroundColor('#4a5c3e'); // Base olive drab
+    this.cameras.main.setBackgroundColor('#1d241b');
     
     // Create camouflage pattern with irregular blobs
     this.createCamouflageBackground();
     
     // Title
-    this.titleText = this.add.text(640, 40, 'SQUAD OF FIVE', {
+    this.titleText = this.add.text(640, 38, 'SQUAD OF FIVE', {
       font: 'bold 48px Arial',
       color: '#ffffff',
       stroke: '#000000',
-      strokeThickness: 6,
+      strokeThickness: 5,
     });
     this.titleText.setOrigin(0.5);
     
     // Subtitle
-    this.add.text(640, 90, 'SELECT YOUR SQUAD', {
+    this.add.text(640, 88, 'SELECT YOUR SQUAD', {
       font: '24px Arial',
-      color: '#aaaaaa',
+      color: '#d8dfd2',
     }).setOrigin(0.5);
     
     // Team indicator
@@ -132,128 +112,89 @@ export class MenuScene extends Phaser.Scene {
 
     const byId = new Map<string, SoldierClass>(SOLDIER_CLASSES.map(s => [s.id, s]));
 
-    const groups: {
-      id: 'close' | 'mid' | 'long' | 'support';
-      title: string;
-      color: number;
-      soldierIds: string[];
-      rect: { x: number; y: number; w: number; h: number }; // top-left
-      layout: { cols: number; tileW: number; tileH: number; gapX: number; gapY: number; padX: number; padY: number; scale?: number };
-    }[] = [
-      {
-        id: 'close',
-        title: 'CLOSE RANGE',
-        color: 0xff9966,
-        soldierIds: ['shotgun', 'flamer'],
-        rect: { x: 40, y: 175, w: 390, h: 205 },
-        // Move the two close-range tiles down a bit to give the header breathing room.
-        layout: { cols: 2, tileW: 170, tileH: 92, gapX: 14, gapY: 12, padX: 10, padY: 35 },
-      },
-      {
-        id: 'mid',
-        title: 'MID RANGE',
-        color: 0x66ddff,
-        soldierIds: ['rifle', 'smg', 'grenade', 'minigun'],
-        rect: { x: 445, y: 175, w: 395, h: 205 },
-        // Shrink proportionally so the two-row grid never overlaps.
-        layout: { cols: 2, tileW: 185, tileH: 85, gapX: 14, gapY: 2, padX: 10, padY: 30, scale: 0.87 },
-      },
-      {
-        id: 'long',
-        title: 'LONG RANGE',
-        color: 0xffdd66,
-        soldierIds: ['sniper', 'rocket', 'mortar'],
-        rect: { x: 40, y: 390, w: 540, h: 205 },
-        // Slight proportional shrink for better padding within the section.
-        layout: { cols: 3, tileW: 170, tileH: 92, gapX: 10, gapY: 12, padX: 10, padY: 34, scale: 0.92 },
-      },
-      {
-        id: 'support',
-        title: 'SUPPORT',
-        color: 0x98fb98,
-        soldierIds: ['pistol'],
-        rect: { x: 595, y: 390, w: 245, h: 205 },
-        layout: { cols: 1, tileW: 225, tileH: 92, gapX: 10, gapY: 12, padX: 10, padY: 34 },
-      },
-    ];
-
-    // Order cards by group. (If new classes are added later, they can be placed into a group explicitly.)
-    this.orderedClasses = groups
-      .flatMap(g => g.soldierIds)
+    this.orderedClasses = MENU_ORDERED_CLASS_IDS
       .map(id => byId.get(id))
       .filter(Boolean) as SoldierClass[];
 
     // Left panel framing (soldiers)
     const frame = this.add.graphics();
-    frame.fillStyle(0x0f1620, 0.65);
-    frame.fillRoundedRect(30, 165, 830, 440, 12);
-    frame.lineStyle(2, 0x2a3a4a, 0.9);
-    frame.strokeRoundedRect(30, 165, 830, 440, 12);
+    frame.fillStyle(0x101820, 0.92);
+    frame.fillRect(30, 165, 830, 440);
+    frame.lineStyle(2, 0x92a17f, 0.9);
+    frame.strokeRect(30, 165, 830, 440);
+
+    const headerBar = this.add.graphics();
+    headerBar.fillStyle(0x26311f, 1);
+    headerBar.fillRect(30, 165, 830, 36);
+    headerBar.lineStyle(1, 0x92a17f, 0.75);
+    headerBar.lineBetween(30, 201, 860, 201);
+
+    this.add.text(54, 176, 'UNIT ROSTER', {
+      font: 'bold 14px Arial',
+      color: '#ffffff',
+    }).setOrigin(0, 0);
+
+    this.add.text(754, 176, '13 CLASSES', {
+      font: 'bold 12px Arial',
+      color: '#b8c9a8',
+    }).setOrigin(0, 0);
 
     // Create tiles within group sections
-    let globalIndex = 0;
-    for (const g of groups) {
-      const sectionBg = this.add.graphics();
-      sectionBg.fillStyle(0x121b26, 0.75);
-      sectionBg.fillRoundedRect(g.rect.x, g.rect.y, g.rect.w, g.rect.h, 10);
-      sectionBg.lineStyle(2, g.color, 0.35);
-      sectionBg.strokeRoundedRect(g.rect.x, g.rect.y, g.rect.w, g.rect.h, 10);
+    this.orderedClasses.forEach((soldier, globalIndex) => {
+        const pos = getMenuClassGridPosition(globalIndex);
+        const x = pos.x + pos.w / 2;
+        const y = pos.y + pos.h / 2;
+        const cardWidth = pos.w;
+        const cardHeight = pos.h;
+        const role =
+          ['shotgun', 'flamer', 'slug'].includes(soldier.id) ? 'CLOSE' :
+          ['sniper', 'rocket', 'mortar'].includes(soldier.id) ? 'LONG' :
+          soldier.id === 'pistol' ? 'SUPPORT' :
+          'MID';
 
-      const header = this.add.text(g.rect.x + 12, g.rect.y + 10, g.title, {
-        font: 'bold 12px Arial',
-        color: '#ffffff',
-        stroke: '#000000',
-        strokeThickness: 2,
-      });
-      header.setOrigin(0, 0);
-
-      g.soldierIds.forEach((id, idxInGroup) => {
-        const soldier = byId.get(id);
-        if (!soldier) return;
-
-        const col = idxInGroup % g.layout.cols;
-        const row = Math.floor(idxInGroup / g.layout.cols);
-        const x = g.rect.x + g.layout.padX + col * (g.layout.tileW + g.layout.gapX) + g.layout.tileW / 2;
-        const y = g.rect.y + g.layout.padY + row * (g.layout.tileH + g.layout.gapY) + g.layout.tileH / 2;
-        const cardWidth = g.layout.tileW;
-        const cardHeight = g.layout.tileH;
-
-        const card = this.add.container(x, y);
+        const card = this.add.container(Math.round(x), Math.round(y));
 
         // Card background (compact tile)
         const bg = this.add.graphics();
         bg.fillStyle(0x1a2433, 1);
-        bg.fillRoundedRect(-cardWidth / 2, -cardHeight / 2, cardWidth, cardHeight, 10);
-        bg.lineStyle(2, soldier.color, 0.5);
-        bg.strokeRoundedRect(-cardWidth / 2, -cardHeight / 2, cardWidth, cardHeight, 10);
+        bg.fillRect(-cardWidth / 2, -cardHeight / 2, cardWidth, cardHeight);
+        bg.lineStyle(2, soldier.color, 0.65);
+        bg.strokeRect(-cardWidth / 2, -cardHeight / 2, cardWidth, cardHeight);
         card.add(bg);
 
         // Left icon
         const icon = this.add.graphics();
         icon.fillStyle(soldier.color, 1);
-        icon.fillCircle(-cardWidth / 2 + 28, 0, 18);
-        icon.fillStyle(0x000000, 0.25);
-        icon.fillCircle(-cardWidth / 2 + 28, 0, 10);
+        icon.fillRect(-cardWidth / 2 + 12, -22, 28, 28);
+        icon.fillStyle(0x000000, 0.22);
+        icon.fillRect(-cardWidth / 2 + 18, -16, 16, 16);
         card.add(icon);
 
-        const nameText = this.add.text(-cardWidth / 2 + 52, -18, soldier.name.toUpperCase(), {
+        const nameText = this.add.text(-cardWidth / 2 + 50, -26, soldier.name.toUpperCase(), {
           font: 'bold 12px Arial',
           color: '#ffffff',
         });
         nameText.setOrigin(0, 0);
         card.add(nameText);
 
-        const weaponText = this.add.text(-cardWidth / 2 + 52, -2, soldier.weapon, {
+        const roleText = this.add.text(cardWidth / 2 - 9, -26, role, {
+          font: 'bold 9px Arial',
+          color: '#a9b99a',
+        });
+        roleText.setOrigin(1, 0);
+        card.add(roleText);
+
+        const weaponText = this.add.text(-cardWidth / 2 + 50, -9, soldier.weapon, {
           font: '10px Arial',
           color: '#b7c5d8',
         });
         weaponText.setOrigin(0, 0);
         card.add(weaponText);
 
-        const descText = this.add.text(-cardWidth / 2 + 52, 14, soldier.description, {
+        const descText = this.add.text(-cardWidth / 2 + 50, 8, soldier.description, {
           font: '9px Arial',
           color: '#7f90a8',
-          wordWrap: { width: cardWidth - 70 },
+          wordWrap: { width: cardWidth - 60 },
         });
         descText.setOrigin(0, 0);
         card.add(descText);
@@ -275,15 +216,8 @@ export class MenuScene extends Phaser.Scene {
         card.setData('w', cardWidth); // base size in local coords (before scaling)
         card.setData('h', cardHeight);
 
-        const scale = g.layout.scale ?? 1;
-        if (scale !== 1) {
-          card.setScale(scale);
-        }
-
         this.soldierCards.push(card);
-        globalIndex++;
-      });
-    }
+    });
   }
 
   private createSelectedDisplay(): void {
@@ -293,10 +227,10 @@ export class MenuScene extends Phaser.Scene {
     
     // Background panel
     const bg = this.add.graphics();
-    bg.fillStyle(0x1a1a2e, 0.9);
-    bg.fillRoundedRect(-300, -50, 600, 100, 10);
-    bg.lineStyle(2, 0x444466, 1);
-    bg.strokeRoundedRect(-300, -50, 600, 100, 10);
+    bg.fillStyle(0x121820, 0.95);
+    bg.fillRect(-300, -50, 600, 100);
+    bg.lineStyle(2, 0x92a17f, 0.85);
+    bg.strokeRect(-300, -50, 600, 100);
     this.selectedDisplay.add(bg);
     
     // Title
@@ -312,10 +246,10 @@ export class MenuScene extends Phaser.Scene {
       const slotX = -200 + i * 100;
       
       const slot = this.add.graphics();
-      slot.fillStyle(0x333355, 1);
-      slot.fillRoundedRect(slotX - 35, -15, 70, 50, 5);
-      slot.lineStyle(1, 0x555577, 1);
-      slot.strokeRoundedRect(slotX - 35, -15, 70, 50, 5);
+      slot.fillStyle(0x273144, 1);
+      slot.fillRect(slotX - 35, -15, 70, 50);
+      slot.lineStyle(1, 0x657089, 1);
+      slot.strokeRect(slotX - 35, -15, 70, 50);
       this.selectedDisplay.add(slot);
       
       const slotText = this.add.text(slotX, 10, `[${i + 1}]`, {
@@ -334,9 +268,9 @@ export class MenuScene extends Phaser.Scene {
     
     const bg = this.add.graphics();
     bg.fillStyle(0x446644, 1);
-    bg.fillRoundedRect(-80, -20, 160, 40, 8);
+    bg.fillRect(-80, -20, 160, 40);
     bg.lineStyle(2, 0x66aa66, 1);
-    bg.strokeRoundedRect(-80, -20, 160, 40, 8);
+    bg.strokeRect(-80, -20, 160, 40);
     this.autoSelectButton.add(bg);
     
     const text = this.add.text(0, 0, 'RANDOM [R]', {
@@ -350,8 +284,8 @@ export class MenuScene extends Phaser.Scene {
     const hitArea = this.add.rectangle(0, 0, 160, 40, 0x000000, 0);
     hitArea.setInteractive({ useHandCursor: true });
     hitArea.on('pointerdown', () => this.autoSelectSquad());
-    hitArea.on('pointerover', () => bg.clear().fillStyle(0x558855, 1).fillRoundedRect(-80, -20, 160, 40, 8).lineStyle(2, 0x88cc88, 1).strokeRoundedRect(-80, -20, 160, 40, 8));
-    hitArea.on('pointerout', () => bg.clear().fillStyle(0x446644, 1).fillRoundedRect(-80, -20, 160, 40, 8).lineStyle(2, 0x66aa66, 1).strokeRoundedRect(-80, -20, 160, 40, 8));
+    hitArea.on('pointerover', () => bg.clear().fillStyle(0x558855, 1).fillRect(-80, -20, 160, 40).lineStyle(2, 0x88cc88, 1).strokeRect(-80, -20, 160, 40));
+    hitArea.on('pointerout', () => bg.clear().fillStyle(0x446644, 1).fillRect(-80, -20, 160, 40).lineStyle(2, 0x66aa66, 1).strokeRect(-80, -20, 160, 40));
     this.autoSelectButton.add(hitArea);
   }
 
@@ -361,9 +295,9 @@ export class MenuScene extends Phaser.Scene {
     
     const bg = this.add.graphics();
     bg.fillStyle(0x664444, 1);
-    bg.fillRoundedRect(-100, -25, 200, 50, 10);
+    bg.fillRect(-100, -25, 200, 50);
     bg.lineStyle(3, 0xaa6666, 1);
-    bg.strokeRoundedRect(-100, -25, 200, 50, 10);
+    bg.strokeRect(-100, -25, 200, 50);
     this.startButton.add(bg);
     
     const text = this.add.text(0, 0, 'START BATTLE', {
@@ -377,8 +311,8 @@ export class MenuScene extends Phaser.Scene {
     const hitArea = this.add.rectangle(0, 0, 200, 50, 0x000000, 0);
     hitArea.setInteractive({ useHandCursor: true });
     hitArea.on('pointerdown', () => this.startGame());
-    hitArea.on('pointerover', () => bg.clear().fillStyle(0x885555, 1).fillRoundedRect(-100, -25, 200, 50, 10).lineStyle(3, 0xcc8888, 1).strokeRoundedRect(-100, -25, 200, 50, 10));
-    hitArea.on('pointerout', () => bg.clear().fillStyle(0x664444, 1).fillRoundedRect(-100, -25, 200, 50, 10).lineStyle(3, 0xaa6666, 1).strokeRoundedRect(-100, -25, 200, 50, 10));
+    hitArea.on('pointerover', () => bg.clear().fillStyle(0x885555, 1).fillRect(-100, -25, 200, 50).lineStyle(3, 0xcc8888, 1).strokeRect(-100, -25, 200, 50));
+    hitArea.on('pointerout', () => bg.clear().fillStyle(0x664444, 1).fillRect(-100, -25, 200, 50).lineStyle(3, 0xaa6666, 1).strokeRect(-100, -25, 200, 50));
     this.startButton.add(hitArea);
   }
 
@@ -719,8 +653,14 @@ export class MenuScene extends Phaser.Scene {
   }
 
   private confirmTeam(): void {
+    // Both squads already locked in — Enter launches the battle.
+    if (this.selectionComplete) {
+      this.startGame();
+      return;
+    }
+
     const team = this.getCurrentTeam();
-    
+
     if (team.selected.length !== 5) {
       // Flash warning
       this.teamIndicator.setColor('#ff0000');
@@ -787,19 +727,19 @@ export class MenuScene extends Phaser.Scene {
       
       if (isSelected) {
         bg.fillStyle(0x2a4a2a, 1);
-        bg.fillRoundedRect(-cardWidth / 2, -cardHeight / 2, cardWidth, cardHeight, 10);
+        bg.fillRect(-cardWidth / 2, -cardHeight / 2, cardWidth, cardHeight);
         bg.lineStyle(3, 0x44ff44, 1);
-        bg.strokeRoundedRect(-cardWidth / 2, -cardHeight / 2, cardWidth, cardHeight, 10);
+        bg.strokeRect(-cardWidth / 2, -cardHeight / 2, cardWidth, cardHeight);
       } else if (isHighlighted) {
         bg.fillStyle(0x3a3a5a, 1);
-        bg.fillRoundedRect(-cardWidth / 2, -cardHeight / 2, cardWidth, cardHeight, 10);
+        bg.fillRect(-cardWidth / 2, -cardHeight / 2, cardWidth, cardHeight);
         bg.lineStyle(3, 0xffff00, 1);
-        bg.strokeRoundedRect(-cardWidth / 2, -cardHeight / 2, cardWidth, cardHeight, 10);
+        bg.strokeRect(-cardWidth / 2, -cardHeight / 2, cardWidth, cardHeight);
       } else {
         bg.fillStyle(0x2a2a4a, 1);
-        bg.fillRoundedRect(-cardWidth / 2, -cardHeight / 2, cardWidth, cardHeight, 10);
+        bg.fillRect(-cardWidth / 2, -cardHeight / 2, cardWidth, cardHeight);
         bg.lineStyle(2, soldier.color, 0.5);
-        bg.strokeRoundedRect(-cardWidth / 2, -cardHeight / 2, cardWidth, cardHeight, 10);
+        bg.strokeRect(-cardWidth / 2, -cardHeight / 2, cardWidth, cardHeight);
       }
       
       // Update selection number
@@ -835,97 +775,43 @@ export class MenuScene extends Phaser.Scene {
   private createCamouflageBackground(): void {
     const graphics = this.add.graphics();
     graphics.setDepth(-10);
-    
-    // Extend pattern beyond viewport to cover any borders
-    const padding = 200;
-    const areaWidth = 1280 + padding * 2;
-    const areaHeight = 720 + padding * 2;
-    const offsetX = -padding;
-    const offsetY = -padding;
-    
-    // Fill base color for extended area
-    graphics.fillStyle(0x4a5c3e, 1);
-    graphics.fillRect(offsetX, offsetY, areaWidth, areaHeight);
-    
-    // WW2 camouflage colors
-    const colors = [
-      0x3d4a2d, // Dark olive
-      0x5c6b4a, // Medium olive
-      0x6b5c3e, // Brown
-      0x4a3d2d, // Dark brown
-      0x7a6b4a, // Tan/khaki
-      0x2d3a24, // Very dark green
+
+    graphics.fillStyle(0x1d241b, 1);
+    graphics.fillRect(0, 0, 1280, 720);
+
+    const stripes = [
+      { color: 0x26311f, y: 0, h: 96 },
+      { color: 0x323b29, y: 96, h: 64 },
+      { color: 0x1a2119, y: 612, h: 108 },
     ];
-    
-    // Create large irregular blobs for the camo pattern
-    for (let i = 0; i < 80; i++) {
-      const x = offsetX + Math.random() * areaWidth;
-      const y = offsetY + Math.random() * areaHeight;
-      const color = colors[Math.floor(Math.random() * colors.length)];
-      
-      graphics.fillStyle(color, 0.9);
-      
-      // Create irregular blob shape using multiple overlapping ellipses
-      const baseSize = 80 + Math.random() * 120;
-      const numEllipses = 3 + Math.floor(Math.random() * 4);
-      
-      for (let j = 0; j < numEllipses; j++) {
-        const blobOffsetX = (Math.random() - 0.5) * baseSize * 0.6;
-        const blobOffsetY = (Math.random() - 0.5) * baseSize * 0.6;
-        const width = baseSize * (0.5 + Math.random() * 0.5);
-        const height = baseSize * (0.3 + Math.random() * 0.4);
-        const rotation = Math.random() * Math.PI;
-        
-        // Draw rotated ellipse by using multiple points
-        this.drawRotatedEllipse(graphics, x + blobOffsetX, y + blobOffsetY, width, height, rotation);
-      }
+
+    for (const stripe of stripes) {
+      graphics.fillStyle(stripe.color, 1);
+      graphics.fillRect(0, stripe.y, 1280, stripe.h);
     }
-    
-    // Add smaller detail blobs
-    for (let i = 0; i < 60; i++) {
-      const x = offsetX + Math.random() * areaWidth;
-      const y = offsetY + Math.random() * areaHeight;
-      const color = colors[Math.floor(Math.random() * colors.length)];
-      const size = 30 + Math.random() * 50;
-      
-      graphics.fillStyle(color, 0.85);
-      this.drawRotatedEllipse(graphics, x, y, size, size * 0.6, Math.random() * Math.PI);
+
+    const blocks = [
+      { x: -40, y: 78, w: 420, h: 110, color: 0x3b442d },
+      { x: 278, y: 30, w: 360, h: 84, color: 0x4b442d },
+      { x: 748, y: 56, w: 310, h: 92, color: 0x2e3a29 },
+      { x: 1036, y: 20, w: 320, h: 130, color: 0x51472f },
+      { x: 54, y: 610, w: 280, h: 110, color: 0x2b3324 },
+      { x: 360, y: 632, w: 390, h: 88, color: 0x403728 },
+      { x: 838, y: 600, w: 360, h: 120, color: 0x2f3828 },
+    ];
+
+    for (const block of blocks) {
+      graphics.fillStyle(block.color, 0.95);
+      graphics.fillRect(block.x, block.y, block.w, block.h);
     }
-    
-    // Add subtle texture with small spots
-    for (let i = 0; i < 150; i++) {
-      const x = offsetX + Math.random() * areaWidth;
-      const y = offsetY + Math.random() * areaHeight;
-      const color = colors[Math.floor(Math.random() * colors.length)];
-      const size = 5 + Math.random() * 15;
-      
-      graphics.fillStyle(color, 0.5);
-      graphics.fillCircle(x, y, size);
+
+    graphics.lineStyle(1, 0x506044, 0.28);
+    for (let x = 0; x <= 1280; x += 32) {
+      graphics.lineBetween(x, 0, x, 720);
+    }
+    for (let y = 0; y <= 720; y += 32) {
+      graphics.lineBetween(0, y, 1280, y);
     }
   }
 
-  private drawRotatedEllipse(graphics: Phaser.GameObjects.Graphics, cx: number, cy: number, width: number, height: number, rotation: number): void {
-    const points: { x: number; y: number }[] = [];
-    const segments = 12;
-    
-    for (let i = 0; i <= segments; i++) {
-      const angle = (i / segments) * Math.PI * 2;
-      const px = Math.cos(angle) * width / 2;
-      const py = Math.sin(angle) * height / 2;
-      
-      // Rotate point
-      const rotatedX = px * Math.cos(rotation) - py * Math.sin(rotation);
-      const rotatedY = px * Math.sin(rotation) + py * Math.cos(rotation);
-      
-      points.push({ x: cx + rotatedX, y: cy + rotatedY });
-    }
-    
-    graphics.beginPath();
-    graphics.moveTo(points[0].x, points[0].y);
-    for (let i = 1; i < points.length; i++) {
-      graphics.lineTo(points[i].x, points[i].y);
-    }
-    graphics.closePath();
-    graphics.fillPath();
-  }
 }

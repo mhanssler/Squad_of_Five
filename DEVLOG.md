@@ -8,6 +8,60 @@
 
 ## Changelog
 
+### [0.0.8] - 2026-07-01
+#### Changed (aim & movement feel, from playtest feedback)
+- **Power charge slowed**: 65/s → 35/s (~2.6s to full). The fast charge made overshooting
+  the intended power too easy; the down-cycle is slower too (85/s → 45/s).
+- **Numeric power readout**: a "NN%" label appears above the power bar while charging, so
+  precise power is judged by number instead of eyeballing a 50px bar.
+- **Smoothed mouse aim**: the aim rotates toward the pointer at a capped 240°/s instead of
+  snapping, ignores pointer positions within 26px of the soldier (where the angle used to
+  flip wildly), and no longer follows the scrolling world while panning with A/D — panning
+  used to drag your lined-up shot with it.
+- **Weightier troop movement**: soldiers accelerate to speed (~0.25s) and brake to a stop
+  instead of snapping; climbing slows them (down to ~45% on steep slopes) and downhill
+  gives a small boost; airborne control is reduced; real falls end with a landing squash
+  and dust kick.
+
+### [0.0.7] - 2026-07-01
+#### Fixed
+- **Self-hit bug (major)**: projectiles spawned inside the shooter's own hit circle when
+  aiming level or downward, so bullets/rockets instantly hit the firer — burst weapons
+  could self-kill in one shot. Projectiles now know their shooter: bullets never collide
+  with the firer, explosives ignore them for a 400ms spawn grace (a bad grenade bounce
+  can still punish you).
+- **Flamethrower self-burn**: the flame jet started inside the shooter's body and roasted
+  them for up to ~70 HP every shot. The shooter is now excluded from flame damage.
+- **Flamethrower one-shot kills**: overlapping flame-path damage points stacked 2-4x on
+  the same soldier (200+ damage per pass). Each damage wave now hits each soldier at most
+  once — a full burn deals up to 72, comparable to a grenade.
+- **Bullet ground-splash self-damage**: bullets impacting terrain at the shooter's feet no
+  longer chip the firer via their small splash radius (big explosives still self-damage).
+- **AI walking off cliffs**: high-mobility AI units (SMG/shotgun/flamer) sprinted straight
+  off cliffs and bottomless craters chasing targets, dying without firing. The AI now
+  probes the ground ahead and stops at lethal drops.
+- **Menu Enter-to-start**: after "BOTH SQUADS READY!", Enter now actually starts the
+  battle (previously only the button worked, contradicting the README).
+- Build errors from leftover half-finished code (unused class-ability fields).
+
+#### Changed
+- **Skippable intro**: SPACE/ENTER/ESC or click skips the bombardment + paradrop opening
+  (it also auto-ends as soon as everyone has landed, instead of a fixed 15s wait). Restarting
+  with N no longer costs 15 seconds. Skipping fast-forwards paratroopers to the ground and
+  cancels the quote narration.
+- **Power charge speed**: 18/s → 65/s (full charge ~1.4s instead of 5s). Release timing
+  still matters — power cycles back down at 85/s.
+- **Per-class walk animation**: walking no longer swaps every class to one generic walk
+  texture. Classes keep their unique sprite and march with a procedural rock/bob plus
+  footstep dust puffs.
+- **Team-colored name labels**: red/blue names above soldiers so sides are readable at a
+  glance (sprites themselves stay untinted).
+- **Turn header during selection** now shows "X Team — choose a soldier" instead of the
+  previous turn's stale text.
+- **Burst weapon trims** (pacing + framerate; per-shot damage roughly preserved):
+  rifle 30→15 rounds, SMG 50→25 (dmg 6→7), minigun 120→60 (dmg 3→4), carbine 20→12,
+  pistol 12→8.
+
 ### [0.0.6] - 2026-01-19
 #### Added
 - **Grappling Hook**: Press G to grapple in the aim direction

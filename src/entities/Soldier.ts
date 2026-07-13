@@ -17,6 +17,9 @@ const WEAPON_SPRITES: Record<WeaponType, string> = {
   [WeaponType.PISTOL]: 'worm-pistol',
   [WeaponType.SMG]: 'worm-smg',
   [WeaponType.MINIGUN]: 'worm-minigun',
+  [WeaponType.CARBINE]: 'worm-rifle',
+  [WeaponType.SLUG]: 'worm-shotgun',
+  [WeaponType.DEMO]: 'worm-grenade',
 };
 
 // Military quips for speech bubbles
@@ -46,6 +49,15 @@ export class Soldier {
   
   private moveSpeed: number = 150;
   private jumpForce: number = -350;
+
+  // Movement physics: soldiers accelerate/decelerate instead of snapping to full speed,
+  // climb slopes slower, and get a landing impact after real falls.
+  private moveInput: -1 | 0 | 1 = 0;
+  private grounded: boolean = true;
+  private peakFallSpeed: number = 0;
+  private static readonly WALK_ACCEL = 900; // px/s^2 while there is input
+  private static readonly WALK_DECEL = 1500; // px/s^2 braking to a stop
+  private static readonly AIR_CONTROL = 0.45; // fraction of ground accel while airborne
   
   private healthBar: Phaser.GameObjects.Graphics;
   private nameText: Phaser.GameObjects.Text;
@@ -62,7 +74,7 @@ export class Soldier {
   private grappleTarget: { x: number; y: number } | null = null;
   private grappleLine: Phaser.GameObjects.Graphics | null = null;
   private grappleUsesThisTurn: number = 0;
-  private maxGrappleUsesPerTurn: number = 2;
+  private maxGrappleUsesPerTurn: number = 3; // Increased from 2
   
   // Visual outline for better visibility
   private outline: Phaser.GameObjects.Graphics;
@@ -70,12 +82,16 @@ export class Soldier {
   // Animation state
   private standingTexture: string;
   private isWalking: boolean = false;
-  private walkAnimTimer: Phaser.Time.TimerEvent | null = null;
-  private currentWalkFrame: number = 1;
+  private walkRockTween: Phaser.Tweens.Tween | null = null;
+  private walkBobTween: Phaser.Tweens.Tween | null = null;
+  private walkDustTimer: Phaser.Time.TimerEvent | null = null;
+  private baseScaleX: number = 1;
+  private baseScaleY: number = 1;
 
-  // Call-in powerups (from supply drops)
+// Call-in powerups (from supply drops)
   private airstrikeCharges: number = 0;
   private artilleryCharges: number = 0;
+  private armor: number = 0;
 
   constructor(scene: Phaser.Scene, x: number, y: number, team: Team, name: string, squadIndex: number, disableGravity: boolean = false, weaponType?: WeaponType) {
     this.scene = scene;
@@ -99,6 +115,8 @@ export class Soldier {
     
     // Set sprite display size - 64x64 sprites displayed at 56x56 for good detail
     this.sprite.setDisplaySize(56, 56);
+    this.baseScaleX = this.sprite.scaleX;
+    this.baseScaleY = this.sprite.scaleY;
     this.sprite.body!.setSize(20, 36); // Tighter collision box adjusted for new proportions
     
     // Disable gravity if requested (for paratrooper drop)
@@ -120,12 +138,12 @@ export class Soldier {
     this.healthBar = scene.add.graphics();
     this.healthBar.setVisible(false);
 
-    // Create name label - bigger and more visible
+    // Create name label - bigger and more visible, colored by team so sides are readable at a glance
     this.nameText = scene.add.text(x, y - 40, name, {
       font: 'bold 11px Arial',
-      color: '#ffffff',
+      color: team === Team.RED ? '#ff8877' : '#88bbff',
       stroke: '#000000',
-      strokeThickness: 2,
+      strokeThickness: 3,
     });
     this.nameText.setOrigin(0.5);
     
@@ -175,6 +193,10 @@ export class Soldier {
     return this.artilleryCharges;
   }
 
+  public getArmor(): number {
+    return this.armor;
+  }
+
   public addAirstrikeCharges(count: number = 1): void {
     if (!this.alive) return;
     const add = Math.max(0, Math.floor(count));
@@ -185,6 +207,13 @@ export class Soldier {
     if (!this.alive) return;
     const add = Math.max(0, Math.floor(count));
     this.artilleryCharges = Math.min(3, this.artilleryCharges + add);
+  }
+
+  public addArmor(amount: number): void {
+    if (!this.alive) return;
+    const add = Math.max(0, Math.floor(amount));
+    this.armor = Math.min(75, this.armor + add);
+    this.showHealthBar();
   }
 
   public consumeAirstrikeCharge(): boolean {
@@ -204,7 +233,17 @@ export class Soldier {
   public setActive(isActive: boolean): void {
     this.active = isActive;
     this.weaponText.setVisible(isActive);
-    
+
+    if (!isActive) {
+      // Movement steering only runs on the active soldier — kill any leftover walk speed
+      // so a soldier can't keep sliding after their turn ends.
+      this.moveInput = 0;
+      if (this.sprite.body) {
+        this.sprite.setVelocityX(0);
+      }
+      this.stopWalkingAnimation();
+    }
+
     // Show speech bubble when selected
     if (isActive) {
       this.showSpeechBubble('selected');
@@ -213,55 +252,104 @@ export class Soldier {
 
   public moveLeft(): void {
     if (!this.active || !this.alive || this.isGrappling) return;
-    this.sprite.setVelocityX(-this.moveSpeed);
+    this.moveInput = -1;
     this.sprite.setFlipX(true);
     this.startWalkingAnimation();
   }
 
   public moveRight(): void {
     if (!this.active || !this.alive || this.isGrappling) return;
-    this.sprite.setVelocityX(this.moveSpeed);
+    this.moveInput = 1;
     this.sprite.setFlipX(false);
     this.startWalkingAnimation();
   }
 
   public stopMoving(): void {
     if (!this.alive || this.isGrappling) return;
-    this.sprite.setVelocityX(0);
+    this.moveInput = 0;
     this.stopWalkingAnimation();
   }
 
+  public setMoveSpeed(speed: number): void {
+    this.moveSpeed = Math.max(80, speed);
+  }
+
+  // Procedural march: keep the class-specific sprite (no generic walk texture swap) and
+  // sell the movement with a rocking sway, a step bounce, and footstep dust.
   private startWalkingAnimation(): void {
     if (this.isWalking) return;
     this.isWalking = true;
-    
-    // Switch to walking sprite
-    this.sprite.setTexture('soldier-walk1');
-    this.currentWalkFrame = 1;
-    
-    // Alternate between walk frames
-    this.walkAnimTimer = this.scene.time.addEvent({
-      delay: 250,
+
+    this.walkRockTween = this.scene.tweens.add({
+      targets: this.sprite,
+      angle: { from: -5, to: 5 },
+      duration: 140,
+      yoyo: true,
+      repeat: -1,
+      ease: 'Sine.easeInOut',
+    });
+
+    this.walkBobTween = this.scene.tweens.add({
+      targets: this.sprite,
+      scaleY: this.baseScaleY * 0.93,
+      scaleX: this.baseScaleX * 1.04,
+      duration: 140,
+      yoyo: true,
+      repeat: -1,
+      ease: 'Sine.easeInOut',
+    });
+
+    this.walkDustTimer = this.scene.time.addEvent({
+      delay: 170,
+      loop: true,
       callback: () => {
         if (!this.isWalking || !this.alive) return;
-        this.currentWalkFrame = this.currentWalkFrame === 1 ? 2 : 1;
-        this.sprite.setTexture(`soldier-walk${this.currentWalkFrame}`);
+        this.spawnFootstepDust();
       },
-      loop: true,
+    });
+  }
+
+  private spawnFootstepDust(): void {
+    const puff = this.scene.add.circle(
+      this.sprite.x + (Math.random() - 0.5) * 10,
+      this.sprite.y + 22,
+      2 + Math.random() * 2.5,
+      0xbfa77a,
+      0.45
+    );
+    puff.setDepth(this.sprite.depth - 1);
+    this.scene.tweens.add({
+      targets: puff,
+      x: puff.x - (this.sprite.flipX ? -1 : 1) * (6 + Math.random() * 8),
+      y: puff.y - (3 + Math.random() * 5),
+      alpha: 0,
+      scale: 1.8,
+      duration: 280 + Math.random() * 140,
+      ease: 'Quad.easeOut',
+      onComplete: () => puff.destroy(),
     });
   }
 
   private stopWalkingAnimation(): void {
     if (!this.isWalking) return;
     this.isWalking = false;
-    
-    // Stop the animation timer
-    if (this.walkAnimTimer) {
-      this.walkAnimTimer.destroy();
-      this.walkAnimTimer = null;
+
+    if (this.walkRockTween) {
+      this.walkRockTween.stop();
+      this.walkRockTween = null;
     }
-    
-    // Return to unique standing pose
+    if (this.walkBobTween) {
+      this.walkBobTween.stop();
+      this.walkBobTween = null;
+    }
+    if (this.walkDustTimer) {
+      this.walkDustTimer.destroy();
+      this.walkDustTimer = null;
+    }
+
+    // Settle back into the class-specific standing pose.
+    this.sprite.setAngle(0);
+    this.sprite.setScale(this.baseScaleX, this.baseScaleY);
     this.sprite.setTexture(this.standingTexture);
   }
 
@@ -295,13 +383,14 @@ export class Soldier {
       angle,
       power,
       this.weapon,
-      terrain
+      terrain,
+      this
     );
   }
 
 
-  // Grappling hook system - requires terrain connection
-  public startGrapple(targetX: number, targetY: number, terrain: Terrain): boolean {
+  // Grappling hook system - can also target empty air (jetpack mode)
+  public startGrapple(targetX: number, targetY: number, terrain: Terrain, requireTerrain: boolean = true): boolean {
     if (!this.active || !this.alive || this.isGrappling) return false;
     
     // Check if we've used up grapple uses this turn
@@ -310,25 +399,30 @@ export class Soldier {
       return false;
     }
     
-    // Check range (max 300 pixels)
+    // Check range (max 400 pixels - increased from 300)
     const distance = Phaser.Math.Distance.Between(this.sprite.x, this.sprite.y, targetX, targetY);
-    if (distance > 300) return false;
+    if (distance > 400) return false;
     
     // Check if grapple would hit terrain (raycast along the path)
     const hitPoint = this.findGrappleHitPoint(this.sprite.x, this.sprite.y, targetX, targetY, terrain);
     
     if (!hitPoint) {
-      // No terrain connection - grapple fails
-      this.showSpeechBubble('hit'); // Use hit quip for failure
-      return false;
+      if (requireTerrain) {
+        // No terrain connection - grapple fails
+        this.showSpeechBubble('hit'); // Use hit quip for failure
+        return false;
+      }
+      // Jetpack mode - can grapple to any point in air
+      this.grappleTarget = { x: targetX, y: targetY };
+    } else {
+      // Use the hit point as the actual target
+      this.grappleTarget = hitPoint;
     }
     
     // Use a grapple
     this.grappleUsesThisTurn++;
     
-    // Use the hit point as the actual target
     this.isGrappling = true;
-    this.grappleTarget = hitPoint;
     
     // Create grapple line (hidden initially during windup)
     this.grappleLine = this.scene.add.graphics();
@@ -340,25 +434,30 @@ export class Soldier {
     // Disable gravity temporarily
     (this.sprite.body as Phaser.Physics.Arcade.Body).setAllowGravity(false);
     
-    // Calculate landing position (just below the hit point on the terrain surface)
-    const landingY = terrain.getSurfaceY(hitPoint.x) - 15;
+    // Calculate landing position
+    let landingY: number;
+    if (hitPoint) {
+      landingY = terrain.getSurfaceY(hitPoint.x) - 15;
+    } else {
+      landingY = this.grappleTarget.y; // Jetpack - go to exact target
+    }
     
     // *** TWIRLING ANIMATION before throwing ***
     this.scene.tweens.add({
       targets: this.sprite,
       angle: { from: 0, to: 360 },
-      duration: 300,
+      duration: 250, // Faster
       ease: 'Power1',
       onComplete: () => {
         // Reset rotation and throw the hook
         this.sprite.setAngle(0);
         
-        // Animate movement to target
+        // Animate movement to target - faster
         this.scene.tweens.add({
           targets: this.sprite,
-          x: hitPoint.x,
+          x: this.grappleTarget!.x,
           y: landingY,
-          duration: 500,
+          duration: 400, // Faster from 500
           ease: 'Power2',
           onUpdate: () => this.updateGrappleLine(),
           onComplete: () => this.endGrapple(),
@@ -503,7 +602,14 @@ export class Soldier {
   public takeDamage(amount: number): void {
     if (!this.alive) return;
 
-    this.health = Math.max(0, this.health - amount);
+    let damageToHealth = amount;
+    if (this.armor > 0) {
+      const absorbed = Math.min(this.armor, Math.ceil(amount * 0.65));
+      this.armor -= absorbed;
+      damageToHealth = Math.max(0, amount - absorbed);
+    }
+
+    this.health = Math.max(0, this.health - damageToHealth);
     
     // Show hit quip
     if (this.health > 0) {
@@ -534,10 +640,10 @@ export class Soldier {
     const damageText = this.scene.add.text(
       this.sprite.x + (Math.random() - 0.5) * 20,
       this.sprite.y - 40,
-      `-${amount}`,
+      damageToHealth > 0 ? `-${damageToHealth}` : 'ARMOR',
       {
         font: 'bold 24px Arial',
-        color: amount >= 30 ? '#ff0000' : '#ff6644',
+        color: damageToHealth === 0 ? '#66ccff' : damageToHealth >= 30 ? '#ff0000' : '#ff6644',
         stroke: '#000000',
         strokeThickness: 4,
       }
@@ -556,7 +662,7 @@ export class Soldier {
     });
     
     // Blood/hit particles
-    for (let i = 0; i < Math.min(amount / 5, 8); i++) {
+    for (let i = 0; i < Math.min(damageToHealth / 5, 8); i++) {
       const particle = this.scene.add.circle(
         this.sprite.x + (Math.random() - 0.5) * 20,
         this.sprite.y + (Math.random() - 0.5) * 20,
@@ -672,15 +778,26 @@ export class Soldier {
 
   public applyKnockback(forceX: number, forceY: number): void {
     if (!this.alive) return;
+    const body = this.sprite.body as Phaser.Physics.Arcade.Body;
+    const maxImpulseX = 180;
+    const maxImpulseY = 150;
+    const maxVelocityX = 230;
+    const maxVelocityY = 210;
+
+    const impulseX = Phaser.Math.Clamp(forceX, -maxImpulseX, maxImpulseX);
+    const impulseY = Phaser.Math.Clamp(forceY, -maxImpulseY, maxImpulseY);
+
+    body.setAllowGravity(true);
     this.sprite.setVelocity(
-      this.sprite.body!.velocity.x + forceX,
-      this.sprite.body!.velocity.y + forceY
+      Phaser.Math.Clamp(body.velocity.x * 0.35 + impulseX, -maxVelocityX, maxVelocityX),
+      Phaser.Math.Clamp(body.velocity.y * 0.35 + impulseY, -maxVelocityY, maxVelocityY)
     );
   }
 
   private die(): void {
     this.alive = false;
     this.active = false;
+    this.stopWalkingAnimation();
 
     // Play death sound
     SoundManager.playDeath();
@@ -799,10 +916,11 @@ export class Soldier {
   // Called when soldier falls off the map
   public fallToDeath(): void {
     if (!this.alive) return;
-    
+
     this.alive = false;
     this.active = false;
     this.health = 0;
+    this.stopWalkingAnimation();
     
     // Immediately hide and destroy - they fell off!
     this.sprite.setVisible(false);
@@ -849,7 +967,7 @@ export class Soldier {
     const healthPercent = this.health / this.maxHealth;
     let color: number;
     if (healthPercent > 0.5) {
-      color = 0x44ff44;
+        color = this.armor > 0 ? 0x66ccff : 0x44ff44;
     } else if (healthPercent > 0.25) {
       color = 0xffff44;
     } else {
@@ -860,8 +978,98 @@ export class Soldier {
     this.healthBar.fillRect(x, y, barWidth * healthPercent, barHeight);
   }
 
-  public update(): void {
+  // Terrain collision runs in GameScene; it reports back here so landings can react.
+  public setGrounded(isGrounded: boolean): void {
+    if (!this.alive || !this.sprite.body) return;
+    const body = this.sprite.body as Phaser.Physics.Arcade.Body;
+
+    if (!isGrounded) {
+      this.peakFallSpeed = Math.max(this.peakFallSpeed, body.velocity.y);
+    } else if (!this.grounded) {
+      // Just touched down — a real fall gets a thump (small step-downs don't).
+      if (this.peakFallSpeed > 260) {
+        this.playLandingEffect();
+      }
+      this.peakFallSpeed = 0;
+    }
+
+    this.grounded = isGrounded;
+  }
+
+  private playLandingEffect(): void {
+    // Squash on impact (skip while the walk tweens own the sprite's scale)
+    if (!this.isWalking) {
+      this.sprite.setScale(this.baseScaleX * 1.12, this.baseScaleY * 0.8);
+      this.scene.tweens.add({
+        targets: this.sprite,
+        scaleX: this.baseScaleX,
+        scaleY: this.baseScaleY,
+        duration: 160,
+        ease: 'Back.easeOut',
+      });
+    }
+
+    // Dust kicked out to both sides
+    for (let i = 0; i < 6; i++) {
+      const side = i % 2 === 0 ? -1 : 1;
+      const puff = this.scene.add.circle(
+        this.sprite.x + side * (4 + Math.random() * 6),
+        this.sprite.y + 22,
+        2.5 + Math.random() * 3,
+        0xbfa77a,
+        0.5
+      );
+      puff.setDepth(this.sprite.depth - 1);
+      this.scene.tweens.add({
+        targets: puff,
+        x: puff.x + side * (10 + Math.random() * 14),
+        y: puff.y - (2 + Math.random() * 6),
+        alpha: 0,
+        scale: 2,
+        duration: 320 + Math.random() * 160,
+        ease: 'Quad.easeOut',
+        onComplete: () => puff.destroy(),
+      });
+    }
+  }
+
+  // Accelerate toward the input direction rather than snapping to full speed.
+  // Uphill slows the soldier down, downhill gives a slight boost.
+  private updateMovementPhysics(dt: number, terrain: Terrain | null): void {
+    if (!this.active || this.isGrappling || !this.sprite.body) return;
+    const body = this.sprite.body as Phaser.Physics.Arcade.Body;
+
+    let targetVX = 0;
+    if (this.moveInput !== 0) {
+      let slopeFactor = 1;
+      if (terrain) {
+        const lookAhead = 16;
+        const hereY = terrain.getSurfaceY(this.sprite.x);
+        const aheadY = terrain.getSurfaceY(this.sprite.x + this.moveInput * lookAhead);
+        const rise = (hereY - aheadY) / lookAhead; // > 0 means climbing
+        slopeFactor = rise > 0
+          ? Phaser.Math.Clamp(1 - rise * 0.5, 0.45, 1)
+          : Math.min(1.15, 1 - rise * 0.12);
+      }
+      targetVX = this.moveInput * this.moveSpeed * slopeFactor;
+    }
+
+    const baseAccel = this.moveInput !== 0 ? Soldier.WALK_ACCEL : Soldier.WALK_DECEL;
+    const accel = baseAccel * (this.grounded ? 1 : Soldier.AIR_CONTROL);
+    const dv = targetVX - body.velocity.x;
+    const step = accel * dt;
+
+    if (Math.abs(dv) <= step) {
+      body.setVelocityX(targetVX);
+    } else {
+      body.setVelocityX(body.velocity.x + Math.sign(dv) * step);
+    }
+  }
+
+  public update(dt: number = 0.016, terrain: Terrain | null = null): void {
     if (!this.alive) return;
+
+    this.updateMovementPhysics(dt, terrain);
 
     // Update health bar position if visible
     if (this.healthBarVisible) {
@@ -911,8 +1119,14 @@ export class Soldier {
     if (this.outline) {
       this.outline.destroy();
     }
-    if (this.walkAnimTimer) {
-      this.walkAnimTimer.destroy();
+    if (this.walkRockTween) {
+      this.walkRockTween.stop();
+    }
+    if (this.walkBobTween) {
+      this.walkBobTween.stop();
+    }
+    if (this.walkDustTimer) {
+      this.walkDustTimer.destroy();
     }
     this.healthBar.destroy();
     this.nameText.destroy();

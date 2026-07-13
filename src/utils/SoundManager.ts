@@ -15,6 +15,7 @@ class SoundManagerClass {
   private masterGain: GainNode | null = null;
   private initialized = false;
   private speechSynth: SpeechSynthesis | null = null;
+  private speechToken = 0;
   private volume = 0.5;
   private musicGain: GainNode | null = null;
   private musicPlaying = false;
@@ -698,13 +699,13 @@ class SoundManagerClass {
     const now = this.audioContext.currentTime;
     this.musicGain.gain.cancelScheduledValues(now);
     this.musicGain.gain.setValueAtTime(0.0001, now);
-    this.musicGain.gain.linearRampToValueAtTime(this.volume * 0.34, now + 0.8);
+    this.musicGain.gain.linearRampToValueAtTime(this.volume * 0.24, now + 1.0);
     
     // Play a simple military march pattern in a loop
     this.playMarchLoop();
   }
 
-  // Classical in-game music (cello-forward, procedural).
+  // Tactical in-game music (restrained military cadence, procedural).
   public async startCelloMusic(): Promise<void> {
     if (!await this.ensureContext() || !this.audioContext || !this.musicGain) return;
     if (this.musicPlaying) return;
@@ -714,7 +715,7 @@ class SoundManagerClass {
     const now = this.audioContext.currentTime;
     this.musicGain.gain.cancelScheduledValues(now);
     this.musicGain.gain.setValueAtTime(0.0001, now);
-    this.musicGain.gain.linearRampToValueAtTime(this.volume * 0.28, now + 1.2);
+    this.musicGain.gain.linearRampToValueAtTime(this.volume * 0.24, now + 1.6);
 
     this.playCelloLoop();
   }
@@ -729,25 +730,15 @@ class SoundManagerClass {
     this.musicOscillators = [];
     
     // Drum-forward march with a subdued brass-like line.
-    // (Less synthy than the previous sawtooth melody.)
     const melody = [
-      { freq: 164.81, dur: 0.25 }, // E3
-      { freq: 196.00, dur: 0.25 }, // G3
-      { freq: 246.94, dur: 0.25 }, // B3
-      { freq: 329.63, dur: 0.25 }, // E4
-      { freq: 293.66, dur: 0.25 }, // D4
-      { freq: 246.94, dur: 0.25 }, // B3
-      { freq: 196.00, dur: 0.25 }, // G3
-      { freq: 164.81, dur: 0.25 }, // E3
-
-      { freq: 196.00, dur: 0.25 }, // G3
-      { freq: 246.94, dur: 0.25 }, // B3
-      { freq: 329.63, dur: 0.25 }, // E4
-      { freq: 392.00, dur: 0.25 }, // G4
-      { freq: 329.63, dur: 0.25 }, // E4
-      { freq: 246.94, dur: 0.25 }, // B3
-      { freq: 196.00, dur: 0.25 }, // G3
-      { freq: 164.81, dur: 0.25 }, // E3
+      { freq: 146.83, dur: 0.5 }, // D3
+      { freq: 146.83, dur: 0.5 }, // D3
+      { freq: 174.61, dur: 0.5 }, // F3
+      { freq: 164.81, dur: 0.5 }, // E3
+      { freq: 146.83, dur: 0.5 }, // D3
+      { freq: 130.81, dur: 0.5 }, // C3
+      { freq: 110.00, dur: 0.5 }, // A2
+      { freq: 146.83, dur: 0.5 }, // D3
     ];
     
     let time = now;
@@ -760,14 +751,14 @@ class SoundManagerClass {
       
       const filter = ctx.createBiquadFilter();
       filter.type = 'lowpass';
-      filter.frequency.value = 950;
+      filter.frequency.value = 700;
       filter.Q.value = 1.6;
       
       const gain = ctx.createGain();
       gain.gain.setValueAtTime(0, time);
       // Keep melody subtle; drums carry the track.
-      gain.gain.linearRampToValueAtTime(0.035, time + 0.015);
-      gain.gain.setValueAtTime(0.025, time + note.dur - 0.03);
+      gain.gain.linearRampToValueAtTime(0.022, time + 0.035);
+      gain.gain.setValueAtTime(0.015, time + note.dur - 0.08);
       gain.gain.linearRampToValueAtTime(0, time + note.dur);
       
       osc.connect(filter);
@@ -803,44 +794,47 @@ class SoundManagerClass {
     // Notes stop on their own; keep only the current loop's oscillators so this doesn't grow unbounded.
     this.musicOscillators = [];
 
-    const bpm = 68;
+    const bpm = 84;
     const beat = 60 / bpm;
     const bar = beat * 4;
 
-    type Chord = { bass: number; tones: number[] };
+    const makeNoiseBuffer = (seconds: number, decay: number): AudioBuffer => {
+      const bufferSize = Math.max(1, Math.floor(ctx.sampleRate * seconds));
+      const b = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+      const data = b.getChannelData(0);
+      for (let i = 0; i < bufferSize; i++) {
+        const env = Math.exp(-i / (bufferSize * decay));
+        data[i] = (Math.random() * 2 - 1) * env;
+      }
+      return b;
+    };
 
-    // D minor -> Bb major -> G minor -> A major (classical cadence-ish loop).
-    const progression: Chord[] = [
-      { bass: 73.42, tones: [146.83, 174.61, 220.0] }, // Dm (D3, F3, A3)
-      { bass: 58.27, tones: [116.54, 146.83, 174.61] }, // Bb (Bb2, D3, F3)
-      { bass: 98.0, tones: [196.0, 146.83, 116.54] }, // Gm (G3, D3, Bb2)
-      { bass: 110.0, tones: [220.0, 164.81, 138.59] }, // A (A3, E3, C#3)
-    ];
+    const snareBuf = makeNoiseBuffer(0.16, 0.16);
+    const airBuf = makeNoiseBuffer(3.2, 0.95);
 
-    const scheduleBowed = (freq: number, start: number, dur: number, level: number, brightness: number): void => {
+    const scheduleDrone = (freq: number, start: number, dur: number, level: number): void => {
       const osc = ctx.createOscillator();
       osc.type = 'sawtooth';
       osc.frequency.setValueAtTime(freq, start);
 
-      // Gentle vibrato.
       const lfo = ctx.createOscillator();
       lfo.type = 'sine';
-      lfo.frequency.setValueAtTime(5.2, start);
+      lfo.frequency.setValueAtTime(3.8, start);
       const lfoGain = ctx.createGain();
-      lfoGain.gain.setValueAtTime(3.0, start); // +/- Hz
+      lfoGain.gain.setValueAtTime(1.4, start);
       lfo.connect(lfoGain);
       lfoGain.connect(osc.frequency);
 
       const filter = ctx.createBiquadFilter();
       filter.type = 'lowpass';
-      filter.Q.value = 0.9;
-      filter.frequency.setValueAtTime(brightness, start);
-      filter.frequency.exponentialRampToValueAtTime(Math.max(180, brightness * 0.65), start + dur);
+      filter.Q.value = 0.7;
+      filter.frequency.setValueAtTime(240, start);
+      filter.frequency.linearRampToValueAtTime(180, start + dur);
 
       const gain = ctx.createGain();
       gain.gain.setValueAtTime(0.0001, start);
-      gain.gain.linearRampToValueAtTime(level, start + 0.035);
-      gain.gain.setValueAtTime(level * 0.9, start + Math.max(0.05, dur - 0.12));
+      gain.gain.linearRampToValueAtTime(level, start + 0.3);
+      gain.gain.setValueAtTime(level * 0.92, start + Math.max(0.4, dur - 0.5));
       gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
 
       osc.connect(filter);
@@ -856,39 +850,117 @@ class SoundManagerClass {
       this.musicOscillators.push(lfo, osc);
     };
 
-    let time = now;
-    const loopBars = 8; // 2 bars per chord (lush, slower movement)
-    const chordsInLoop = progression.length;
-    const totalBars = loopBars;
-    const barsPerChord = totalBars / chordsInLoop; // 2
+    const scheduleHorn = (freq: number, start: number, dur: number, level: number): void => {
+      const osc = ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(freq, start);
 
-    for (let i = 0; i < chordsInLoop; i++) {
-      const chord = progression[i];
-      const chordStart = time;
-      const chordDur = bar * barsPerChord;
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.Q.value = 1.8;
+      filter.frequency.setValueAtTime(720, start);
 
-      // Low cello drone (bowed bass).
-      scheduleBowed(chord.bass, chordStart, chordDur, 0.06, 420);
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.linearRampToValueAtTime(level, start + 0.08);
+      gain.gain.setValueAtTime(level * 0.75, start + Math.max(0.1, dur - 0.18));
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
 
-      // Mid cello arpeggio (quarter notes).
-      const arp = chord.tones;
-      for (let b = 0; b < barsPerChord * 4; b++) {
-        const t = chordStart + b * beat;
-        const note = arp[b % arp.length];
-        scheduleBowed(note, t, beat * 0.92, 0.032, 640);
+      osc.connect(filter);
+      filter.connect(gain);
+      gain.connect(out);
+      osc.start(start);
+      osc.stop(start + dur + 0.02);
+      this.musicOscillators.push(osc);
+    };
+
+    const scheduleSnare = (t: number, accent: number): void => {
+      const noise = ctx.createBufferSource();
+      noise.buffer = snareBuf;
+
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'bandpass';
+      filter.frequency.setValueAtTime(1450, t);
+      filter.Q.value = 1.1;
+
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.12 * accent, t);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+
+      noise.connect(filter);
+      filter.connect(gain);
+      gain.connect(out);
+      noise.start(t);
+      noise.stop(t + 0.18);
+    };
+
+    const scheduleKick = (t: number, accent: number): void => {
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(82, t);
+      osc.frequency.exponentialRampToValueAtTime(38, t + 0.16);
+
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.11 * accent, t);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.2);
+
+      osc.connect(gain);
+      gain.connect(out);
+      osc.start(t);
+      osc.stop(t + 0.2);
+    };
+
+    const scheduleAir = (start: number, dur: number): void => {
+      const air = ctx.createBufferSource();
+      air.buffer = airBuf;
+      air.loop = true;
+
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'bandpass';
+      filter.frequency.setValueAtTime(310, start);
+      filter.Q.value = 0.45;
+
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.linearRampToValueAtTime(0.026, start + 0.8);
+      gain.gain.setValueAtTime(0.022, start + dur - 0.5);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+
+      air.connect(filter);
+      filter.connect(gain);
+      gain.connect(out);
+      air.start(start);
+      air.stop(start + dur);
+    };
+
+    const loopDuration = bar * 8;
+    scheduleAir(now, loopDuration);
+    scheduleDrone(55.0, now, loopDuration, 0.052); // A1
+    scheduleDrone(73.42, now + bar * 4, bar * 4, 0.035); // D2 answer
+
+    // Sparse, serious field cadence: mostly 1/3 kick with restrained snare answers.
+    for (let barIndex = 0; barIndex < 8; barIndex++) {
+      const t = now + barIndex * bar;
+      scheduleKick(t, barIndex % 4 === 0 ? 1.3 : 1.0);
+      scheduleKick(t + beat * 2, 0.8);
+      scheduleSnare(t + beat, 0.85);
+      scheduleSnare(t + beat * 3, 0.7);
+
+      if (barIndex === 3 || barIndex === 7) {
+        scheduleSnare(t + beat * 3.5, 0.45);
+        scheduleSnare(t + beat * 3.68, 0.35);
+        scheduleSnare(t + beat * 3.84, 0.32);
       }
-
-      // Simple lyrical "cello melody" (half notes near the top tone).
-      for (let h = 0; h < barsPerChord * 2; h++) {
-        const t = chordStart + h * (beat * 2);
-        const note = arp[(h + 1) % arp.length] * 1.0;
-        scheduleBowed(note, t, beat * 1.85, 0.018, 820);
-      }
-
-      time += chordDur;
     }
 
-    const loopDuration = bar * totalBars;
+    // Distant bugle-like fragments in a minor mode, with lots of room between them.
+    scheduleHorn(220.0, now + beat * 0.5, beat * 1.35, 0.026); // A3
+    scheduleHorn(261.63, now + beat * 2.15, beat * 0.9, 0.020); // C4
+    scheduleHorn(293.66, now + bar + beat * 0.5, beat * 1.2, 0.022); // D4
+    scheduleHorn(246.94, now + bar * 2 + beat * 1.0, beat * 1.35, 0.020); // B3
+    scheduleHorn(220.0, now + bar * 4 + beat * 0.5, beat * 1.6, 0.025); // A3
+    scheduleHorn(174.61, now + bar * 6 + beat * 2.0, beat * 1.5, 0.021); // F3
+
     setTimeout(() => {
       if (this.musicPlaying) this.playCelloLoop();
     }, loopDuration * 1000);
@@ -1136,14 +1208,23 @@ class SoundManagerClass {
   
   // ============ CHURCHILL-STYLE QUOTE READING ============
   
+  // Cancels in-progress narration and any scheduled follow-up (e.g. when the intro is skipped).
+  public stopSpeech(): void {
+    this.speechToken++;
+    if (this.speechSynth) {
+      this.speechSynth.cancel();
+    }
+  }
+
   public async speakQuote(text: string, author: string): Promise<void> {
     if (!this.speechSynth) {
       this.init();
     }
     if (!this.speechSynth) return;
-    
+
     // Cancel any ongoing speech
     this.speechSynth.cancel();
+    const token = ++this.speechToken;
     
     // Speak the quote with Churchill-like delivery
     const utterance = new SpeechSynthesisUtterance(text);
@@ -1170,6 +1251,7 @@ class SoundManagerClass {
     // Speak author after a pause
     setTimeout(() => {
       if (!this.speechSynth) return;
+      if (token !== this.speechToken) return;
       const authorUtterance = new SpeechSynthesisUtterance(author);
       authorUtterance.rate = 0.85;
       authorUtterance.pitch = 0.8;

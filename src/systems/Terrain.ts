@@ -674,21 +674,24 @@ export class Terrain {
 
   public checkCollision(sprite: Phaser.Physics.Arcade.Sprite): boolean {
     const body = sprite.body as Phaser.Physics.Arcade.Body;
+    const footOffsetY = 14;
+    const halfFootWidth = 7;
+    const maxStepUp = 18;
+    const maxStepDown = 32;
+    const maxContactSpread = 24;
 
-    // Check at the bottom of the sprite (feet level)
-    // Use the existing heuristic to avoid changing overall feel, but add robust "un-stuck" resolution below.
-    let spriteBottom = Math.floor(sprite.y + 14); // Sprites are ~28px body height
-    let x = Math.floor(sprite.x);
+    let footY = Math.floor(sprite.y + footOffsetY);
 
-    // Prevent falling below world
-    if (spriteBottom >= this.height - 5) {
-      sprite.y = this.height - 20;
+    // Prevent falling below world.
+    if (footY >= this.height - 5) {
+      sprite.y = this.height - footOffsetY - 5;
       body.setVelocityY(0);
+      body.setAllowGravity(false);
       return true;
     }
 
-    // Check if point is within bounds
-    if (x < 0 || x >= this.width || spriteBottom < 0) {
+    if (sprite.x < 0 || sprite.x >= this.width || footY < 0) {
+      body.setAllowGravity(true);
       return false;
     }
 
@@ -707,77 +710,61 @@ export class Terrain {
       return false;
     };
 
-    const getFootCheckPoints = (): { x: number; y: number }[] => [
-      { x: x - 6, y: spriteBottom },
-      { x: x, y: spriteBottom },
-      { x: x + 6, y: spriteBottom },
-      { x: x - 6, y: spriteBottom + 2 },
-      { x: x, y: spriteBottom + 2 },
-      { x: x + 6, y: spriteBottom + 2 },
+    const findLocalSurface = (sampleX: number): number | null => {
+      return this.findSurfaceYAtOrBelow(
+        sampleX,
+        footY - maxStepUp,
+        maxStepUp + maxStepDown
+      );
+    };
+
+    const footSamples = [
+      sprite.x - halfFootWidth,
+      sprite.x,
+      sprite.x + halfFootWidth,
     ];
+    const surfaces = footSamples
+      .map(findLocalSurface)
+      .filter((y): y is number => y !== null);
 
     let onGround = false;
-    let groundY = this.height;
 
-    for (const point of getFootCheckPoints()) {
-      const px = Math.floor(point.x);
-      const py = Math.floor(point.y);
+    if (surfaces.length > 0 && body.velocity.y >= -30) {
+      const highestSurface = Math.min(...surfaces);
+      const lowestSurface = Math.max(...surfaces);
+      const contactSpread = lowestSurface - highestSurface;
+      const targetY = highestSurface - footOffsetY;
+      const snapDelta = targetY - sprite.y;
 
-      if (px < 0 || px >= this.width || py < 0 || py >= this.height) continue;
-
-      const index = (py * this.width + px) * 4;
-      const alpha = this.collisionData[index + 3];
-
-      if (alpha > 128) {
+      if (contactSpread <= maxContactSpread && snapDelta >= -maxStepUp && snapDelta <= maxStepDown) {
+        sprite.y = targetY;
+        body.setVelocityY(0);
+        body.setAllowGravity(false);
         onGround = true;
-        groundY = Math.min(groundY, py);
+      } else if (snapDelta < -maxStepUp && Math.abs(body.velocity.x) > 1) {
+        // A sudden rise is a wall/cliff face, not a walkable slope.
+        body.setVelocityX(0);
       }
     }
 
-    if (onGround) {
-      // On solid ground - disable gravity and stop falling
-      body.setAllowGravity(false);
-      if (body.velocity.y >= 0) {
-        body.setVelocityY(0);
-
-        // First, snap to the detected ground (legacy behavior)
-        sprite.y = groundY - 15;
-
-        // If knockback shoved us *deep* into terrain, push upward until the actual feet line is no longer inside dirt.
-        // Important: do NOT use the +2 "ground contact" points here, or we'd constantly push grounded units upward.
-        const getFeetInsidePoints = (): { x: number; y: number }[] => [
-          { x: x - 6, y: spriteBottom },
-          { x: x, y: spriteBottom },
-          { x: x + 6, y: spriteBottom },
-        ];
-
-        for (let i = 0; i < 80; i++) {
-          spriteBottom = Math.floor(sprite.y + 14);
-          x = Math.floor(sprite.x);
-          const insidePts = getFeetInsidePoints();
-          if (!anySolid(insidePts)) break;
-          sprite.y -= 1;
-        }
-      }
-    } else {
-      // Not on ground - enable gravity so soldier falls
+    if (!onGround) {
       body.setAllowGravity(true);
     }
 
-    // Final safety: if any part of the body overlaps solid terrain (e.g., shoved into a wall),
-    // resolve by pushing upward a bit. This is conservative, but keeps units from ending up embedded.
+    // If knockback or terrain edits leave the body embedded, nudge upward until clear.
     const bodyPts = (): { x: number; y: number }[] => [
-      { x: sprite.x, y: sprite.y }, // center
-      { x: sprite.x - 8, y: sprite.y }, // mid-left
-      { x: sprite.x + 8, y: sprite.y }, // mid-right
-      { x: sprite.x, y: sprite.y - 10 }, // upper
-      { x: sprite.x, y: sprite.y + 10 }, // lower
+      { x: sprite.x, y: sprite.y - 10 },
+      { x: sprite.x - 8, y: sprite.y },
+      { x: sprite.x + 8, y: sprite.y },
+      { x: sprite.x, y: sprite.y + 8 },
+      { x: sprite.x - 6, y: sprite.y + footOffsetY - 1 },
+      { x: sprite.x + 6, y: sprite.y + footOffsetY - 1 },
     ];
 
-    for (let i = 0; i < 80; i++) {
+    for (let i = 0; i < 72; i++) {
       if (!anySolid(bodyPts())) break;
       sprite.y -= 1;
-      // If we had gravity disabled (standing), keep it disabled; otherwise allow gravity to re-settle after unstuck.
+      footY = Math.floor(sprite.y + footOffsetY);
       if (body.velocity.y > 0) body.setVelocityY(0);
     }
 
