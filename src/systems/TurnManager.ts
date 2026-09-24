@@ -1,4 +1,4 @@
-import { Soldier } from '../entities/Soldier';
+import type { Soldier } from '../entities/Soldier';
 
 export enum Team {
   RED = 'red',
@@ -104,13 +104,12 @@ export class TurnManager {
     this.roundNumber++;
     this.actedThisRound.clear();
     
-    // Red team always starts each round
-    this.currentTeam = Team.RED;
+    this.currentTeam = this.roundNumber % 2 === 1 ? Team.RED : Team.BLUE;
     
     // Check if red team has alive soldiers, if not switch to blue
-    const redAlive = this.getTeamSoldiers(Team.RED).filter(s => s.isAlive());
-    if (redAlive.length === 0) {
-      this.currentTeam = Team.BLUE;
+    const startersAlive = this.getTeamSoldiers(this.currentTeam).filter(s => s.isAlive());
+    if (startersAlive.length === 0) {
+      this.currentTeam = this.currentTeam === Team.RED ? Team.BLUE : Team.RED;
     }
   }
 

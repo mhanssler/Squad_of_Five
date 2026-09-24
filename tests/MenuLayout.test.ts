@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  getMapPixelWidth,
+  getMapPreviewRect,
   getMenuClassCardBoxes,
   MENU_LAYOUT_BOXES,
   MENU_OPTION_PERMUTATIONS,
@@ -41,7 +43,7 @@ describe('Menu layout', () => {
   });
 
   it('keeps primary menu regions separated in every battlefield option permutation', () => {
-    expect(MENU_OPTION_PERMUTATIONS).toBe(24);
+    expect(MENU_OPTION_PERMUTATIONS).toBe(48);
 
     const visibleRegions = MENU_LAYOUT_BOXES.filter(box =>
       box.id !== 'title' &&
@@ -68,6 +70,17 @@ describe('Menu layout', () => {
       expect(box.y, box.id).toBeGreaterThanOrEqual(0);
       expect(box.x + box.w, box.id).toBeLessThanOrEqual(1280);
       expect(box.y + box.h, box.id).toBeLessThanOrEqual(720);
+    }
+  });
+
+  it('renders every map preview at its real battlefield aspect ratio inside the panel', () => {
+    for (const size of ['small', 'medium', 'large'] as const) {
+      const rect = getMapPreviewRect(size);
+      expect(rect.w / rect.h).toBeCloseTo(getMapPixelWidth(size) / 720, 2);
+      expect(rect.x).toBeGreaterThanOrEqual(16);
+      expect(rect.y).toBeGreaterThanOrEqual(404);
+      expect(rect.x + rect.w).toBeLessThanOrEqual(356);
+      expect(rect.y + rect.h).toBeLessThanOrEqual(476);
     }
   });
 });

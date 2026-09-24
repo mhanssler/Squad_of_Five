@@ -8,6 +8,51 @@
 
 ## Changelog
 
+### [0.0.11] - 2026-07-26
+#### Added
+- Two-frame faction/class stride animations with planted feet and restrained cadence.
+- Silhouette-shaped light/dark contrast rims that keep soldiers readable over sky and terrain.
+- Tested AI trajectory safety for first-unit interception and early terrain obstruction.
+
+#### Changed
+- AI rejects friendly direct fire, dangerous burst spread, unsafe explosive splash, and shots that bury themselves in terrain.
+- Projectile collision resolves the nearest physical unit hit instead of depending on squad array order.
+- Shot variance is kept only when the perturbed trajectory remains safe; the unsafe direct-fire fallback was removed.
+- Shotgun, flamethrower, and slug classes are now exclusive to Small maps, including stale-data validation at match start.
+
+---
+
+### [0.0.10] - 2026-07-26
+#### Added
+- Seven visually distinct WWII-inspired factions: four Allied and three Axis.
+- Random Axis-versus-Allies matchup generation with randomized red/blue side assignment.
+- Seventy faction/class soldier texture variants with faction palettes, varied skin tones, period headgear, webbing, insignia, and accessories.
+- Faction emblems, national callsigns, transport markings, parachute colors, HUD identity, tactical portraits, and faction-aware victory text.
+- A contact-report reveal shown before both Basic and Operations matches.
+- Automated coverage for faction roster integrity, matchup rules, random side assignment, and class texture aliases.
+
+---
+
+### [0.0.9] - 2026-07-12
+#### Added
+- **Basic and Operations rulesets**: Basic preserves the artillery duel; Operations adds a movement-driven signal victory.
+- **Diggable tunnels**: `B` carves real traversable terrain in Operations mode, costs movement, and leaves the attack available. `Shift+B` builds the existing cover berm.
+- **Signal relays**: three capturable battlefield objectives award points on capture and at the end of each round. First to 7 points wins; elimination remains valid.
+- **Objective-aware AI**: AI squads sometimes reposition to contest relays instead of always taking a shot.
+- **Situational chatter**: new quips for tunneling, failed digs, low health, near misses, ally losses, supplies, and relay captures.
+- **Operations onboarding**: a deployment brief and live relay proximity states explain capture, contesting, and round scoring.
+- **Readable supplies**: crates state whether they are instant, passive, or key-triggered; the HUD tracks armor and call-in charges.
+
+#### Changed
+- Soldiers now have breathing idles, action poses, improved walk/landing motion, ground shadows, and a clearer active-unit marker.
+- Speech bubbles wrap, stagger around clustered squads, stay inside world bounds, and use team-colored outlines.
+- The battlefield has layered night-sky silhouettes and a quieter tactical HUD with mode-specific controls.
+- In-game music now responds to firing, explosions, and objective captures, with new dig and relay stingers.
+- Movement distance is cumulative, so doubling back no longer refunds movement.
+- Menu layout coverage now audits all 48 map, terrain, opponent, and ruleset permutations.
+- Terrain collision ignores decorative grass and gravel, uses slope-limited stepping, and no longer lifts embedded soldiers up hills.
+- Battle music now alternates arrangements and advances through maneuver, pressure, and finale phases.
+
 ### [0.0.8] - 2026-07-01
 #### Changed (aim & movement feel, from playtest feedback)
 - **Power charge slowed**: 65/s → 35/s (~2.6s to full). The fast charge made overshooting

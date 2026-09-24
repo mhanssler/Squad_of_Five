@@ -1,4 +1,5 @@
 import Phaser from 'phaser';
+import { createFactionTextures } from '../systems/FactionSprites';
 
 // Sprite size constant - 64x64 for better detail
 const SPRITE_SIZE = 64;
@@ -64,7 +65,7 @@ export class BootScene extends Phaser.Scene {
   }
 
   create(): void {
-    this.scene.start('MenuScene');
+    this.scene.start(new URLSearchParams(location.search).has('visual-test') ? 'VisualTestScene' : 'MenuScene');
   }
 
   private createPlaceholderAssets(): void {
@@ -84,6 +85,10 @@ export class BootScene extends Phaser.Scene {
     
     // Default worm sprite (fallback)
     this.createDefaultWormSprite();
+
+    // Build the complete faction roster from the class silhouettes. The derived
+    // textures preserve weapon readability while changing period kit and identity.
+    createFactionTextures(this);
 
     // Create projectile sprite
     const projectileGraphics = this.make.graphics({ x: 0, y: 0 });
