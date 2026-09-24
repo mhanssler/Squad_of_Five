@@ -22,6 +22,7 @@ import { adjustDropXsForTerrain, getDeploymentZone, planTeamDropXs } from '../sy
 import { COVER_MOVEMENT_COST } from '../systems/Cover';
 import { getWindAccel, isWindCalm, rollWind, WIND_PREVIEW_SECONDS } from '../systems/Wind';
 import { HazardField } from '../entities/Hazards';
+import { BanterCategory, emptyShotStats, pickLine, pickShotBanter, ShotStats } from '../systems/Banter';
 import {
   rollSpecialWeapon,
   SLEDGE_DAMAGE,
@@ -296,6 +297,13 @@ private gKey!: Phaser.Input.Keyboard.Key;
 
   // One-shot weapon from a supply crate, armed with Q for this turn.
   private isCrateWeaponArmed: boolean = false;
+
+  // Who is acting this turn (kill credit, veterancy, banter) and what their attack did.
+  private turnActor: Soldier | null = null;
+  private turnStats: ShotStats = emptyShotStats();
+  private turnActorAttacked: boolean = false;
+  private lastImpact: { x: number; y: number } | null = null;
+  private lastAllyHit: Soldier | null = null;
 
   // Character selection
   private isSelectingCharacter: boolean = false;
@@ -774,6 +782,11 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     this.isCoverActionInProgress = false;
     this.coverUsedThisTurn = false;
     this.isCrateWeaponArmed = false;
+    this.turnActor = this.currentSoldier;
+    this.turnStats = emptyShotStats();
+    this.turnActorAttacked = false;
+    this.lastImpact = null;
+    this.lastAllyHit = null;
 
     // New wind every turn.
     this.wind = rollWind();
@@ -2086,6 +2099,8 @@ private startParatrooperDrop(): void {
       const bonusMovement = Math.floor(BASE_MOVEMENT_DISTANCE * mobilityBonus);
       const movementFloor = this.getCloseRangeMovementFloor(this.currentSoldier.getWeaponType());
       this.maxMovement = Math.floor(Math.max(baseMovement + bonusMovement, movementFloor) * this.currentSoldier.getMovementAllowanceMultiplier());
+      // Veterans move further.
+      this.maxMovement = Math.round(this.maxMovement * (1 + this.currentSoldier.getRank().movementBonus));
       this.movementUsed = 0;
       this.lastMovementX = this.currentSoldier.x;
       this.currentSoldier.setMoveSpeed(this.getSoldierMoveSpeed(this.currentSoldier.getWeaponType()));
@@ -2830,6 +2845,7 @@ private startParatrooperDrop(): void {
       return;
     }
     this.hasFired = true;
+    this.turnActorAttacked = true;
     this.isMouseCharging = false;
     this.isCharging = false;
     this.mouseChargeTurnId = 0;
@@ -2889,6 +2905,7 @@ private startParatrooperDrop(): void {
 
   private fireHowitzerShot(): void {
     if (!this.currentSoldier || this.hasFired) return;
+    this.turnActorAttacked = true;
 
     const shooter = this.currentSoldier;
     if (!shooter.consumeArtilleryCharge()) {
@@ -3142,6 +3159,7 @@ private startParatrooperDrop(): void {
 
   private callAirstrikeAt(targetX: number): void {
     if (!this.currentSoldier || this.hasFired) return;
+    this.turnActorAttacked = true;
 
     const shooter = this.currentSoldier;
     if (!shooter.consumeAirstrikeCharge()) return;
@@ -3530,8 +3548,10 @@ private startParatrooperDrop(): void {
     this.cameras.main.shake(100, 0.004);
   }
 
-  // Hook for veterancy/banter bookkeeping (a teleport isn't an attack).
-  private onCrateWeaponFired(_def: SpecialWeaponDef): void {}
+  // A teleport relocates rather than attacks - no "missed!" banter for it.
+  private onCrateWeaponFired(def: SpecialWeaponDef): void {
+    this.turnActorAttacked = def.behavior !== 'teleport';
+  }
 
   private swingSledgehammer(soldier: Soldier): void {
     const turnId = this.turnId;
@@ -3614,10 +3634,86 @@ private startParatrooperDrop(): void {
     }
   }
 
-  /** All soldier damage goes through here (kill credit, veterancy and banter hook in). */
+  /** All soldier damage goes through here so kill credit, veterancy and banter can see it. */
   private damageSoldier(soldier: Soldier, amount: number): void {
     if (!soldier.isAlive() || amount <= 0) return;
-    soldier.takeDamage(amount);
+    const actor = this.turnActor;
+    const damage = Math.round(amount * (actor ? actor.getRank().damageMultiplier : 1));
+
+    if (actor) {
+      if (soldier === actor) this.turnStats.selfDamage += damage;
+      else if (soldier.team === actor.team) {
+        this.turnStats.allyDamage += damage;
+        this.lastAllyHit = soldier;
+      } else this.turnStats.enemyDamage += damage;
+    }
+
+    soldier.takeDamage(damage);
+  }
+
+  /** Credit the acting soldier with a kill (and promote them if they earned it). */
+  private creditKill(fallen: Soldier): void {
+    const killer = this.turnActor;
+    if (!killer || killer === fallen) return;
+    if (killer.team === fallen.team) {
+      this.turnStats.allyKills++;
+      return;
+    }
+
+    this.turnStats.enemyKills++;
+    const promotion = killer.addKill();
+    if (killer.isAlive()) this.time.delayedCall(250, () => { if (killer.isAlive()) killer.sayQuip('kill'); });
+    if (!promotion) return;
+
+    this.time.delayedCall(700, () => {
+      const bonus = Math.round((promotion.damageMultiplier - 1) * 100);
+      const extras = [
+        `+${bonus}% damage`,
+        promotion.movementBonus > 0 ? `+${Math.round(promotion.movementBonus * 100)}% movement` : '',
+        promotion.promotionArmor > 0 ? `+${promotion.promotionArmor} armor` : '',
+      ].filter(Boolean).join('  ·  ');
+      this.showWorldBanner(`${killer.name.toUpperCase()} PROMOTED: ${promotion.title.toUpperCase()} ${promotion.stars}`, extras);
+      SoundManager.playSelect();
+      if (killer.isAlive()) this.speak(killer, 'promotion', 1400);
+      this.emitPowerupStatus();
+    });
+  }
+
+  private speak(soldier: Soldier, category: BanterCategory, delayMs: number = 0, vars: Record<string, string> = {}): void {
+    const line = pickLine(category, vars);
+    this.time.delayedCall(delayMs, () => {
+      if (soldier.isAlive()) soldier.say(line);
+    });
+  }
+
+  private nearestSoldier(x: number, y: number, filter: (s: Soldier) => boolean, maxDist: number): Soldier | null {
+    let best: Soldier | null = null;
+    let bestDist = maxDist;
+    for (const s of this.soldiers) {
+      if (!filter(s)) continue;
+      const d = Phaser.Math.Distance.Between(x, y, s.x, s.y);
+      if (d < bestDist) {
+        best = s;
+        bestDist = d;
+      }
+    }
+    return best;
+  }
+
+  /** After an attack resolves: brag, apologise, or get taunted. */
+  private playShotBanter(shooter: Soldier, stats: ShotStats): void {
+    const banter = pickShotBanter(stats);
+    if (banter.shooter && shooter.isAlive() && Math.random() < 0.8) {
+      this.speak(shooter, banter.shooter, 100);
+    }
+    if (banter.ally && this.lastAllyHit?.isAlive()) {
+      this.speak(this.lastAllyHit, banter.ally, 800);
+    }
+    if (banter.enemy && Math.random() < 0.6) {
+      const at = this.lastImpact ?? { x: shooter.x, y: shooter.y };
+      const enemy = this.nearestSoldier(at.x, at.y, s => s.isAlive() && s.team !== shooter.team, 600);
+      if (enemy) this.speak(enemy, banter.enemy, 900);
+    }
   }
 
   // ===== Ability availability (HUD + blocked-press feedback) =====
@@ -3925,7 +4021,7 @@ private startParatrooperDrop(): void {
           const rawDamage = Math.round((1 - distance / radius) * baseDamage);
           const exposure = blastExposure.get(soldier) ?? 1;
           const damage = Math.round(rawDamage * exposure);
-          soldier.takeDamage(damage);
+          this.damageSoldier(soldier, damage);
           if (exposure < 1 && rawDamage - damage >= 2) {
             this.showCoverProtection(soldier, rawDamage - damage);
           }
@@ -3952,6 +4048,8 @@ private startParatrooperDrop(): void {
         .sort((a, b) => a.distance - b.distance)[0];
       if (nearMiss && Math.random() < 0.72) nearMiss.soldier.sayQuip('nearMiss');
     }
+
+    if (!isBulletImpact && radius > 5) this.lastImpact = { x, y };
 
     // Barrels/mines caught in the blast go off too (chain reactions).
     this.hazards.onExplosion(x, y, radius);
@@ -4021,6 +4119,7 @@ private startParatrooperDrop(): void {
   private handleSoldierDeath(fallen: Soldier): void {
     this.updateBattleMusicPhase();
     SoundManager.pulseMusicIntensity(0.84, 1.6);
+    this.creditKill(fallen);
 
     // Killed on their own turn before attacking (e.g. stepped on a mine): move on once any
     // chain reaction has finished. (Shots and falls already end the turn themselves.)
@@ -4044,9 +4143,7 @@ private startParatrooperDrop(): void {
       .sort((a, b) => a.distance - b.distance)[0];
 
     if (!witness) return;
-    this.time.delayedCall(650, () => {
-      if (witness.soldier.isAlive()) witness.soldier.sayQuip('allyDown');
-    });
+    this.speak(witness.soldier, 'allyDown', 650, { name: fallen.name });
   }
   
   private createBulletSparkEffect(x: number, y: number): void {
@@ -4139,7 +4236,7 @@ private startParatrooperDrop(): void {
 
       if (Phaser.Math.Distance.Between(soldier.x, soldier.y, closestX, closestY) <= corridorRadius &&
           !sweepTerrain(startX, startY, soldier.x, soldier.y - 6, (x, y) => this.terrain.isPointSolid(x, y))) {
-        soldier.takeDamage(damage);
+        this.damageSoldier(soldier, damage);
       }
     });
   }
@@ -4176,6 +4273,11 @@ private startParatrooperDrop(): void {
       this.currentSoldier.setActive(false);
     }
     this.isCrateWeaponArmed = false;
+
+    if (this.turnActor && this.turnActorAttacked) {
+      this.playShotBanter(this.turnActor, this.turnStats);
+    }
+    this.turnActor = null;
 
     // Prevent any pending "release-to-fire" from firing after the turn changes.
     this.clearChargeState();
@@ -6155,7 +6257,7 @@ private startParatrooperDrop(): void {
     const dx = currentX - lastX;
     const dy = currentY - lastY;
     if (isBullet) {
-      soldier.takeDamage(damage);
+      this.damageSoldier(soldier, damage);
       const angle = Math.atan2(dy || 0.001, dx || 0.001);
       soldier.applyKnockback(
         Math.cos(angle) * 24,
