@@ -3,6 +3,20 @@ import { WeaponConfig, WeaponType } from '../systems/WeaponTypes';
 import { Terrain } from '../systems/Terrain';
 import { SoundManager } from '../utils/SoundManager';
 import type { Soldier } from './Soldier';
+import { getWindAccel } from '../systems/Wind';
+import {
+  CLUSTER_BOMBLET_CONFIG,
+  CLUSTER_BOMBLET_COUNT,
+  GOAT_MAX_WALK_MS,
+  GOAT_WALK_SPEED,
+  HOLY_FUSE_MS,
+  type SpecialBehavior,
+} from '../systems/SpecialWeapons';
+
+export interface ProjectileOptions {
+  /** Special-weapon behavior (cluster split, teleport beacon, walking goat...). */
+  behavior?: SpecialBehavior;
+}
 
 // How long a newly fired explosive ignores its own shooter. Prevents point-blank self-detonation
 // at spawn (the muzzle sits inside the shooter's hit circle for downward aims) while still letting
@@ -54,7 +68,15 @@ function playWeaponSound(type: WeaponType): void {
 }
 
 export class Projectile {
+  /** Current wind (-1..1), set by GameScene at the start of every turn. Applies to newly fired projectiles. */
+  public static wind = 0;
+
   private scene: Phaser.Scene;
+  private behavior: SpecialBehavior | null;
+  private goatWalking = false;
+  private goatDirection: -1 | 1 = 1;
+  private goatWalkStartedAt = 0;
+  private goatBleatAt = 0;
   private sprite: Phaser.Physics.Arcade.Sprite;
   private config: WeaponConfig;
   private hasExploded: boolean = false;
@@ -81,9 +103,13 @@ export class Projectile {
     velocityY: number,
     config: WeaponConfig,
     terrain: Terrain,
-    shooter: Soldier | null = null
+    shooter: Soldier | null = null,
+    options: ProjectileOptions = {}
   ) {
     this.scene = scene;
+    this.behavior = options.behavior ?? null;
+    // The holy grenade keeps bouncing until its fuse runs out.
+    if (this.behavior === 'holy') this.maxBounces = 12;
     this.config = config;
     this.terrain = terrain;
     this.shooter = shooter;
@@ -91,10 +117,14 @@ export class Projectile {
     this.isBullet = BULLET_WEAPONS.includes(config.type);
 
     // Create projectile sprite
-    this.sprite = scene.physics.add.sprite(x, y, 'projectile');
+    const isGoat = this.behavior === 'goat';
+    if (isGoat) ensureGoatTexture(scene);
+    this.sprite = scene.physics.add.sprite(x, y, isGoat ? 'goat' : 'projectile');
     
     // Bullets are smaller and elongated
-    if (this.isBullet) {
+    if (isGoat) {
+      this.sprite.setDisplaySize(26, 22);
+    } else if (this.isBullet) {
       this.sprite.setDisplaySize(config.projectileSize * 2, config.projectileSize);
     } else {
       this.sprite.setDisplaySize(config.projectileSize, config.projectileSize);
@@ -106,9 +136,17 @@ export class Projectile {
     
     // Set custom gravity for this projectile
     (this.sprite.body as Phaser.Physics.Arcade.Body).setGravityY(500 * config.gravity - 500);
+
+    // Wind pushes slower ordnance sideways (bullets are unaffected).
+    this.sprite.setAccelerationX(getWindAccel(Projectile.wind, config.type));
     
     // Tint based on weapon
-    this.sprite.setTint(config.trailColor);
+    if (!isGoat) this.sprite.setTint(config.trailColor);
+    if (isGoat) {
+      this.goatDirection = velocityX < 0 ? -1 : 1;
+      this.sprite.setFlipX(this.goatDirection < 0);
+      scene.events.on('special-detonate', this.explode, this);
+    }
 
     // Create trail graphics
     this.trailGraphics = scene.add.graphics();
@@ -155,6 +193,13 @@ export class Projectile {
       this.flightSound.update(body.velocity.x, body.velocity.y);
     }
 
+    if (this.goatWalking) {
+      this.updateGoatWalk();
+      this.lastX = this.sprite.x;
+      this.lastY = this.sprite.y;
+      return;
+    }
+
     // Add current position to trail
     this.trailPoints.push({ x: this.sprite.x, y: this.sprite.y });
     
@@ -172,7 +217,7 @@ export class Projectile {
       this.sprite.body!.velocity.y,
       this.sprite.body!.velocity.x
     );
-    this.sprite.setRotation(angle);
+    if (this.behavior !== 'goat') this.sprite.setRotation(angle);
 
     // Check terrain collision
     this.checkTerrainCollision();
@@ -261,7 +306,9 @@ export class Projectile {
 
     // Check if projectile hit terrain
     if (this.terrain.isPointSolid(x, y)) {
-      if (this.isBullet) {
+      if (this.behavior === 'goat') {
+        this.startGoatWalk();
+      } else if (this.isBullet) {
         // Bullets do direct damage on hit - no explosion, just impact
         this.bulletImpact();
       } else if (this.config.bounce > 0 && this.bounceCount < this.maxBounces) {
@@ -294,8 +341,8 @@ export class Projectile {
   }
 
   private startFuseTimer(): void {
-    // Start 2 second fuse when grenade first hits ground
-    this.fuseTimer = this.scene.time.delayedCall(2000, () => {
+    // Start 2 second fuse when grenade first hits ground (holy grenades take longer - build the suspense)
+    this.fuseTimer = this.scene.time.delayedCall(this.behavior === 'holy' ? HOLY_FUSE_MS : 2000, () => {
       if (!this.hasExploded) {
         this.explode();
       }
@@ -360,6 +407,17 @@ export class Projectile {
     const x = this.sprite.x;
     const y = this.sprite.y;
 
+    if (this.behavior === 'teleport') {
+      // The beacon doesn't explode: GameScene moves the shooter here.
+      this.scene.events.emit('special-teleport', x, y, this.shooter);
+      this.destroy();
+      return;
+    }
+
+    if (this.behavior) {
+      this.scene.events.emit('special-exploded', this.behavior, x, y);
+    }
+
     // Emit explosion event for GameScene to handle
     this.scene.events.emit(
       'projectile-explode', 
@@ -369,8 +427,92 @@ export class Projectile {
       this.config.damage
     );
 
+    if (this.behavior === 'cluster') {
+      this.spawnBomblets(x, y);
+    }
+
     // Cleanup
     this.destroy();
+  }
+
+  private spawnBomblets(x: number, y: number): void {
+    for (let i = 0; i < CLUSTER_BOMBLET_COUNT; i++) {
+      const spread = (i / (CLUSTER_BOMBLET_COUNT - 1) - 0.5) * 2; // -1..1
+      const vx = spread * 230 + (Math.random() - 0.5) * 60;
+      const vy = -260 - Math.random() * 160;
+      const bomblet = new Projectile(this.scene, x, y - 14, vx, vy, CLUSTER_BOMBLET_CONFIG, this.terrain, null);
+      // Spawned before this projectile ends, so the shot stays "in flight" until the bomblets land.
+      this.scene.events.emit('projectile-spawned', bomblet);
+    }
+  }
+
+  private startGoatWalk(): void {
+    if (this.goatWalking) return;
+    this.goatWalking = true;
+    this.goatWalkStartedAt = this.scene.time.now;
+    this.goatBleatAt = this.scene.time.now + 400;
+    const body = this.sprite.body as Phaser.Physics.Arcade.Body;
+    body.setAllowGravity(false);
+    body.setVelocity(0, 0);
+    body.setAcceleration(0, 0);
+    this.sprite.setRotation(0);
+    this.trailGraphics.clear();
+    // Stand on the surface we just hit.
+    const surface = this.terrain.findSurfaceYAtOrBelow(this.sprite.x, this.sprite.y - 30, 60);
+    if (surface !== null) this.sprite.y = surface - 10;
+  }
+
+  private updateGoatWalk(): void {
+    const now = this.scene.time.now;
+    if (now - this.goatWalkStartedAt > GOAT_MAX_WALK_MS) {
+      this.explode();
+      return;
+    }
+
+    const dt = Math.min(0.05, this.scene.game.loop.delta / 1000);
+    const body = this.sprite.body as Phaser.Physics.Arcade.Body;
+
+    // Falling off a ledge: let gravity take it until it lands again.
+    const footY = this.sprite.y + 10;
+    if (!this.terrain.isPointSolid(this.sprite.x, footY + 2) && body.allowGravity === false) {
+      const below = this.terrain.findSurfaceYAtOrBelow(this.sprite.x, footY, 8);
+      if (below === null) {
+        body.setAllowGravity(true);
+        body.setVelocity(this.goatDirection * GOAT_WALK_SPEED * 0.5, 0);
+        return;
+      }
+    }
+    if (body.allowGravity) {
+      if (this.terrain.isPointSolid(this.sprite.x, footY)) {
+        body.setAllowGravity(false);
+        body.setVelocity(0, 0);
+        const surface = this.terrain.findSurfaceYAtOrBelow(this.sprite.x, footY - 30, 60);
+        if (surface !== null) this.sprite.y = surface - 10;
+      }
+      if (this.sprite.y > this.scene.physics.world.bounds.bottom) this.destroy();
+      return;
+    }
+
+    const nextX = this.sprite.x + this.goatDirection * GOAT_WALK_SPEED * dt;
+    const surface = this.terrain.findSurfaceYAtOrBelow(nextX, footY - 24, 40);
+    if (surface !== null && footY - surface > 22) {
+      // Wall too tall to climb: turn around.
+      this.goatDirection = this.goatDirection > 0 ? -1 : 1;
+      this.sprite.setFlipX(this.goatDirection < 0);
+    } else {
+      this.sprite.x = nextX;
+      if (surface !== null) this.sprite.y = surface - 10;
+    }
+
+    // Little hop animation + the occasional bleat.
+    this.sprite.setAngle(Math.sin(now / 70) * 6);
+    if (now > this.goatBleatAt) {
+      this.goatBleatAt = now + 1400 + Math.random() * 800;
+      const bleat = this.scene.add.text(this.sprite.x, this.sprite.y - 22, 'Baaa!', {
+        font: 'bold 11px Arial', color: '#ffffff', stroke: '#000000', strokeThickness: 3,
+      }).setOrigin(0.5).setDepth(200);
+      this.scene.tweens.add({ targets: bleat, y: bleat.y - 18, alpha: 0, duration: 800, onComplete: () => bleat.destroy() });
+    }
   }
 
   // Methods for camera tracking
@@ -401,11 +543,36 @@ export class Projectile {
       this.fuseTimer.destroy();
     }
     this.scene.events.off('update', this.update, this);
+    this.scene.events.off('special-detonate', this.explode, this);
     this.trailGraphics.destroy();
     if (this.sprite.active) {
       this.sprite.destroy();
     }
   }
+}
+
+function ensureGoatTexture(scene: Phaser.Scene): void {
+  if (scene.textures.exists('goat')) return;
+  const g = scene.make.graphics({ x: 0, y: 0 }, false);
+  // Body
+  g.fillStyle(0xf2efe6, 1);
+  g.fillEllipse(12, 12, 18, 11);
+  // Head (facing right)
+  g.fillEllipse(21, 7, 8, 7);
+  // Horns + legs
+  g.fillStyle(0x6b5a45, 1);
+  g.fillTriangle(19, 4, 20, 0, 22, 4);
+  g.fillRect(6, 16, 2, 5);
+  g.fillRect(10, 16, 2, 5);
+  g.fillRect(14, 16, 2, 5);
+  g.fillRect(17, 16, 2, 5);
+  // Eye + strapped-on dynamite
+  g.fillStyle(0x000000, 1);
+  g.fillCircle(22, 6, 1);
+  g.fillStyle(0xcc2222, 1);
+  g.fillRect(7, 5, 9, 4);
+  g.generateTexture('goat', 26, 22);
+  g.destroy();
 }
 
 // Flamethrower creates a flame jet instead of projectiles

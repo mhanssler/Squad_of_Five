@@ -96,7 +96,17 @@ Pull requests and pushes to `main` run install, type-check, test, and production
 - G: grapple
 - B: dig in
 - H: heal
+- Q: arm/put away a special weapon from a crate (Esc also puts it away)
+- Space after firing: detonate the Kamikaze Goat early
 - N: new game
+
+## Battlefield
+
+- **Wind** changes every turn (gauge at the top). It pushes grenades, rockets, mortars and demo charges, not bullets. When it's windy the aim preview only shows the start of the arc.
+- **Explosive barrels** blow up when caught in a blast or shot, and can chain into each other.
+- **Landmines** arm shortly after the battle starts. Walk near one and you get about a second to get clear.
+- **Special weapon crates** arrive with supply drops: Cluster Bomb, Holy Grenade, Teleporter, Kamikaze Goat, or Sledgehammer. Each is single-use.
+- **Veterancy**: kills promote a soldier to Veteran ★ (1 kill), Elite ★★ (2), then Hero ★★★ (4), for more damage, more movement, and armor at Hero.
 
 ## Notes
 

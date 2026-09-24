@@ -1,6 +1,7 @@
 import Phaser from 'phaser';
 import { Team } from '../systems/TurnManager';
 import type { AbilityStatus } from '../systems/Abilities';
+import { isWindCalm } from '../systems/Wind';
 
 interface TurnInfo {
   currentTeam: Team;
@@ -18,6 +19,7 @@ interface TurnInfo {
 interface AbilityStatusInfo {
   dig: AbilityStatus;
   heal: AbilityStatus;
+  special: { name: string; hint: string; armed: boolean } | null;
 }
 
 interface WeaponInfo {
@@ -55,6 +57,9 @@ export class UIScene extends Phaser.Scene {
   private movementText!: Phaser.GameObjects.Text;
   private digStatusText!: Phaser.GameObjects.Text;
   private healStatusText!: Phaser.GameObjects.Text;
+  private specialStatusText!: Phaser.GameObjects.Text;
+  private windGraphics!: Phaser.GameObjects.Graphics;
+  private windText!: Phaser.GameObjects.Text;
   private tacReadoutPanel!: Phaser.GameObjects.Container;
   private gameScene!: Phaser.Scene;
   private maxMovement: number = 200;
@@ -115,6 +120,16 @@ export class UIScene extends Phaser.Scene {
     const abilityStyle = { font: 'bold 13px Arial', color: '#ffffff', stroke: '#000000', strokeThickness: 3 };
     this.digStatusText = this.add.text(630, 602, '', abilityStyle).setOrigin(1, 0).setVisible(false);
     this.healStatusText = this.add.text(650, 602, '', abilityStyle).setOrigin(0, 0).setVisible(false);
+    this.specialStatusText = this.add.text(640, 582, '', abilityStyle).setOrigin(0.5, 0).setVisible(false);
+
+    // Wind gauge (top center, under the team line)
+    this.windGraphics = this.add.graphics();
+    this.windText = this.add.text(640, 78, '', {
+      font: 'bold 12px Arial',
+      color: '#ffffff',
+      stroke: '#000000',
+      strokeThickness: 3,
+    }).setOrigin(0.5, 0);
 
     // Tactical Readout Panel (top left, below team indicator) - military style
     this.tacReadoutPanel = this.add.container(10, 40);
@@ -122,7 +137,7 @@ export class UIScene extends Phaser.Scene {
 
     // Controls help - keyboard and mouse
     this.controlsText = this.add.text(640, 680, 
-      '← → Move | W/S Aim | A/D Scout | SPACE/LMB Fire | RMB Drag | G Grapple | B Dig In | H Heal | Scroll Zoom', {
+      '← → Move | W/S Aim | A/D Scout | SPACE/LMB Fire | RMB Drag | G Grapple | B Dig In | H Heal | Q Special | Scroll Zoom', {
       font: '13px Arial',
       color: '#ffffff',
       stroke: '#000000',
@@ -135,6 +150,7 @@ export class UIScene extends Phaser.Scene {
     this.gameScene.events.on('game-over', this.showGameOver, this);
     this.gameScene.events.on('movement-update', this.updateMovementBar, this);
     this.gameScene.events.on('ability-status', this.updateAbilityStatus, this);
+    this.gameScene.events.on('wind-changed', this.updateWind, this);
     this.gameScene.events.on('character-selection', this.showTacReadout, this);
     this.gameScene.events.on('new-game', this.resetUI, this);
   }
@@ -171,9 +187,45 @@ export class UIScene extends Phaser.Scene {
   private updateAbilityStatus(info: AbilityStatusInfo | null): void {
     this.digStatusText.setVisible(!!info);
     this.healStatusText.setVisible(!!info);
+    this.specialStatusText.setVisible(!!info?.special);
     if (!info) return;
     this.setAbilityText(this.digStatusText, '[B] Dig In', info.dig);
     this.setAbilityText(this.healStatusText, '[H] Heal', info.heal);
+    if (info.special) {
+      const { name, hint, armed } = info.special;
+      this.specialStatusText.setText(armed ? `★ ${name} ARMED - ${hint} (Q/ESC to put away)` : `[Q] ${name}`);
+      this.specialStatusText.setColor(armed ? '#ffdd33' : '#ffeeaa');
+    }
+  }
+
+  private updateWind(wind: number): void {
+    const g = this.windGraphics;
+    g.clear();
+    const cx = 640;
+    const y = 96;
+    const halfWidth = 60;
+
+    g.fillStyle(0x000000, 0.45);
+    g.fillRoundedRect(cx - halfWidth - 4, y - 4, halfWidth * 2 + 8, 12, 3);
+    g.lineStyle(1, 0xffffff, 0.4);
+    g.lineBetween(cx, y - 4, cx, y + 8);
+
+    if (isWindCalm(wind)) {
+      this.windText.setText('WIND: CALM');
+      return;
+    }
+
+    const len = Math.abs(wind) * halfWidth;
+    const dir = wind > 0 ? 1 : -1;
+    const color = Math.abs(wind) >= 0.7 ? 0xff5544 : Math.abs(wind) >= 0.4 ? 0xffcc33 : 0x66ddff;
+    g.fillStyle(color, 1);
+    g.fillRect(dir > 0 ? cx : cx - len, y, len, 4);
+    const tipX = cx + dir * len;
+    g.fillTriangle(tipX + dir * 7, y + 2, tipX, y - 3, tipX, y + 7);
+
+    const arrows = dir > 0 ? '▶'.repeat(Math.ceil(Math.abs(wind) * 3)) : '◀'.repeat(Math.ceil(Math.abs(wind) * 3));
+    const label = Math.abs(wind) >= 0.7 ? 'GALE' : 'WIND';
+    this.windText.setText(dir > 0 ? `${label} ${Math.round(Math.abs(wind) * 100)}% ${arrows}` : `${arrows} ${label} ${Math.round(Math.abs(wind) * 100)}%`);
   }
 
   private setAbilityText(text: Phaser.GameObjects.Text, label: string, status: AbilityStatus): void {
@@ -421,6 +473,8 @@ export class UIScene extends Phaser.Scene {
     this.teamText.setText('');
     this.tacReadoutPanel.setVisible(false);
     this.updateAbilityStatus(null);
+    this.windGraphics.clear();
+    this.windText.setText('');
   }
 
   private showGameOver(winner: Team | null): void {

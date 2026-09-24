@@ -6,6 +6,18 @@ import { Projectile, createProjectile } from '../entities/Projectile';
 import { WeaponConfig, WeaponType, WEAPONS } from '../systems/WeaponTypes';
 import { SoundManager } from '../utils/SoundManager';
 import { AbilityStatus, TurnActionState, getDigInStatus, getHealStatus } from '../systems/Abilities';
+import { HazardField } from '../entities/Hazards';
+import { getWindAccel, isWindCalm, rollWind, WIND_PREVIEW_SECONDS } from '../systems/Wind';
+import { BanterCategory, emptyShotStats, pickLine, pickShotBanter, ShotStats } from '../systems/Banter';
+import {
+  rollSpecialWeapon,
+  SLEDGE_DAMAGE,
+  SLEDGE_KNOCKBACK,
+  SLEDGE_RANGE,
+  SPECIAL_WEAPONS,
+  type SpecialBehavior,
+  type SpecialWeaponDef,
+} from '../systems/SpecialWeapons';
 
 // Base movement distance (modified by weapon weight)
 const BASE_MOVEMENT_DISTANCE = 320;
@@ -26,7 +38,16 @@ function wrapDeg(angle: number): number {
 }
 const DEFAULT_MOVE_SPEED = 180;
 
-type SupplyDropType = 'medkit' | 'airstrike' | 'artillery' | 'armor' | 'munitions';
+type SupplyDropType = 'medkit' | 'airstrike' | 'artillery' | 'armor' | 'munitions' | 'weapon';
+
+// What each soldier shouts when firing a special weapon.
+const SPECIAL_FIRE_LINES: Record<string, string> = {
+  cluster: 'Rain check!',
+  holy: 'Hallelujah!',
+  teleport: 'Beam me up!',
+  goat: "Go get 'em, Bessie!",
+  sledge: 'HAMMER TIME!',
+};
 
 const SUPPLY_DROP_HP = 50;
 const SUPPLY_DROP_RADIUS = 26; // Approx collision radius for damage checks
@@ -230,6 +251,22 @@ private gKey!: Phaser.Input.Keyboard.Key;
   private howitzerBarrel: Phaser.GameObjects.Rectangle | null = null;
   private howitzerHelpText: Phaser.GameObjects.Text | null = null;
 
+  // Battlefield hazards (explosive barrels, landmines)
+  private hazards!: HazardField;
+
+  // Wind for the current turn (-1..1)
+  private wind: number = 0;
+
+  // Who is acting this turn (for kill credit, veterancy and banter) and what their action did.
+  private turnActor: Soldier | null = null;
+  private turnStats: ShotStats = emptyShotStats();
+  private turnActorAttacked: boolean = false;
+  private lastImpact: { x: number; y: number } | null = null;
+  private lastAllyHit: Soldier | null = null;
+
+  // Special weapon from a crate, armed with Q for this turn.
+  private isSpecialArmed: boolean = false;
+
   constructor() {
     super({ key: 'GameScene' });
   }
@@ -261,6 +298,9 @@ private gKey!: Phaser.Input.Keyboard.Key;
     
     // Create terrain (wider battlefield) with random seed
     this.terrain = new Terrain(this, this.worldWidth, this.worldHeight, undefined, { preset: this.terrainPreset });
+    this.hazards = new HazardField(this, this.terrain, (x, y, radius, damage) => {
+      this.handleExplosion(x, y, radius, damage);
+    });
 
     // Create aim line graphics
     this.aimLine = this.add.graphics();
@@ -355,6 +395,10 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     
     // Listen for soldier hit checks (raycast collision for bullets)
     this.events.on('check-soldier-hit', this.checkSoldierHit, this);
+
+    // Special weapon projectiles
+    this.events.on('special-teleport', this.handleTeleportBeacon, this);
+    this.events.on('special-exploded', this.handleSpecialExploded, this);
     
     // Setup mouse controls
     this.setupMouseControls();
@@ -536,6 +580,9 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     });
     this.supplyDrops = [];
     this.nextBalanceEventTurn = 4;
+    this.hazards.clear();
+    this.turnActor = null;
+    this.isSpecialArmed = false;
     
     // Stop camera follow
     this.cameras.main.stopFollow();
@@ -708,6 +755,15 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
   private transitionFromIntro(): void {
     if (this.introDone) return;
     this.introDone = true;
+
+    // Scatter barrels and mines now that the bombardment has finished reshaping the ground.
+    this.hazards.clear();
+    this.hazards.spawn(
+      this.worldWidth,
+      this.soldiers.map(s => s.x),
+      Math.max(2, Math.round(this.worldWidth / 520)),
+      Math.max(2, Math.round(this.worldWidth / 640)),
+    );
 
     if (this.introHintText) {
       this.introHintText.destroy();
@@ -1428,6 +1484,17 @@ private startParatrooperDrop(): void {
 
     this.hasFired = false;
     this.isTurnEnding = false; // Reset turn ending flag
+    this.isSpecialArmed = false;
+    this.turnActor = this.currentSoldier;
+    this.turnStats = emptyShotStats();
+    this.turnActorAttacked = false;
+    this.lastImpact = null;
+    this.lastAllyHit = null;
+
+    // New wind every turn.
+    this.wind = rollWind();
+    Projectile.wind = this.wind;
+    this.events.emit('wind-changed', this.wind);
     
     if (this.currentSoldier) {
       this.currentSoldier.setActive(true);
@@ -1443,6 +1510,8 @@ private startParatrooperDrop(): void {
       const bonusMovement = Math.floor(BASE_MOVEMENT_DISTANCE * mobilityBonus);
       const movementFloor = this.getCloseRangeMovementFloor(this.currentSoldier.getWeaponType());
       this.maxMovement = Math.max(baseMovement + bonusMovement, movementFloor);
+      // Veterans move further.
+      this.maxMovement = Math.round(this.maxMovement * (1 + this.currentSoldier.getRank().movementBonus));
       this.movementUsed = 0;
       this.startX = this.currentSoldier.x;
       this.currentSoldier.setMoveSpeed(this.getSoldierMoveSpeed(this.currentSoldier.getWeaponType()));
@@ -1523,6 +1592,9 @@ private startParatrooperDrop(): void {
     // Supply drops can be collected any time (even during selection between turns).
     this.checkSupplyDropPickups();
 
+    // Barrels settle/fall with the terrain; mines check for anyone stepping close.
+    this.hazards.update(dt, this.soldiers, this.worldHeight);
+
     // Handle character selection mode
     if (this.isSelectingCharacter) {
       this.handleCharacterSelection();
@@ -1548,6 +1620,10 @@ private startParatrooperDrop(): void {
       }
       if (this.isHowitzerMode) {
         this.exitHowitzerMode();
+        return;
+      }
+      if (this.isSpecialArmed) {
+        this.isSpecialArmed = false;
         return;
       }
       this.deselectSoldier();
@@ -1769,6 +1845,16 @@ private startParatrooperDrop(): void {
       }
     }
 
+    // Q arms/disarms the special weapon picked up from a crate.
+    if (Phaser.Input.Keyboard.JustDown(this.qKey)) {
+      this.toggleSpecialWeapon();
+    }
+
+    // SPACE after firing detonates a walking goat early.
+    if (this.hasFired && Phaser.Input.Keyboard.JustDown(this.spaceKey)) {
+      this.events.emit('special-detonate');
+    }
+
     // Dig In / Heal: always check the key so a blocked press explains why instead of silently doing nothing.
     const digStatus = this.getCurrentDigInStatus();
     const healStatus = this.getCurrentHealStatus();
@@ -1801,7 +1887,9 @@ private startParatrooperDrop(): void {
     // Check if soldier is out of bounds
     if (y > this.worldHeight + margin || x < -margin || x > this.worldWidth + margin) {
       // Soldier fell off the map - instant death!
+      const wasAlive = soldier.isAlive();
       soldier.fallToDeath();
+      if (wasAlive) this.onSoldierKilled(soldier);
       
       // Create dramatic falling death effect
       this.createFallDeathEffect(x, Math.min(y, this.worldHeight));
@@ -1931,6 +2019,8 @@ private startParatrooperDrop(): void {
   private getActiveWeaponConfig(): WeaponConfig | null {
     if (!this.currentSoldier) return null;
     if (this.isHowitzerMode) return HOWITZER_CONFIG;
+    const special = this.getArmedSpecial();
+    if (special?.config) return special.config;
     return this.currentSoldier.weapon;
   }
 
@@ -1968,6 +2058,20 @@ private startParatrooperDrop(): void {
     const startX = origin.x;
     const startY = origin.y;
     const angleRad = Phaser.Math.DegToRad(this.aimAngle);
+
+    // Sledgehammer: melee, so just show the swing reach.
+    const armedSpecial = this.getArmedSpecial();
+    if (armedSpecial && !armedSpecial.config) {
+      this.aimLine.lineStyle(3, armedSpecial.color, 0.8);
+      this.aimLine.beginPath();
+      this.aimLine.arc(startX, startY, SLEDGE_RANGE, angleRad - 1.2, angleRad + 1.2);
+      this.aimLine.strokePath();
+      this.aimLine.fillStyle(armedSpecial.color, 0.15);
+      this.aimLine.slice(startX, startY, SLEDGE_RANGE, angleRad - 1.2, angleRad + 1.2);
+      this.aimLine.fillPath();
+      this.aimPowerText.setVisible(false);
+      return;
+    }
     
     // Get weapon config for trajectory physics
     const speed = (this.power / 100) * weaponConfig.projectileSpeed;
@@ -1978,22 +2082,32 @@ private startParatrooperDrop(): void {
     // Calculate trajectory points
     const vx = Math.cos(angleRad) * speed;
     const vy = Math.sin(angleRad) * speed;
+
+    // Wind bends slow ordnance. When it's windy the preview only shows the start of the arc -
+    // judging the rest is the skill.
+    const windAccel = getWindAccel(this.wind, weaponConfig.type);
+    const windLimited = windAccel !== 0 && !isWindCalm(this.wind);
     
 // Simulate trajectory with fine time steps
     const trajectoryPoints: { x: number; y: number }[] = [];
     const timeStep = 0.016; // ~60fps simulation
-    const maxTime = 12.0; // Longer preview for long-range shots (mortar, rocket)
+    const maxTime = windLimited ? WIND_PREVIEW_SECONDS : 12.0; // Longer preview for long-range shots (mortar, rocket)
     let t = 0;
+    let reachedImpact = false;
     
     while (t < maxTime) {
-      const px = startX + vx * t;
+      const px = startX + vx * t + 0.5 * windAccel * t * t;
       const py = startY + vy * t + 0.5 * effectiveGravity * t * t;
       
       // Stop if out of world bounds
-      if (px < 0 || px > this.worldWidth || py > this.worldHeight) break;
+      if (px < 0 || px > this.worldWidth || py > this.worldHeight) {
+        reachedImpact = true;
+        break;
+      }
       
       // Stop if hits terrain. Refine the collision point so the impact marker is accurate.
       if (py > 0 && this.terrain.isPointSolid(px, py)) {
+        reachedImpact = true;
         if (trajectoryPoints.length > 0) {
           // Binary search between the last non-solid point and the first solid point.
           let ax = trajectoryPoints[trajectoryPoints.length - 1].x;
@@ -2056,8 +2170,8 @@ private startParatrooperDrop(): void {
         accumulatedDistance += segmentDist;
       }
       
-      // Draw impact marker at end of trajectory
-      if (trajectoryPoints.length > 2) {
+      // Draw impact marker at end of trajectory (not when wind cut the preview short)
+      if (trajectoryPoints.length > 2 && (reachedImpact || !windLimited)) {
         const lastPoint = trajectoryPoints[trajectoryPoints.length - 1];
         
         // Crosshair at impact point
@@ -2140,7 +2254,12 @@ private startParatrooperDrop(): void {
       this.fireHowitzerShot();
       return;
     }
+    if (this.getArmedSpecial()) {
+      this.fireSpecialWeapon();
+      return;
+    }
     this.hasFired = true;
+    this.turnActorAttacked = true;
     this.isMouseCharging = false;
     this.isCharging = false;
     this.mouseChargeTurnId = 0;
@@ -2198,6 +2317,7 @@ private startParatrooperDrop(): void {
   }
 
   private fireHowitzerShot(): void {
+    this.turnActorAttacked = true;
     if (!this.currentSoldier || this.hasFired) return;
 
     const shooter = this.currentSoldier;
@@ -2449,6 +2569,7 @@ private startParatrooperDrop(): void {
   }
 
   private callAirstrikeAt(targetX: number): void {
+    this.turnActorAttacked = true;
     if (!this.currentSoldier || this.hasFired) return;
 
     const shooter = this.currentSoldier;
@@ -2653,10 +2774,14 @@ private startParatrooperDrop(): void {
   }
 
   private emitAbilityStatus(dig: AbilityStatus | null, heal: AbilityStatus | null): void {
-    const key = dig && heal ? `${dig.reason}|${heal.reason}` : 'hidden';
+    const specialId = this.currentSoldier?.getSpecialWeapon() ?? null;
+    const special = dig && heal && specialId
+      ? { name: SPECIAL_WEAPONS[specialId].name, hint: SPECIAL_WEAPONS[specialId].hint, armed: this.isSpecialArmed }
+      : null;
+    const key = dig && heal ? `${dig.reason}|${heal.reason}|${specialId}|${this.isSpecialArmed}` : 'hidden';
     if (key === this.lastAbilityStatusKey) return;
     this.lastAbilityStatusKey = key;
-    this.events.emit('ability-status', dig && heal ? { dig, heal } : null);
+    this.events.emit('ability-status', dig && heal ? { dig, heal, special } : null);
   }
 
   private showAbilityBlocked(message: string): void {
@@ -2677,6 +2802,245 @@ private startParatrooperDrop(): void {
       duration: 700,
       onComplete: () => text.destroy(),
     });
+  }
+
+  // ===== Damage, kills, veterancy =====
+
+  /** All soldier damage goes through here so kills, veterancy and banter can see it. */
+  private damageSoldier(soldier: Soldier, amount: number): void {
+    if (!soldier.isAlive() || amount <= 0) return;
+    const actor = this.turnActor;
+    const damage = Math.round(amount * (actor ? actor.getRank().damageMultiplier : 1));
+
+    if (actor) {
+      if (soldier === actor) this.turnStats.selfDamage += damage;
+      else if (soldier.team === actor.team) {
+        this.turnStats.allyDamage += damage;
+        this.lastAllyHit = soldier;
+      } else this.turnStats.enemyDamage += damage;
+    }
+
+    soldier.takeDamage(damage);
+    if (!soldier.isAlive()) this.onSoldierKilled(soldier);
+  }
+
+  private onSoldierKilled(victim: Soldier): void {
+    const killer = this.turnActor;
+
+    if (killer && killer !== victim) {
+      if (killer.team !== victim.team) {
+        this.turnStats.enemyKills++;
+        const promotion = killer.addKill();
+        if (killer.isAlive()) this.speak(killer, 'kill', 250);
+        if (promotion) {
+          this.time.delayedCall(700, () => {
+            const bonus = Math.round((promotion.damageMultiplier - 1) * 100);
+            const extras = [
+              `+${bonus}% damage`,
+              promotion.movementBonus > 0 ? `+${Math.round(promotion.movementBonus * 100)}% movement` : '',
+              promotion.promotionArmor > 0 ? `+${promotion.promotionArmor} armor` : '',
+            ].filter(Boolean).join(' · ');
+            this.showWorldBanner(`${killer.name.toUpperCase()} PROMOTED: ${promotion.title.toUpperCase()} ${promotion.stars}`, extras);
+            SoundManager.playSelect();
+            if (killer.isAlive()) this.speak(killer, 'promotion', 1400);
+          });
+        }
+      } else {
+        this.turnStats.allyKills++;
+      }
+    }
+
+    // A nearby teammate reacts.
+    const buddy = this.findNearest(victim.x, victim.y, s => s.isAlive() && s.team === victim.team && s !== victim, 520);
+    if (buddy) this.speak(buddy, 'allyDown', 1100, { name: victim.name });
+
+    // Killed on their own turn before acting (e.g. stepped on a mine): move on.
+    if (victim === this.currentSoldier && !this.hasFired && !this.isTurnEnding) {
+      const turnId = this.turnId;
+      const tryEnd = (): void => {
+        if (turnId !== this.turnId || this.isTurnEnding) return;
+        if (this.hazards.isBusy()) {
+          this.time.delayedCall(250, tryEnd);
+          return;
+        }
+        this.endTurn();
+      };
+      this.time.delayedCall(1300, tryEnd);
+    }
+  }
+
+  private findNearest(x: number, y: number, filter: (s: Soldier) => boolean, maxDist: number = Infinity): Soldier | null {
+    let best: Soldier | null = null;
+    let bestDist = maxDist;
+    for (const s of this.soldiers) {
+      if (!filter(s)) continue;
+      const d = Phaser.Math.Distance.Between(x, y, s.x, s.y);
+      if (d < bestDist) {
+        best = s;
+        bestDist = d;
+      }
+    }
+    return best;
+  }
+
+  private speak(soldier: Soldier, category: BanterCategory, delayMs: number = 0, vars: Record<string, string> = {}): void {
+    const line = pickLine(category, vars);
+    this.time.delayedCall(delayMs, () => {
+      if (soldier.isAlive()) soldier.say(line);
+    });
+  }
+
+  private playShotBanter(shooter: Soldier, stats: ShotStats): void {
+    const banter = pickShotBanter(stats);
+    if (banter.shooter && shooter.isAlive() && Math.random() < 0.8) {
+      this.speak(shooter, banter.shooter, 100);
+    }
+    if (banter.ally && this.lastAllyHit?.isAlive()) {
+      this.speak(this.lastAllyHit, banter.ally, 800);
+    }
+    if (banter.enemy && Math.random() < 0.6) {
+      const at = this.lastImpact ?? { x: shooter.x, y: shooter.y };
+      const enemy = this.findNearest(at.x, at.y, s => s.isAlive() && s.team !== shooter.team, 600);
+      if (enemy) this.speak(enemy, banter.enemy, 900);
+    }
+  }
+
+  // ===== Special weapons (from crates) =====
+
+  private getArmedSpecial(): SpecialWeaponDef | null {
+    if (!this.isSpecialArmed || !this.currentSoldier) return null;
+    const id = this.currentSoldier.getSpecialWeapon();
+    return id ? SPECIAL_WEAPONS[id] : null;
+  }
+
+  private toggleSpecialWeapon(): void {
+    const soldier = this.currentSoldier;
+    if (!soldier) return;
+    const id = soldier.getSpecialWeapon();
+    if (!id) {
+      this.showAbilityBlocked('No special weapon - grab a crate!');
+      return;
+    }
+    if (this.hasFired || this.isCharging || this.isMouseCharging || this.isHowitzerMode || this.isAirstrikeTargeting) return;
+    this.isSpecialArmed = !this.isSpecialArmed;
+    if (this.isSpecialArmed) {
+      const def = SPECIAL_WEAPONS[id];
+      this.showPowerupText(soldier.x, soldier.y - 50, `${def.name.toUpperCase()} ARMED`, def.color);
+      SoundManager.playSelect();
+    }
+  }
+
+  private fireSpecialWeapon(): void {
+    const soldier = this.currentSoldier;
+    const def = this.getArmedSpecial();
+    if (!soldier || !def) return;
+
+    this.hasFired = true;
+    this.turnActorAttacked = def.behavior !== 'teleport'; // relocating isn't an attack - no "missed!" banter
+    this.isSpecialArmed = false;
+    soldier.setSpecialWeapon(null);
+    this.clearChargeState();
+    soldier.say(SPECIAL_FIRE_LINES[def.id] ?? 'Special delivery!');
+
+    if (!def.config) {
+      this.swingSledgehammer(soldier);
+      return;
+    }
+
+    this.cameras.main.stopFollow();
+    const angleRad = Phaser.Math.DegToRad(this.aimAngle);
+    const speed = (this.power / 100) * def.config.projectileSpeed;
+    this.beginShotResolution(soldier, def.config);
+    const projectile = new Projectile(
+      this,
+      soldier.x + Math.cos(angleRad) * 20,
+      soldier.y + Math.sin(angleRad) * 10,
+      Math.cos(angleRad) * speed,
+      Math.sin(angleRad) * speed,
+      def.config,
+      this.terrain,
+      soldier,
+      { behavior: def.behavior ?? undefined },
+    );
+    this.events.emit('projectile-spawned', projectile);
+    this.events.emit('projectile-created', projectile);
+    this.cameras.main.shake(100, 0.004);
+  }
+
+  private swingSledgehammer(soldier: Soldier): void {
+    const turnId = this.turnId;
+    const angleRad = Phaser.Math.DegToRad(this.aimAngle);
+    const facing = Math.cos(angleRad) < 0 ? -1 : 1;
+
+    // Swing arc visual
+    const arc = this.add.graphics().setDepth(190);
+    arc.lineStyle(6, 0xcc8844, 0.9);
+    arc.beginPath();
+    arc.arc(soldier.x, soldier.y - 6, 34, angleRad - 1.1, angleRad + 0.4);
+    arc.strokePath();
+    this.tweens.add({ targets: arc, alpha: 0, duration: 300, onComplete: () => arc.destroy() });
+
+    // Hit the closest soldier in front of us (within range and roughly in the aim direction).
+    const target = this.findNearest(soldier.x, soldier.y, s => {
+      if (!s.isAlive() || s === soldier) return false;
+      const toTarget = Math.atan2(s.y - soldier.y, s.x - soldier.x);
+      return Math.abs(Phaser.Math.Angle.Wrap(toTarget - angleRad)) < 1.2;
+    }, SLEDGE_RANGE);
+
+    if (!target) {
+      this.showPowerupText(soldier.x + facing * 30, soldier.y - 30, 'WHIFF!', 0xaaaaaa);
+      this.time.delayedCall(1100, () => {
+        if (turnId === this.turnId && !this.isTurnEnding) this.endTurn();
+      });
+      return;
+    }
+
+    this.damageSoldier(target, SLEDGE_DAMAGE);
+    // Launch in the swing direction, always with some lift so they fly (aiming higher = more lift).
+    const lift = Phaser.Math.Clamp(-Math.sin(angleRad), 0.3, 0.9);
+    target.launch(facing * SLEDGE_KNOCKBACK * (1 - lift * 0.5), -SLEDGE_KNOCKBACK * 0.7 * lift - 120);
+    this.showPowerupText(target.x, target.y - 30, 'BONK!', 0xffaa33);
+    SoundManager.playExplosion('small');
+    this.cameras.main.shake(180, 0.01);
+    this.cameras.main.startFollow(target.sprite, true, 0.1, 0.1);
+
+    // Give the victim time to fly (and maybe off a cliff) before the turn ends.
+    this.time.delayedCall(2600, () => {
+      if (turnId === this.turnId && !this.isTurnEnding) this.endTurn();
+    });
+  }
+
+  private handleTeleportBeacon(x: number, y: number, shooter: Soldier | null): void {
+    if (!shooter || !shooter.isAlive() || shooter !== this.currentSoldier) return;
+
+    const surface = this.terrain.findSurfaceYAtOrBelow(x, y - 30, 90);
+    if (surface === null || surface > this.worldHeight - 20) {
+      this.showPowerupText(x, y - 20, 'TELEPORT FAILED', 0x66ffff);
+      return;
+    }
+
+    const flash = (fx: number, fy: number): void => {
+      const ring = this.add.circle(fx, fy, 22, 0x66ffff, 0.5).setDepth(190);
+      this.tweens.add({ targets: ring, scale: 2.2, alpha: 0, duration: 450, onComplete: () => ring.destroy() });
+    };
+    flash(shooter.x, shooter.y);
+
+    const body = shooter.sprite.body as Phaser.Physics.Arcade.Body;
+    body.setVelocity(0, 0);
+    shooter.sprite.setPosition(x, surface - 16);
+    flash(shooter.x, shooter.y);
+    SoundManager.playSelect();
+    this.cameras.main.startFollow(shooter.sprite, true, 0.1, 0.1);
+  }
+
+  private handleSpecialExploded(behavior: SpecialBehavior, _x: number, _y: number): void {
+    if (behavior === 'holy') {
+      this.showWorldBanner('HALLELUJAH!', 'Holy Grenade');
+      this.cameras.main.shake(500, 0.02);
+      this.cameras.main.flash(250, 255, 250, 200);
+    } else if (behavior === 'goat') {
+      this.cameras.main.shake(260, 0.012);
+    }
   }
 
   private tryMedicHeal(): void {
@@ -2809,13 +3173,18 @@ private startParatrooperDrop(): void {
     this.shotEndScheduled = true;
     const turnId = this.turnId;
 
-    // Small delay so the player sees the impact/explosion.
-    this.time.delayedCall(650, () => {
+    // Small delay so the player sees the impact/explosion (and any barrel/mine chain finishes).
+    const tryEnd = (): void => {
       if (turnId !== this.turnId) return;
       if (this.isTurnEnding) return;
       if (!this.hasFired) return;
-      if (!this.isTurnEnding) this.endTurn();
-    });
+      if (this.hazards.isBusy()) {
+        this.time.delayedCall(250, tryEnd);
+        return;
+      }
+      this.endTurn();
+    };
+    this.time.delayedCall(650, tryEnd);
   }
 
   private trackProjectile(projectile: Projectile): void {
@@ -2866,7 +3235,7 @@ private startParatrooperDrop(): void {
         const distance = Phaser.Math.Distance.Between(x, y, soldier.x, soldier.y);
         if (distance < radius) {
           const damage = Math.round((1 - distance / radius) * baseDamage);
-          soldier.takeDamage(damage);
+          this.damageSoldier(soldier, damage);
 
           // Apply knockback (reduced for bullets)
           if (radius > 10) {
@@ -2881,6 +3250,11 @@ private startParatrooperDrop(): void {
         }
       }
     });
+
+    if (radius > 5) this.lastImpact = { x, y };
+
+    // Barrels/mines caught in the blast go off too (chain reactions).
+    this.hazards.onExplosion(x, y, radius);
 
     // Supply crates should persist across turns, but they can be destroyed by enemy fire.
     // Apply explosion damage to any active crates inside the blast envelope.
@@ -3124,7 +3498,7 @@ private startParatrooperDrop(): void {
       const closestY = startY + dy * t;
 
       if (Phaser.Math.Distance.Between(soldier.x, soldier.y, closestX, closestY) <= corridorRadius) {
-        soldier.takeDamage(damage);
+        this.damageSoldier(soldier, damage);
       }
     });
   }
@@ -3158,6 +3532,12 @@ private startParatrooperDrop(): void {
     if (this.currentSoldier) {
       this.currentSoldier.setActive(false);
     }
+
+    if (this.turnActor && this.turnActorAttacked) {
+      this.playShotBanter(this.turnActor, this.turnStats);
+    }
+    this.turnActor = null;
+    this.isSpecialArmed = false;
 
     // Prevent any pending "release-to-fire" from firing after the turn changes.
     this.clearChargeState();
@@ -3267,7 +3647,8 @@ private startParatrooperDrop(): void {
       return 'munitions';
     }
 
-    // Otherwise, a more even spread.
+    // Otherwise, a more even spread (a quarter are special weapon crates).
+    if (Math.random() < 0.25) return 'weapon';
     if (r < 0.28) return 'medkit';
     if (r < 0.48) return 'armor';
     if (r < 0.68) return 'artillery';
@@ -3310,7 +3691,7 @@ private startParatrooperDrop(): void {
     }
   }
 
-  private showWorldBanner(text: string): void {
+  private showWorldBanner(text: string, subtitle: string = 'Contest it to swing the fight'): void {
     const cam = this.cameras.main;
     const banner = this.add.text(cam.width / 2, 150, text, {
       font: 'bold 24px Arial',
@@ -3322,7 +3703,7 @@ private startParatrooperDrop(): void {
     banner.setScrollFactor(0);
     banner.setDepth(1000);
 
-    const sub = this.add.text(cam.width / 2, 182, 'Contest it to swing the fight', {
+    const sub = this.add.text(cam.width / 2, 182, subtitle, {
       font: 'bold 14px Arial',
       color: '#d9e6ff',
       stroke: '#000000',
@@ -3405,6 +3786,7 @@ private startParatrooperDrop(): void {
     if (type === 'artillery') return 'HOWITZER';
     if (type === 'armor') return 'ARMOR';
     if (type === 'munitions') return 'MUNITIONS';
+    if (type === 'weapon') return 'SPECIAL WEAPON';
     return 'AIRSTRIKE';
   }
 
@@ -3425,6 +3807,7 @@ private startParatrooperDrop(): void {
       type === 'armor' ? 0x66ccff :
       type === 'munitions' ? 0xff66cc :
       type === 'artillery' ? 0xffaa00 :
+      type === 'weapon' ? 0xffdd33 :
       0x66ffff;
     const glow = this.add.rectangle(0, 0, 52, 38, glowColor, 0.10);
     glow.setOrigin(0.5);
@@ -3636,6 +4019,14 @@ private startParatrooperDrop(): void {
   private applySupplyDropToSoldier(type: SupplyDropType, soldier: Soldier, x: number, y: number): void {
     // Small confirmation sound
     SoundManager.playSelect();
+
+    if (type === 'weapon') {
+      const def = SPECIAL_WEAPONS[rollSpecialWeapon()];
+      soldier.setSpecialWeapon(def.id);
+      this.showPowerupText(x, y - 20, `${def.name.toUpperCase()} (Q)`, def.color);
+      this.speak(soldier, 'pickup', 300);
+      return;
+    }
 
     if (type === 'medkit') {
       const amount = Phaser.Math.Between(25, 45);
@@ -4200,6 +4591,8 @@ private startParatrooperDrop(): void {
     const vx = Math.cos(angleRad) * speed;
     const vy = Math.sin(angleRad) * speed;
     const effectiveGravity = 500 * weapon.gravity;
+    // The AI reads the wind well, but not perfectly.
+    const windAccel = getWindAccel(this.wind, weapon.type) * 0.85;
 
     const isBullet = this.isBulletWeapon(weapon.type);
     // Smaller timestep for fast weapons so the score matches the actual 60fps-ish simulation more closely.
@@ -4211,7 +4604,7 @@ private startParatrooperDrop(): void {
     let impactY: number | null = null;
 
     for (let t = 0; t < maxTime; t += dt) {
-      const x = startX + vx * t;
+      const x = startX + vx * t + 0.5 * windAccel * t * t;
       const y = startY + vy * t + 0.5 * effectiveGravity * t * t;
 
       // Out of bounds
@@ -4350,7 +4743,7 @@ private startParatrooperDrop(): void {
         if (distSq <= hitRadius * hitRadius) {
           // Point is inside circle - hit!
           if (isBullet) {
-            soldier.takeDamage(damage);
+            this.damageSoldier(soldier, damage);
             const angle = Math.atan2(dy || 0.001, dx || 0.001);
             soldier.applyKnockback(
               Math.cos(angle) * 24,
@@ -4385,7 +4778,7 @@ private startParatrooperDrop(): void {
           
           // Apply damage directly for bullets (not through explosion system)
           if (isBullet) {
-            soldier.takeDamage(damage);
+            this.damageSoldier(soldier, damage);
             
             // Small knockback for bullets
             const angle = Math.atan2(dy, dx);
@@ -4403,6 +4796,12 @@ private startParatrooperDrop(): void {
           return; // Only hit one soldier per frame
         }
       }
+    }
+
+    // No soldier in the way - did it hit an explosive barrel?
+    const barrelHit = this.hazards.findBarrelHit(lastX, lastY, currentX, currentY);
+    if (barrelHit) {
+      onHit(barrelHit.x, barrelHit.y);
     }
   }
 

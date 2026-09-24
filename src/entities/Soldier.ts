@@ -4,6 +4,8 @@ import { createProjectile } from './Projectile';
 import { WeaponConfig, WeaponType, WEAPONS, SQUAD_WEAPONS } from '../systems/WeaponTypes';
 import { Terrain } from '../systems/Terrain';
 import { SoundManager } from '../utils/SoundManager';
+import { getPromotion, getRankForKills, type Rank } from '../systems/Veterancy';
+import type { SpecialWeaponId } from '../systems/SpecialWeapons';
 
 // Map weapon types to sprite keys (each weapon has unique sprite)
 const WEAPON_SPRITES: Record<WeaponType, string> = {
@@ -93,6 +95,10 @@ export class Soldier {
   private airstrikeCharges: number = 0;
   private artilleryCharges: number = 0;
   private armor: number = 0;
+
+  // Veterancy + one-shot special weapon from crates
+  private kills: number = 0;
+  private specialWeapon: SpecialWeaponId | null = null;
 
   constructor(scene: Phaser.Scene, x: number, y: number, team: Team, name: string, squadIndex: number, disableGravity: boolean = false, weaponType?: WeaponType) {
     this.scene = scene;
@@ -192,6 +198,39 @@ export class Soldier {
 
   public getArtilleryCharges(): number {
     return this.artilleryCharges;
+  }
+
+  public getKills(): number {
+    return this.kills;
+  }
+
+  public getRank(): Rank {
+    return getRankForKills(this.kills);
+  }
+
+  /** Record an enemy kill. Returns the new rank if this kill earned a promotion. */
+  public addKill(): Rank | null {
+    const promotion = getPromotion(this.kills, this.kills + 1);
+    this.kills++;
+    if (promotion) {
+      if (promotion.promotionArmor > 0) this.addArmor(promotion.promotionArmor);
+      this.refreshNameLabel();
+    }
+    return promotion;
+  }
+
+  public getSpecialWeapon(): SpecialWeaponId | null {
+    return this.specialWeapon;
+  }
+
+  public setSpecialWeapon(id: SpecialWeaponId | null): void {
+    this.specialWeapon = id;
+  }
+
+  private refreshNameLabel(): void {
+    const stars = this.getRank().stars;
+    this.nameText.setText(stars ? `${stars} ${this.name}` : this.name);
+    if (stars) this.nameText.setColor(this.team === Team.RED ? '#ffcc88' : '#aaddff');
   }
 
   public getArmor(): number {
@@ -527,6 +566,13 @@ export class Soldier {
 
   // Speech bubble system
   private showSpeechBubble(type: keyof typeof MILITARY_QUIPS): void {
+    const quips = MILITARY_QUIPS[type];
+    this.say(quips[Math.floor(Math.random() * quips.length)]);
+  }
+
+  /** Show an arbitrary line in this soldier's speech bubble. */
+  public say(quip: string): void {
+    if (!this.alive && !this.sprite.active) return;
     // Clear existing bubble
     if (this.speechBubble) {
       this.speechBubble.destroy();
@@ -536,11 +582,7 @@ export class Soldier {
       this.speechTimer.destroy();
       this.speechTimer = null;
     }
-    
-    // Pick random quip
-    const quips = MILITARY_QUIPS[type];
-    const quip = quips[Math.floor(Math.random() * quips.length)];
-    
+
     // Create bubble container
     this.speechBubble = this.scene.add.container(this.sprite.x, this.sprite.y - 55);
     this.speechBubble.setDepth(200);
@@ -793,6 +835,14 @@ export class Soldier {
       Phaser.Math.Clamp(body.velocity.x * 0.35 + impulseX, -maxVelocityX, maxVelocityX),
       Phaser.Math.Clamp(body.velocity.y * 0.35 + impulseY, -maxVelocityY, maxVelocityY)
     );
+  }
+
+  /** Hard launch that ignores the usual knockback caps (sledgehammer). */
+  public launch(velocityX: number, velocityY: number): void {
+    if (!this.alive) return;
+    const body = this.sprite.body as Phaser.Physics.Arcade.Body;
+    body.setAllowGravity(true);
+    this.sprite.setVelocity(velocityX, velocityY);
   }
 
   private die(): void {
