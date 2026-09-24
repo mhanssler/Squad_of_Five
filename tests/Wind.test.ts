@@ -40,3 +40,30 @@ describe('Wind', () => {
     expect(isWindCalm(-0.3)).toBe(false);
   });
 });
+
+describe('Wind in the shared ballistics step', () => {
+  it('drifts a projectile downwind and leaves a calm shot untouched', async () => {
+    const { advanceFlight, BALLISTIC_STEP } = await import('../src/systems/Ballistics');
+    const config = { gravity: 0.7, drag: 0, bounce: 0, projectileSize: 8 };
+    const air = () => false;
+    let calm = { x: 0, y: 0, vx: 300, vy: -300, age: 0 };
+    let windy = { ...calm };
+    for (let i = 0; i < 120; i++) {
+      calm = advanceFlight(calm, config, air, BALLISTIC_STEP).state;
+      windy = advanceFlight(windy, config, air, BALLISTIC_STEP, 0, 100).state;
+    }
+    // One second at 100 px/s^2 is ~50px of drift; vertical motion is identical.
+    expect(windy.x - calm.x).toBeGreaterThan(45);
+    expect(windy.x - calm.x).toBeLessThan(55);
+    expect(windy.y).toBeCloseTo(calm.y, 6);
+  });
+
+  it('honours a custom fuse for bouncing projectiles', async () => {
+    const { advanceFlight, BALLISTIC_STEP } = await import('../src/systems/Ballistics');
+    const air = () => false;
+    const state = { x: 0, y: 0, vx: 0, vy: 0, age: 2.99 };
+    const base = { gravity: 0, drag: 0, bounce: 0.5, projectileSize: 8 };
+    expect(advanceFlight(state, base, air, BALLISTIC_STEP).ended).toBe(true); // default 2.5s fuse
+    expect(advanceFlight(state, { ...base, fuse: 3.5 }, air, BALLISTIC_STEP).ended).toBe(false);
+  });
+});

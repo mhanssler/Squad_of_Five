@@ -48,8 +48,8 @@ export const CLUSTER_BOMBLET_CONFIG: WeaponConfig = base({
 /** Number of bomblets a cluster bomb splits into. */
 export const CLUSTER_BOMBLET_COUNT = 6;
 
-/** Seconds a holy grenade waits after first touching the ground. */
-export const HOLY_FUSE_MS = 2600;
+/** Seconds from the throw before a holy grenade goes off (normal grenades: 2.5s). */
+export const HOLY_FUSE_SECONDS = 3.5;
 
 /** How long the goat walks before it blows up on its own. */
 export const GOAT_MAX_WALK_MS = 6000;
@@ -91,6 +91,7 @@ export const SPECIAL_WEAPONS: Record<SpecialWeaponId, SpecialWeaponDef> = {
       projectileSpeed: 800,
       gravity: 0.75,
       bounce: 0.45,
+      fuse: HOLY_FUSE_SECONDS,
       trailColor: 0xffee88,
       projectileSize: 11,
     }),

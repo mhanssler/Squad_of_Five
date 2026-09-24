@@ -1,17 +1,44 @@
 import Phaser from 'phaser';
+import { moveCharacter } from './CharacterPhysics';
+import { traceBlastExposure } from './Cover';
+import {
+  findWalkableSurfaceY,
+  smoothTerrainProfile,
+} from './Locomotion';
+
+type CavePoint = {
+  x: number;
+  y: number;
+  radius: number;
+};
+
+type CaveNetwork = {
+  paths: CavePoint[][];
+};
 
 export class Terrain {
   private scene: Phaser.Scene;
   private width: number;
   private height: number;
   private terrainImage!: Phaser.GameObjects.Image;
+  private caveImage!: Phaser.GameObjects.Image;
   private collisionData!: Uint8ClampedArray;
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
+  private solidCanvas: HTMLCanvasElement;
+  private solidCtx: CanvasRenderingContext2D;
+  private caveCanvas: HTMLCanvasElement;
+  private caveCtx: CanvasRenderingContext2D;
   private heightMap: number[] = [];
   private seed: number;
   private textureKey: string;
+  private caveTextureKey: string;
   private preset: 'standard' | 'plains' | 'hills' | 'caves';
+  private collisionState = new WeakMap<Phaser.Physics.Arcade.Sprite, {
+    x: number;
+    y: number;
+    grounded: boolean;
+  }>();
 
   constructor(
     scene: Phaser.Scene,
@@ -25,6 +52,7 @@ export class Terrain {
     this.height = height;
     this.seed = seed ?? Math.floor(Math.random() * 1000000);
     this.textureKey = 'terrain-texture-' + this.seed;
+    this.caveTextureKey = 'terrain-caves-' + this.seed;
     this.preset = options?.preset ?? 'standard';
 
     // Create offscreen canvas for collision detection
@@ -32,6 +60,17 @@ export class Terrain {
     this.canvas.width = width;
     this.canvas.height = height;
     this.ctx = this.canvas.getContext('2d')!;
+    this.solidCanvas = document.createElement('canvas');
+    this.solidCanvas.width = width;
+    this.solidCanvas.height = height;
+    this.solidCtx = this.solidCanvas.getContext('2d')!;
+
+    // Cave interiors use their own raster layer so they can be clipped to the
+    // original ground silhouette without becoming collision geometry.
+    this.caveCanvas = document.createElement('canvas');
+    this.caveCanvas.width = width;
+    this.caveCanvas.height = height;
+    this.caveCtx = this.caveCanvas.getContext('2d')!;
 
     // Generate initial terrain with seed
     this.generateTerrain();
@@ -41,6 +80,19 @@ export class Terrain {
   }
 
   private createTerrainTexture(): void {
+    if (this.scene.textures.exists(this.caveTextureKey)) {
+      this.scene.textures.remove(this.caveTextureKey);
+    }
+    this.scene.textures.addCanvas(this.caveTextureKey, this.caveCanvas);
+
+    if (this.caveImage) {
+      this.caveImage.setTexture(this.caveTextureKey);
+    } else {
+      this.caveImage = this.scene.add.image(0, 0, this.caveTextureKey);
+      this.caveImage.setOrigin(0, 0);
+      this.caveImage.setDepth(-2);
+    }
+
     // Remove old texture if it exists
     if (this.scene.textures.exists(this.textureKey)) {
       this.scene.textures.remove(this.textureKey);
@@ -66,6 +118,7 @@ export class Terrain {
   public regenerate(newSeed?: number): void {
     this.seed = newSeed ?? Math.floor(Math.random() * 1000000);
     this.textureKey = 'terrain-texture-' + this.seed;
+    this.caveTextureKey = 'terrain-caves-' + this.seed;
     this.generateTerrain();
     this.createTerrainTexture();
   }
@@ -99,6 +152,22 @@ export class Terrain {
     return null;
   }
 
+  public findWalkableSurfaceNear(
+    x: number,
+    referenceFootY: number,
+    maxUp: number = 6,
+    maxDown: number = 11,
+  ): number | null {
+    const px = Math.max(0, Math.min(this.width - 1, Math.floor(x)));
+    return findWalkableSurfaceY(
+      referenceFootY,
+      maxUp,
+      maxDown,
+      this.height,
+      y => this.isPointSolid(px, y),
+    );
+  }
+
   // Seeded random number generator
   private seededRandom(): number {
     this.seed = (this.seed * 9301 + 49297) % 233280;
@@ -111,6 +180,7 @@ export class Terrain {
     
     // Clear canvas
     this.ctx.clearRect(0, 0, this.width, this.height);
+    this.caveCtx.clearRect(0, 0, this.width, this.height);
 
     // Generate more extreme terrain with caves, overhangs, and dramatic features
     const baseLevel =
@@ -159,28 +229,28 @@ export class Terrain {
         y += (-ridgeFactor - 0.6) * 60; // Deep cuts
       }
       
-      // === ENHANCED ROCKY DETAIL ===
-      // Medium rocky bumps
-      y += Math.sin(x * 0.03 + phaseShift * 1.5) * 18;
-      y += Math.cos(x * 0.045 + phaseShift * 0.8) * 14;
+      // Rocky character comes mostly from the painted surface detail. Keep collision
+      // broad enough that a soldier's feet can follow it without pixel-scale hopping.
+      y += Math.sin(x * 0.03 + phaseShift * 1.5) * 10;
+      y += Math.cos(x * 0.045 + phaseShift * 0.8) * 8;
       
       // Small bumps and texture (increased density)
-      y += Math.sin(x * 0.05 + phaseShift * 2) * 12;
-      y += Math.sin(x * 0.08 + phaseShift) * 8;
-      y += Math.cos(x * 0.12 + phaseShift * 1.2) * 6;
+      y += Math.sin(x * 0.05 + phaseShift * 2) * 5;
+      y += Math.sin(x * 0.08 + phaseShift) * 3;
+      y += Math.cos(x * 0.12 + phaseShift * 1.2) * 2;
       
       // Fine rocky detail - high frequency for jagged look
-      y += Math.sin(x * 0.15 + phaseShift * 2.5) * 5;
-      y += Math.cos(x * 0.22 + phaseShift * 0.3) * 4;
-      y += Math.sin(x * 0.35 + phaseShift * 1.8) * 3;
+      y += Math.sin(x * 0.15 + phaseShift * 2.5) * 1.5;
+      y += Math.cos(x * 0.22 + phaseShift * 0.3) * 1;
+      y += Math.sin(x * 0.35 + phaseShift * 1.8) * 0.75;
       
       // Micro-texture for rough appearance
-      y += Math.sin(x * 0.5 + phaseShift) * 2;
-      y += Math.cos(x * 0.7 + phaseShift * 2) * 1.5;
+      y += Math.sin(x * 0.5 + phaseShift) * 0.5;
+      y += Math.cos(x * 0.7 + phaseShift * 2) * 0.35;
       
       // Random small rocks/pebbles effect using pseudo-random from position
       const rockNoise = Math.sin(x * 1.3 + phaseShift * 3.7) * Math.cos(x * 0.9 + phaseShift);
-      y += rockNoise * 3;
+      y += rockNoise * 0.6;
       
       // Create distinct elevated positions on each side for team positions
       // Left side elevated position for red team
@@ -218,6 +288,9 @@ export class Terrain {
       this.heightMap.push(y);
     }
 
+    const smoothingRadius = this.preset === 'hills' ? 3 : 4;
+    this.heightMap = smoothTerrainProfile(this.heightMap, smoothingRadius, 2);
+
     // Draw dirt layer (brown) - main terrain body with gradient
     const dirtGradient = this.ctx.createLinearGradient(0, 0, 0, this.height);
     dirtGradient.addColorStop(0, '#6b4423');
@@ -234,48 +307,19 @@ export class Terrain {
     this.ctx.closePath();
     this.ctx.fill();
 
-    // Create caves and overhangs by carving out areas
-    this.ctx.globalCompositeOperation = 'destination-out';
-    
-    // Generate several cave systems based on seed
+    // Carve connected cave networks with open mouths, descending passages, and
+    // branches. The old isolated ellipses read as blast craters rather than caves.
     const cavesEnabled = this.preset === 'standard' || this.preset === 'caves';
     if (cavesEnabled) {
-      const numCavesBase = this.preset === 'caves' ? 6 : 3;
-      const numCaves = numCavesBase + Math.floor(this.seededRandom() * 5);
-      for (let i = 0; i < numCaves; i++) {
-        const caveX = 300 + this.seededRandom() * (this.width - 600);
-        const surfaceY = this.heightMap[Math.floor(caveX)] || baseLevel;
-        const caveY = surfaceY + 45 + this.seededRandom() * (this.preset === 'caves' ? 110 : 80); // Below surface
-        const caveWidth = (this.preset === 'caves' ? 90 : 60) + this.seededRandom() * 110;
-        const caveHeight = (this.preset === 'caves' ? 40 : 30) + this.seededRandom() * 60;
-        
-        // Only create cave if it's below the surface
-        if (caveY > surfaceY + 20 && caveY < this.height - 50) {
-          // Draw elliptical cave
-          this.ctx.beginPath();
-          this.ctx.ellipse(caveX, caveY, caveWidth, caveHeight, 0, 0, Math.PI * 2);
-          this.ctx.fill();
-          
-          // Add connecting tunnels sometimes
-          const tunnelChance = this.preset === 'caves' ? 0.75 : 0.5;
-          if (this.seededRandom() > (1 - tunnelChance) && i < numCaves - 1) {
-            const tunnelEndX = caveX + 80 + this.seededRandom() * 170;
-            const tunnelEndY = caveY + (this.seededRandom() - 0.5) * (this.preset === 'caves' ? 90 : 60);
-            this.ctx.beginPath();
-            this.ctx.ellipse(
-              (caveX + tunnelEndX) / 2,
-              (caveY + tunnelEndY) / 2, 
-              Math.abs(tunnelEndX - caveX) / 2 + 26,
-              this.preset === 'caves' ? 34 : 25, 
-              Math.atan2(tunnelEndY - caveY, tunnelEndX - caveX),
-              0,
-              Math.PI * 2
-            );
-            this.ctx.fill();
-          }
-        }
+      const networks = this.createCaveNetworks();
+      for (const network of networks) {
+        this.carveCaveNetwork(network);
+        this.drawCaveBackdrop(network);
       }
+      this.clipCaveBackdropToGround();
     }
+
+    this.ctx.globalCompositeOperation = 'destination-out';
     
     // Create dramatic overhangs by carving under steep terrain
     const overhangsEnabled = this.preset === 'standard' || this.preset === 'hills';
@@ -313,8 +357,11 @@ export class Terrain {
     this.ctx.globalCompositeOperation = 'source-over';
 
     // Get collision data AFTER caves are carved so we know actual solid terrain
-    let imageData = this.ctx.getImageData(0, 0, this.width, this.height);
-    let tempCollisionData = imageData.data;
+    const imageData = this.ctx.getImageData(0, 0, this.width, this.height);
+    const tempCollisionData = imageData.data;
+    this.solidCtx.clearRect(0, 0, this.width, this.height);
+    this.solidCtx.drawImage(this.canvas, 0, 0);
+    this.rebuildHeightMapFromPixels(tempCollisionData, 0, this.width - 1);
     
     // Now draw grass only where there's actual solid terrain with sky above
     this.drawGrassOnSolidTerrain(tempCollisionData);
@@ -386,9 +433,303 @@ export class Terrain {
       this.ctx.stroke();
     }
 
-    // Store final collision data
-    imageData = this.ctx.getImageData(0, 0, this.width, this.height);
-    this.collisionData = imageData.data;
+    // Decorative grass, gravel, and rocks must never become collision geometry.
+    this.collisionData = new Uint8ClampedArray(tempCollisionData);
+    this.drawRockMaterial();
+  }
+
+  private drawRockMaterial(): void {
+    this.ctx.save();
+    this.ctx.globalCompositeOperation = 'source-atop';
+    // Broken strata and angular facets give the cutaway readable material scale.
+    for (let y = 160; y < this.height; y += 28) {
+      for (let x = -30; x < this.width; x += 48) {
+        const jitter = this.seededRandom();
+        const px = x + jitter * 22;
+        const py = y + this.seededRandom() * 14;
+        this.ctx.fillStyle = jitter > 0.5 ? 'rgba(137,151,139,0.045)' : 'rgba(12,22,25,0.065)';
+        this.ctx.beginPath();
+        this.ctx.moveTo(px, py);
+        this.ctx.lineTo(px + 31, py - 5);
+        this.ctx.lineTo(px + 48, py + 5);
+        this.ctx.lineTo(px + 37, py + 19);
+        this.ctx.lineTo(px + 7, py + 22);
+        this.ctx.closePath();
+        this.ctx.fill();
+        this.ctx.strokeStyle = 'rgba(13,22,25,0.10)';
+        this.ctx.lineWidth = 1;
+        this.ctx.beginPath();
+        this.ctx.moveTo(px + 7, py + 22);
+        this.ctx.lineTo(px + 37, py + 19);
+        this.ctx.lineTo(px + 48, py + 5);
+        this.ctx.stroke();
+      }
+    }
+    this.ctx.restore();
+  }
+
+  private createCaveNetworks(): CaveNetwork[] {
+    const networkCount = this.preset === 'caves'
+      ? Math.max(3, Math.round(this.width / 720))
+      : Math.max(2, Math.round(this.width / 1400));
+    const networks: CaveNetwork[] = [];
+    const usableStart = this.width * 0.12;
+    const usableWidth = this.width * 0.76;
+    const slotWidth = usableWidth / networkCount;
+
+    for (let i = 0; i < networkCount; i++) {
+      const slotStart = usableStart + slotWidth * i;
+      const entranceX = this.findCaveEntranceX(slotStart, slotWidth);
+      const surfaceY = this.heightMap[Math.floor(entranceX)] ?? this.height * 0.5;
+      const direction: -1 | 1 = i % 2 === 0 ? 1 : -1;
+      const mainPath: CavePoint[] = [
+        { x: entranceX, y: surfaceY + 2, radius: 20 },
+        {
+          x: entranceX + direction * (14 + this.seededRandom() * 18),
+          y: surfaceY + 34,
+          radius: 24,
+        },
+      ];
+
+      const chamberCount = this.preset === 'caves' ? 4 : 3;
+      for (let chamber = 0; chamber < chamberCount; chamber++) {
+        const previous = mainPath[mainPath.length - 1];
+        const nextX = Phaser.Math.Clamp(
+          previous.x + direction * (44 + this.seededRandom() * 46),
+          55,
+          this.width - 55,
+        );
+        const nextY = Phaser.Math.Clamp(
+          previous.y + 10 + (this.seededRandom() - 0.25) * 32,
+          surfaceY + 48,
+          this.height - 58,
+        );
+        mainPath.push({
+          x: nextX,
+          y: nextY,
+          radius: 24 + this.seededRandom() * (this.preset === 'caves' ? 13 : 9),
+        });
+      }
+
+      const buriedMainPath = this.constrainCavePathToGround(mainPath, true);
+      if (buriedMainPath.length < 3) continue;
+
+      const paths: CavePoint[][] = [buriedMainPath];
+      if (this.preset === 'caves') {
+        const branchOrigin = buriedMainPath[Math.min(3, buriedMainPath.length - 2)];
+        const branch = this.constrainCavePathToGround([
+          branchOrigin,
+          {
+            x: Phaser.Math.Clamp(branchOrigin.x - direction * (34 + this.seededRandom() * 35), 55, this.width - 55),
+            y: Phaser.Math.Clamp(branchOrigin.y + 24 + this.seededRandom() * 24, surfaceY + 55, this.height - 55),
+            radius: 22 + this.seededRandom() * 9,
+          },
+          {
+            x: Phaser.Math.Clamp(branchOrigin.x - direction * (76 + this.seededRandom() * 42), 55, this.width - 55),
+            y: Phaser.Math.Clamp(branchOrigin.y + 12 + this.seededRandom() * 52, surfaceY + 55, this.height - 55),
+            radius: 27 + this.seededRandom() * 11,
+          },
+        ], false);
+        if (branch.length >= 2) {
+          branch[0] = { ...branchOrigin };
+          paths.push(branch);
+        }
+      }
+
+      networks.push({ paths });
+    }
+
+    return networks;
+  }
+
+  private findCaveEntranceX(slotStart: number, slotWidth: number): number {
+    let bestX = Phaser.Math.Clamp(slotStart + slotWidth * 0.5, 70, this.width - 70);
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    for (let i = 1; i <= 11; i++) {
+      const x = Phaser.Math.Clamp(slotStart + slotWidth * (i / 12), 70, this.width - 70);
+      const surface = this.heightMap[Math.floor(x)] ?? this.height;
+      const left = this.heightMap[Math.max(0, Math.floor(x - 18))] ?? surface;
+      const right = this.heightMap[Math.min(this.width - 1, Math.floor(x + 18))] ?? surface;
+      const undergroundDepth = this.height - surface;
+      if (undergroundDepth < 145) continue;
+
+      const score = surface + Math.abs(left - right) * 2 + this.seededRandom() * 16;
+      if (score < bestScore) {
+        bestScore = score;
+        bestX = x;
+      }
+    }
+
+    return bestX;
+  }
+
+  private constrainCavePathToGround(path: CavePoint[], keepSurfaceMouth: boolean): CavePoint[] {
+    const clearance = 10;
+    const bottomPadding = 16;
+    const constrained = path.map(point => ({ ...point }));
+
+    for (let i = keepSurfaceMouth ? 1 : 0; i < constrained.length; i++) {
+      const point = constrained[i];
+      const surface = this.heightMap[Math.floor(point.x)] ?? this.height;
+      point.y = Phaser.Math.Clamp(
+        Math.max(point.y, surface + point.radius + clearance),
+        point.radius + clearance,
+        this.height - point.radius - bottomPadding,
+      );
+    }
+
+    const firstBuriedSegment = keepSurfaceMouth ? 2 : 1;
+    for (let i = firstBuriedSegment; i < constrained.length; i++) {
+      const from = constrained[i - 1];
+      const to = constrained[i];
+      const distance = Math.abs(to.x - from.x);
+      const samples = Math.max(4, Math.ceil(distance / 10));
+      let deepestSurface = 0;
+      for (let sample = 0; sample <= samples; sample++) {
+        const t = sample / samples;
+        const x = from.x + (to.x - from.x) * t;
+        deepestSurface = Math.max(deepestSurface, this.heightMap[Math.floor(x)] ?? this.height);
+      }
+
+      const maximumRadius = Math.floor((this.height - deepestSurface - clearance - bottomPadding) / 2);
+      if (maximumRadius < 16) {
+        constrained.splice(i);
+        break;
+      }
+
+      from.radius = Math.min(from.radius, maximumRadius);
+      to.radius = Math.min(to.radius, maximumRadius);
+      const requiredY = deepestSurface + Math.max(from.radius, to.radius) + clearance;
+      from.y = Math.min(this.height - from.radius - bottomPadding, Math.max(from.y, requiredY));
+      to.y = Math.min(this.height - to.radius - bottomPadding, Math.max(to.y, requiredY));
+    }
+
+    return constrained;
+  }
+
+  private carveCaveNetwork(network: CaveNetwork): void {
+    this.ctx.save();
+    this.ctx.globalCompositeOperation = 'destination-out';
+    this.ctx.strokeStyle = '#000000';
+    this.ctx.fillStyle = '#000000';
+    this.ctx.lineCap = 'round';
+    this.ctx.lineJoin = 'round';
+
+    for (const path of network.paths) {
+      for (let i = 1; i < path.length; i++) {
+        const from = path[i - 1];
+        const to = path[i];
+        this.ctx.lineWidth = from.radius + to.radius;
+        this.ctx.beginPath();
+        this.ctx.moveTo(from.x, from.y);
+        this.ctx.lineTo(to.x, to.y);
+        this.ctx.stroke();
+      }
+
+      for (const point of path) {
+        this.ctx.beginPath();
+        this.ctx.arc(point.x, point.y, point.radius, 0, Math.PI * 2);
+        this.ctx.fill();
+      }
+    }
+
+    this.ctx.restore();
+  }
+
+  private drawCaveBackdrop(network: CaveNetwork): void {
+    const ctx = this.caveCtx;
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = '#070a0b';
+    ctx.fillStyle = '#070a0b';
+
+    for (const path of network.paths) {
+      for (let i = 1; i < path.length; i++) {
+        const from = path[i - 1];
+        const to = path[i];
+        const width = from.radius + to.radius;
+        ctx.lineWidth = width + 4;
+        ctx.beginPath();
+        ctx.moveTo(from.x, from.y);
+        ctx.lineTo(to.x, to.y);
+        ctx.stroke();
+      }
+
+      for (const point of path) {
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, point.radius + 2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // Sparse, dark rock teeth add cave texture without exposing node geometry.
+      ctx.fillStyle = '#151b1c';
+      for (let i = 1; i < path.length; i += 2) {
+        const point = path[i];
+        const tooth = Math.min(12, point.radius * 0.38);
+        ctx.beginPath();
+        ctx.moveTo(point.x - 7, point.y - point.radius + 2);
+        ctx.lineTo(point.x + 5, point.y - point.radius + 3);
+        ctx.lineTo(point.x - 1, point.y - point.radius + tooth);
+        ctx.closePath();
+        ctx.fill();
+      }
+      ctx.fillStyle = '#070a0b';
+    }
+
+    ctx.globalCompositeOperation = 'source-atop';
+    for (const path of network.paths) {
+      for (const point of path) {
+        ctx.strokeStyle = '#253033';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(point.x - 23, point.y - 10);
+        ctx.lineTo(point.x - 8, point.y - 17);
+        ctx.lineTo(point.x + 16, point.y - 12);
+        ctx.lineTo(point.x + 23, point.y + 8);
+        ctx.stroke();
+        ctx.strokeStyle = '#11191c';
+        ctx.lineWidth = 6;
+        ctx.beginPath();
+        ctx.moveTo(point.x - 24, point.y + 17);
+        ctx.lineTo(point.x + 4, point.y + 23);
+        ctx.lineTo(point.x + 30, point.y + 15);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+
+  private clipCaveBackdropToGround(): void {
+    const ctx = this.caveCtx;
+    ctx.save();
+    ctx.globalCompositeOperation = 'destination-in';
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.moveTo(0, this.height);
+    for (let x = 0; x <= this.width; x++) {
+      ctx.lineTo(x, this.heightMap[x] ?? this.height);
+    }
+    ctx.lineTo(this.width, this.height);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  private rebuildHeightMapFromPixels(source: Uint8ClampedArray, startX: number, endX: number): void {
+    const sx = Math.max(0, Math.floor(startX));
+    const ex = Math.min(this.width - 1, Math.ceil(endX));
+    for (let x = sx; x <= ex; x++) {
+      this.heightMap[x] = this.height;
+      for (let y = 0; y < this.height; y++) {
+        const index = (y * this.width + x) * 4;
+        if (source[index + 3] > 128) {
+          this.heightMap[x] = y;
+          break;
+        }
+      }
+    }
   }
 
   private drawGrassOnSolidTerrain(collisionData: Uint8ClampedArray): void {
@@ -511,24 +852,16 @@ export class Terrain {
     const sx = Math.max(0, Math.floor(startX));
     const ex = Math.min(this.width - 1, Math.ceil(endX));
 
-    const imageData = this.ctx.getImageData(0, 0, this.width, this.height);
+    const imageData = this.solidCtx.getImageData(0, 0, this.width, this.height);
     this.collisionData = imageData.data;
-
-    for (let x = sx; x <= ex; x++) {
-      let foundSurface = false;
-      for (let y = 0; y < this.height; y++) {
-        const index = (y * this.width + x) * 4;
-        if (this.collisionData[index + 3] > 128) {
-          this.heightMap[x] = y;
-          foundSurface = true;
-          break;
-        }
-      }
-      if (!foundSurface) this.heightMap[x] = this.height;
-    }
+    this.rebuildHeightMapFromPixels(this.collisionData, sx, ex);
   }
 
   private addSolidEllipse(cx: number, cy: number, rx: number, ry: number, rotation: number = 0): void {
+    this.solidCtx.fillStyle = '#ffffff';
+    this.solidCtx.beginPath();
+    this.solidCtx.ellipse(cx, cy, rx, ry, rotation, 0, Math.PI * 2);
+    this.solidCtx.fill();
     // Add solid terrain (used for crude barriers / berms)
     this.ctx.globalCompositeOperation = 'source-over';
 
@@ -543,23 +876,33 @@ export class Terrain {
   }
 
   public buildCrudeBarrier(centerX: number, groundY: number, facing: -1 | 1): void {
-    // Build a small berm in front of the soldier. This is real terrain (solid).
-    const cx = centerX + facing * 26;
-    const cy = groundY - 10;
-    const rx = 22;
-    const ry = 16;
+    // A two-row sandbag wall leaves a small movement gap and reaches high enough
+    // to interrupt a blast ray aimed at the soldier's torso.
+    const cx = centerX + facing * 40;
+    const cy = groundY - 11;
+    const rx = 29;
+    const ry = 18;
 
-    this.addSolidEllipse(cx, cy, rx, ry, facing * 0.15);
+    this.addSolidEllipse(cx, cy + 2, rx, ry - 2, facing * 0.08);
 
-    // A couple of dark "sandbag" stripes for definition (kept solid).
     this.ctx.globalCompositeOperation = 'source-over';
-    this.ctx.strokeStyle = 'rgba(40, 28, 18, 0.75)';
-    this.ctx.lineWidth = 2;
-    for (let i = 0; i < 3; i++) {
-      const y = cy - 6 + i * 6;
+    const bags = [
+      { x: -18, y: 2, w: 22, h: 10 },
+      { x: 0, y: 3, w: 22, h: 10 },
+      { x: 18, y: 2, w: 22, h: 10 },
+      { x: -10, y: -8, w: 23, h: 10 },
+      { x: 11, y: -8, w: 23, h: 10 },
+    ];
+    for (const bag of bags) {
+      this.solidCtx.beginPath();
+      this.solidCtx.ellipse(cx + bag.x, cy + bag.y, bag.w / 2, bag.h / 2, facing * 0.04, 0, Math.PI * 2);
+      this.solidCtx.fill();
+      this.ctx.fillStyle = bag.y < 0 ? '#a9895b' : '#8f7049';
+      this.ctx.strokeStyle = '#4a3825';
+      this.ctx.lineWidth = 1.5;
       this.ctx.beginPath();
-      this.ctx.moveTo(cx - rx + 4, y);
-      this.ctx.lineTo(cx + rx - 4, y + facing * 1);
+      this.ctx.ellipse(cx + bag.x, cy + bag.y, bag.w / 2, bag.h / 2, facing * 0.04, 0, Math.PI * 2);
+      this.ctx.fill();
       this.ctx.stroke();
     }
 
@@ -570,14 +913,72 @@ export class Terrain {
     this.updateDisplay();
   }
 
+  public getBlastExposure(startX: number, startY: number, targetX: number, targetY: number): number {
+    return traceBlastExposure(startX, startY, targetX, targetY, (x, y) => this.isPointSolid(x, y));
+  }
+
+  public digTunnel(startX: number, startY: number, endX: number, endY: number, radius: number): boolean {
+    const steps = Math.max(4, Math.ceil(Math.hypot(endX - startX, endY - startY) / 8));
+    let solidSamples = 0;
+
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const x = startX + (endX - startX) * t;
+      const y = startY + (endY - startY) * t;
+      if (
+        this.isPointSolid(x, y) ||
+        this.isPointSolid(x, y + radius * 0.55) ||
+        this.isPointSolid(x, y - radius * 0.55)
+      ) {
+        solidSamples++;
+      }
+    }
+
+    if (solidSamples < Math.max(2, Math.floor(steps * 0.25))) return false;
+
+    for (const context of [this.ctx, this.solidCtx]) {
+      context.save();
+      context.globalCompositeOperation = 'destination-out';
+      context.lineCap = 'round';
+      context.lineJoin = 'round';
+      context.lineWidth = radius * 2;
+      context.beginPath();
+      context.moveTo(startX, startY);
+      context.lineTo(endX, endY);
+      context.stroke();
+      context.beginPath();
+      context.arc(endX, endY, radius * 1.08, 0, Math.PI * 2);
+      context.fill();
+      context.restore();
+    }
+
+    const start = Math.min(startX, endX) - radius - 8;
+    const end = Math.max(startX, endX) + radius + 8;
+    this.refreshCollisionAndHeightMap(start, end);
+    this.redrawGrassInArea(Math.floor(start), Math.ceil(end));
+    this.updateDisplay();
+    return true;
+  }
+
   public destroyCircle(centerX: number, centerY: number, radius: number): void {
     // Create explosion crater - completely remove terrain
     // Clear with a circular mask (avoid square clearRect so craters stay round).
-    this.ctx.globalCompositeOperation = 'destination-out';
+    for (const context of [this.ctx, this.solidCtx]) {
+      context.save();
+      context.globalCompositeOperation = 'destination-out';
+      context.beginPath();
+      context.arc(centerX, centerY, radius, 0, Math.PI * 2);
+      context.fill();
+      context.restore();
+    }
+    this.ctx.save();
+    this.ctx.globalCompositeOperation = 'source-atop';
+    this.ctx.strokeStyle = 'rgba(15,19,22,0.68)';
+    this.ctx.lineWidth = 9;
     this.ctx.beginPath();
-    this.ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
-    this.ctx.fill();
-    this.ctx.globalCompositeOperation = 'source-over';
+    this.ctx.arc(centerX, centerY, radius + 3, 0, Math.PI * 2);
+    this.ctx.stroke();
+    this.ctx.restore();
 
     // Update heightMap in the affected area by scanning for new surface
     const startX = Math.max(0, Math.floor(centerX - radius - 5));
@@ -672,123 +1073,31 @@ export class Terrain {
     if (drawing) this.ctx.stroke();
   }
 
-  public checkCollision(sprite: Phaser.Physics.Arcade.Sprite): boolean {
-    const body = sprite.body as Phaser.Physics.Arcade.Body;
-    const footOffsetY = 14;
-    const halfFootWidth = 7;
-    const maxStepUp = 18;
-    const maxStepDown = 32;
-    const maxContactSpread = 24;
-    const maxSweep = 160;
-
-    let footY = Math.floor(sprite.y + footOffsetY);
-
-    // Prevent falling below world.
-    if (footY >= this.height - 5) {
-      sprite.y = this.height - footOffsetY - 5;
-      body.setVelocityY(0);
-      body.setAllowGravity(false);
-      return true;
-    }
-
-    if (sprite.x < 0 || sprite.x >= this.width || footY < 0) {
-      body.setAllowGravity(true);
-      return false;
-    }
-
-    const isSolidAt = (px: number, py: number): boolean => {
-      const ix = Math.floor(px);
-      const iy = Math.floor(py);
-      if (ix < 0 || ix >= this.width || iy < 0 || iy >= this.height) return false;
-      const index = (iy * this.width + ix) * 4;
-      return this.collisionData[index + 3] > 128;
-    };
-
-    const anySolid = (pts: { x: number; y: number }[]): boolean => {
-      for (const p of pts) {
-        if (isSolidAt(p.x, p.y)) return true;
-      }
-      return false;
-    };
-
-    // Physics can move a falling body many pixels between checks (fixed-step catch-up on slow frames),
-    // enough to pass straight through a thin ledge. Sweep from last check's foot position so a surface
-    // crossed in between still catches the soldier.
-    const lastFootY = sprite.getData('terrainLastFootY') as number | undefined;
-    const fallSweep = lastFootY !== undefined && body.velocity.y > 0 ? footY - Math.floor(lastFootY) : 0;
-    const maxRise = fallSweep > maxStepUp && fallSweep <= maxSweep ? fallSweep : maxStepUp;
-
-    const findLocalSurface = (sampleX: number): number | null => {
-      return this.findSurfaceYAtOrBelow(
-        sampleX,
-        footY - maxRise,
-        maxRise + maxStepDown
-      );
-    };
-
-    const footSamples = [
-      sprite.x - halfFootWidth,
-      sprite.x,
-      sprite.x + halfFootWidth,
-    ];
-    const surfaces = footSamples
-      .map(findLocalSurface)
-      .filter((y): y is number => y !== null);
-
-    let onGround = false;
-
-    if (surfaces.length > 0 && body.velocity.y >= -30) {
-      const highestSurface = Math.min(...surfaces);
-      const lowestSurface = Math.max(...surfaces);
-      const contactSpread = lowestSurface - highestSurface;
-      const targetY = highestSurface - footOffsetY;
-      const snapDelta = targetY - sprite.y;
-
-      if (contactSpread <= maxContactSpread && snapDelta >= -maxRise && snapDelta <= maxStepDown) {
-        sprite.y = targetY;
-        body.setVelocityY(0);
-        body.setAllowGravity(false);
-        onGround = true;
-      } else if (snapDelta < -maxStepUp && Math.abs(body.velocity.x) > 1) {
-        // A sudden rise is a wall/cliff face, not a walkable slope.
-        body.setVelocityX(0);
-      }
-    }
-
-    if (!onGround) {
-      body.setAllowGravity(true);
-    }
-
-    // If knockback or terrain edits leave the body embedded, nudge upward until clear.
-    const bodyPts = (): { x: number; y: number }[] => [
-      { x: sprite.x, y: sprite.y - 10 },
-      { x: sprite.x - 8, y: sprite.y },
-      { x: sprite.x + 8, y: sprite.y },
-      { x: sprite.x, y: sprite.y + 8 },
-      { x: sprite.x - 6, y: sprite.y + footOffsetY - 1 },
-      { x: sprite.x + 6, y: sprite.y + footOffsetY - 1 },
-    ];
-
-    for (let i = 0; i < 72; i++) {
-      if (!anySolid(bodyPts())) break;
-      sprite.y -= 1;
-      footY = Math.floor(sprite.y + footOffsetY);
-      if (body.velocity.y > 0) body.setVelocityY(0);
-    }
-
-    sprite.setData('terrainLastFootY', sprite.y + footOffsetY);
-    return onGround;
+  public forgetCollision(sprite: Phaser.Physics.Arcade.Sprite): void {
+    this.collisionState.delete(sprite);
   }
 
   public isPointSolid(x: number, y: number): boolean {
-    const px = Math.floor(x);
-    const py = Math.floor(y);
+    const px = Math.floor(x), py = Math.floor(y);
+    if (px < 0 || px >= this.width || py < 0 || py >= this.height) return false;
+    return this.collisionData[(py * this.width + px) * 4 + 3] > 128;
+  }
 
-    if (px < 0 || px >= this.width || py < 0 || py >= this.height) {
-      return false;
-    }
+  /** Forget a body's tracked position (after teleporting it), so collision doesn't sweep from the old spot. */
+  public resetCollisionState(sprite: Phaser.Physics.Arcade.Sprite): void {
+    this.collisionState.delete(sprite);
+  }
 
-    const index = (py * this.width + px) * 4;
-    return this.collisionData[index + 3] > 128;
+  public checkCollision(sprite: Phaser.Physics.Arcade.Sprite): boolean {
+    const body = sprite.body as Phaser.Physics.Arcade.Body;
+    const prior = this.collisionState.get(sprite) ?? { x: sprite.x, y: sprite.y, grounded: false };
+    const result = moveCharacter(prior, Math.max(8, Math.min(this.width - 9, sprite.x)), sprite.y,
+      (x, y) => y >= this.height - 5 || this.isPointSolid(x, y), this.height, body.velocity.y < 0);
+    sprite.setPosition(result.x, result.y);
+    if (result.blockedX) body.setVelocityX(0);
+    if (result.blockedY || result.grounded) body.setVelocityY(0);
+    body.setAllowGravity(!result.grounded);
+    this.collisionState.set(sprite, result);
+    return result.grounded;
   }
 }

@@ -33,6 +33,8 @@ export interface WeaponConfig {
   projectileSize: number;
   description: string;
   weight: number; // Affects movement range (1 = light, 3 = heavy)
+  /** Seconds a bouncing projectile waits before detonating (default: GRENADE_FUSE). */
+  fuse?: number;
   mobilityBonus: number; // Extra movement for close-range weapons (0-1, adds percentage of base movement)
 }
 

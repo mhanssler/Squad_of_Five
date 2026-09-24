@@ -1,19 +1,19 @@
 // Soldier chatter that reacts to what just happened. Pure data + selection so it can be tested.
 
+// Kill lines, near misses and supply pickups use the soldier's own quips (Soldier.sayQuip);
+// these cover the situations those don't.
 export const BANTER = {
-  kill: ['Tango down!', 'Scratch one!', "Got 'em!", 'Enemy neutralized!', 'And stay down!', 'Next!'],
-  multiKill: ['Two for one!', 'Double tap!', 'Clean sweep!', 'Did you see that?!', 'Bowling for soldiers!'],
-  bigHit: ['Direct hit!', 'Feel that?', 'Right on target!', 'Bullseye!', "That'll leave a mark!"],
-  miss: ['So close!', 'Wind got it!', 'Warning shot!', 'Meant to do that.', 'Next one counts.', 'Calibrating...'],
-  selfHit: ['Ow! My own shot!', 'Did anyone see that?', 'Totally intended.', "Don't tell Sarge."],
-  teamHit: ['Sorry! Sorry!', 'Friendly fire! My bad!', 'Oops.', 'That was the wind!'],
-  teamKill: ['I... uh...', 'Nobody saw that.', 'He was like that when I got here.'],
+  multiKill: ['Two for one!', 'Bulk discount!', 'Did everyone see that?!', 'Efficiency award, please!', 'Bowling, but louder!'],
+  bigHit: ['That one landed!', 'Feel that?', 'Math works!', 'Special delivery!', "That'll leave paperwork!"],
+  miss: ['Warning shot!', 'Meant to do that.', 'The wind did it!', 'Calibrating...', 'Next one counts.', 'Scared them, though.'],
+  selfHit: ['Ow! My own shot!', 'Did anyone see that?', 'Totally intended.', 'Friendly fire, very friendly.'],
+  teamHit: ['Sorry! Sorry!', 'That was the wind!', 'My bad, buddy!', 'Aiming is hard!'],
+  teamKill: ['I... uh...', 'Nobody saw that.', 'That goes in no report.'],
   enemyTaunt: ['Ha! Missed me!', 'You call that aiming?', 'Nice try, rookie!', 'My grandma shoots better!', 'Over here!'],
-  hitReaction: ['Check your fire!', 'Whose side are you on?!', 'Watch it!', 'HEY!'],
-  allyDown: ['They got {name}!', 'Avenge {name}!', 'Noooo! {name}!', "{name}'s down!", 'For {name}!'],
+  hitReaction: ['Check your fire!', 'Whose side are you on?!', 'I felt that, pal!', 'HEY!'],
+  allyDown: ['That was {name}!', 'Keep moving for {name}!', 'We lost {name}!', 'I liked {name}!', 'For {name}!'],
   enemyDown: ['One less to worry about.', "That's what you get!", 'Who is next?'],
-  promotion: ['Promoted!', 'Moving up!', 'Earned it!', 'Call me sir!'],
-  pickup: ['Christmas came early!', 'Ooh, shiny!', 'Mine now!', 'Special delivery!'],
+  promotion: ['Promoted!', 'Call me sir!', 'Earned it!', 'Pay raise, please!'],
 } as const;
 
 export type BanterCategory = keyof typeof BANTER;

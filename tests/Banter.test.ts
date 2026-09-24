@@ -6,7 +6,7 @@ const stats = (o: Partial<ReturnType<typeof emptyShotStats>>) => ({ ...emptyShot
 describe('Banter', () => {
   it('fills in names', () => {
     const line = pickLine('allyDown', { name: 'Sarge' }, () => 0);
-    expect(line).toBe('They got Sarge!');
+    expect(line).toBe('That was Sarge!');
   });
 
   it('has lines for every category', () => {

@@ -4,11 +4,20 @@
  */
 
 import { WeaponType } from '../systems/WeaponTypes';
+import {
+  getBattleBaselineIntensity,
+  getMusicMovement,
+  transposeFrequency,
+  type DirectedMusicMovement,
+  type MusicSection,
+} from '../systems/MusicDirector';
 
 type FlightSoundHandle = {
   update: (vx: number, vy: number) => void;
   stop: () => void;
 };
+
+export type BattleMusicPhase = Exclude<MusicSection, 'menu'>;
 
 class SoundManagerClass {
   private audioContext: AudioContext | null = null;
@@ -18,8 +27,16 @@ class SoundManagerClass {
   private speechToken = 0;
   private volume = 0.5;
   private musicGain: GainNode | null = null;
+  private musicCompressor: DynamicsCompressorNode | null = null;
   private musicPlaying = false;
-  private musicOscillators: OscillatorNode[] = [];
+  private musicSources: AudioScheduledSourceNode[] = [];
+  private musicLoopTimer: number | null = null;
+  private musicSessionId = 0;
+  private musicIntensityTimeout: number | null = null;
+  private musicIntensity = 0.32;
+  private battleMusicPhase: BattleMusicPhase = 'maneuver';
+  private battleLoopCount: number = 0;
+  private menuLoopCount: number = 0;
 
   // Initialize audio context (must be called after user interaction)
   public init(): void {
@@ -33,7 +50,14 @@ class SoundManagerClass {
       
       // Separate gain for music (lower volume)
       this.musicGain = this.audioContext.createGain();
-      this.musicGain.connect(this.audioContext.destination);
+      this.musicCompressor = this.audioContext.createDynamicsCompressor();
+      this.musicCompressor.threshold.value = -18;
+      this.musicCompressor.knee.value = 16;
+      this.musicCompressor.ratio.value = 4;
+      this.musicCompressor.attack.value = 0.012;
+      this.musicCompressor.release.value = 0.24;
+      this.musicGain.connect(this.musicCompressor);
+      this.musicCompressor.connect(this.audioContext.destination);
       this.musicGain.gain.value = this.volume * 0.3;
       
       this.speechSynth = window.speechSynthesis;
@@ -48,6 +72,128 @@ class SoundManagerClass {
     if (this.masterGain) {
       this.masterGain.gain.value = this.volume;
     }
+    if (this.musicGain && this.audioContext && this.musicPlaying) {
+      const now = this.audioContext.currentTime;
+      this.musicGain.gain.setTargetAtTime(
+        this.volume * (0.17 + this.musicIntensity * 0.15),
+        now,
+        0.08,
+      );
+    }
+  }
+
+  public setMusicIntensity(intensity: number, rampSeconds: number = 0.45): void {
+    this.musicIntensity = Math.max(0, Math.min(1, intensity));
+    if (!this.audioContext || !this.musicGain || !this.musicPlaying) return;
+    const now = this.audioContext.currentTime;
+    const target = this.volume * (0.17 + this.musicIntensity * 0.15);
+    this.musicGain.gain.cancelScheduledValues(now);
+    this.musicGain.gain.setValueAtTime(Math.max(0.0001, this.musicGain.gain.value), now);
+    this.musicGain.gain.linearRampToValueAtTime(target, now + Math.max(0.05, rampSeconds));
+  }
+
+  public pulseMusicIntensity(intensity: number, holdSeconds: number = 1.2): void {
+    if (this.musicIntensityTimeout !== null) {
+      window.clearTimeout(this.musicIntensityTimeout);
+      this.musicIntensityTimeout = null;
+    }
+    this.setMusicIntensity(intensity, 0.16);
+    this.musicIntensityTimeout = window.setTimeout(() => {
+      this.musicIntensityTimeout = null;
+      this.settleBattleMusic(1.1);
+    }, Math.max(200, holdSeconds * 1000));
+  }
+
+  public settleBattleMusic(rampSeconds: number = 0.8): void {
+    this.setMusicIntensity(getBattleBaselineIntensity(this.battleMusicPhase), rampSeconds);
+  }
+
+  public setBattleMusicPhase(phase: BattleMusicPhase): void {
+    if (phase === this.battleMusicPhase) return;
+    this.battleMusicPhase = phase;
+    this.playMusicPhaseStinger(phase);
+    this.settleBattleMusic(0.9);
+  }
+
+  private playMusicPhaseStinger(phase: BattleMusicPhase): void {
+    if (!this.audioContext || !this.musicGain || !this.musicPlaying) return;
+    const ctx = this.audioContext;
+    const now = ctx.currentTime + 0.02;
+    const notes = phase === 'finale'
+      ? [146.83, 174.61, 220]
+      : phase === 'pressure'
+        ? [110, 130.81]
+        : [82.41, 110];
+
+    notes.forEach((frequency, index) => {
+      const start = now + index * 0.16;
+      const osc = ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(frequency, start);
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.setValueAtTime(520, start);
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.linearRampToValueAtTime(0.035, start + 0.04);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.48);
+      osc.connect(filter);
+      filter.connect(gain);
+      gain.connect(this.musicGain!);
+      osc.start(start);
+      osc.stop(start + 0.5);
+      this.musicSources.push(osc);
+    });
+  }
+
+  public async playDig(): Promise<void> {
+    if (!await this.ensureContext() || !this.audioContext || !this.masterGain) return;
+    const ctx = this.audioContext;
+    const now = ctx.currentTime;
+
+    for (let i = 0; i < 3; i++) {
+      const t = now + i * 0.13;
+      const osc = ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(92 - i * 9, t);
+      osc.frequency.exponentialRampToValueAtTime(48, t + 0.11);
+
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.1, t);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
+      osc.connect(gain);
+      gain.connect(this.masterGain);
+      osc.start(t);
+      osc.stop(t + 0.15);
+    }
+  }
+
+  public async playObjectiveStinger(team: 'red' | 'blue'): Promise<void> {
+    if (!await this.ensureContext() || !this.audioContext || !this.masterGain) return;
+    const ctx = this.audioContext;
+    const now = ctx.currentTime;
+    const notes = team === 'red' ? [196, 233.08, 293.66] : [220, 261.63, 329.63];
+
+    notes.forEach((frequency, index) => {
+      const start = now + index * 0.12;
+      const osc = ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(frequency, start);
+
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.setValueAtTime(950, start);
+
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.linearRampToValueAtTime(0.08, start + 0.03);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.45);
+      osc.connect(filter);
+      filter.connect(gain);
+      gain.connect(this.masterGain!);
+      osc.start(start);
+      osc.stop(start + 0.48);
+    });
   }
 
   // Resume audio context if suspended (browser autoplay policy)
@@ -457,28 +603,29 @@ class SoundManagerClass {
 
     if (type === WeaponType.MORTAR) {
       const mainGain = ctx.createGain();
-      mainGain.gain.setValueAtTime(0.04, now);
+      mainGain.gain.setValueAtTime(0.0001, now);
       mainGain.connect(out);
 
       const whistle = ctx.createOscillator();
       whistle.type = 'sine';
-      whistle.frequency.setValueAtTime(650, now);
+      whistle.frequency.setValueAtTime(1050, now);
 
       const whistleFilter = ctx.createBiquadFilter();
       whistleFilter.type = 'bandpass';
       whistleFilter.frequency.setValueAtTime(900, now);
-      whistleFilter.Q.value = 2.2;
+      whistleFilter.Q.value = 0.65;
 
       const whistleGain = ctx.createGain();
-      whistleGain.gain.setValueAtTime(0.22, now);
+      whistleGain.gain.setValueAtTime(0.10, now);
 
       const air = makeLoopNoise(0.14);
       const airFilter = ctx.createBiquadFilter();
-      airFilter.type = 'highpass';
+      airFilter.type = 'bandpass';
+      airFilter.Q.value = 0.6;
       airFilter.frequency.setValueAtTime(600, now);
 
       const airGain = ctx.createGain();
-      airGain.gain.setValueAtTime(0.10, now);
+      airGain.gain.setValueAtTime(0.035, now);
 
       whistle.connect(whistleFilter);
       whistleFilter.connect(whistleGain);
@@ -500,13 +647,13 @@ class SoundManagerClass {
         const f = norm(falling, 50, 900);
 
         // Mortar whistle mostly on descent; soften on ascent.
-        const level = 0.02 + f * 0.34;
-        mainGain.gain.setTargetAtTime(level, t, 0.04);
+        const level = vy > 40 ? 0.05 + f * 0.12 : 0.0001;
+        mainGain.gain.setTargetAtTime(level, t, 0.16);
 
-        const freq = 650 + f * 1100;
-        whistle.frequency.setTargetAtTime(freq, t, 0.05);
-        whistleFilter.frequency.setTargetAtTime(900 + f * 900, t, 0.05);
-        airFilter.frequency.setTargetAtTime(500 + s * 1100, t, 0.05);
+        const freq = 1050 - f * 430;
+        whistle.frequency.setTargetAtTime(freq, t, 0.16);
+        whistleFilter.frequency.setTargetAtTime(freq, t, 0.16);
+        airFilter.frequency.setTargetAtTime(850 + s * 200, t, 0.16);
       };
 
       const stop = (): void => {
@@ -694,109 +841,184 @@ class SoundManagerClass {
     if (this.musicPlaying) return;
     
     this.musicPlaying = true;
+    this.menuLoopCount = 0;
+    this.musicIntensity = 0.36;
+    const sessionId = ++this.musicSessionId;
 
     // Fade in so the first drum hits don't feel abrupt.
     const now = this.audioContext.currentTime;
     this.musicGain.gain.cancelScheduledValues(now);
     this.musicGain.gain.setValueAtTime(0.0001, now);
-    this.musicGain.gain.linearRampToValueAtTime(this.volume * 0.24, now + 1.0);
+    this.musicGain.gain.linearRampToValueAtTime(
+      this.volume * (0.17 + this.musicIntensity * 0.15),
+      now + 1.0,
+    );
     
-    // Play a simple military march pattern in a loop
-    this.playMarchLoop();
+    this.playMarchLoop(sessionId);
   }
 
-  // Tactical in-game music (restrained military cadence, procedural).
-  public async startCelloMusic(): Promise<void> {
+  // Tactical in-game score with phase-directed procedural movements.
+  public async startBattleMusic(): Promise<void> {
     if (!await this.ensureContext() || !this.audioContext || !this.musicGain) return;
     if (this.musicPlaying) return;
 
     this.musicPlaying = true;
+    this.battleLoopCount = 0;
+    this.musicIntensity = getBattleBaselineIntensity(this.battleMusicPhase);
+    const sessionId = ++this.musicSessionId;
 
     const now = this.audioContext.currentTime;
     this.musicGain.gain.cancelScheduledValues(now);
     this.musicGain.gain.setValueAtTime(0.0001, now);
-    this.musicGain.gain.linearRampToValueAtTime(this.volume * 0.24, now + 1.6);
+    this.musicGain.gain.linearRampToValueAtTime(
+      this.volume * (0.17 + this.musicIntensity * 0.15),
+      now + 1.6,
+    );
 
-    this.playCelloLoop();
+    this.playBattleScoreLoop(sessionId);
+  }
+
+  private scheduleNextMusicLoop(
+    sessionId: number,
+    durationSeconds: number,
+    callback: () => void,
+  ): void {
+    if (this.musicLoopTimer !== null) {
+      window.clearTimeout(this.musicLoopTimer);
+    }
+    this.musicLoopTimer = window.setTimeout(() => {
+      this.musicLoopTimer = null;
+      if (!this.musicPlaying || sessionId !== this.musicSessionId) return;
+      callback();
+    }, Math.max(50, (durationSeconds - 0.03) * 1000));
   }
   
-  private async playMarchLoop(): Promise<void> {
-    if (!this.musicPlaying || !this.audioContext || !this.musicGain) return;
+  private async playMarchLoop(sessionId: number): Promise<void> {
+    if (
+      !this.musicPlaying ||
+      sessionId !== this.musicSessionId ||
+      !this.audioContext ||
+      !this.musicGain
+    ) return;
     
     const ctx = this.audioContext;
     const now = ctx.currentTime + 0.02;
+    const plan = getMusicMovement('menu', this.menuLoopCount++);
+    const beat = 60 / plan.bpm;
+    const bar = beat * 4;
+    const loopDuration = bar * plan.bars;
+    const variationShift = plan.variation === 1
+      ? plan.alternateShift
+      : plan.variation === 2
+        ? -2
+        : 0;
 
-    // Notes stop on their own; keep only the current loop's oscillators so this doesn't grow unbounded.
-    this.musicOscillators = [];
-    
-    // Drum-forward march with a subdued brass-like line.
-    const melody = [
-      { freq: 146.83, dur: 0.5 }, // D3
-      { freq: 146.83, dur: 0.5 }, // D3
-      { freq: 174.61, dur: 0.5 }, // F3
-      { freq: 164.81, dur: 0.5 }, // E3
-      { freq: 146.83, dur: 0.5 }, // D3
-      { freq: 130.81, dur: 0.5 }, // C3
-      { freq: 110.00, dur: 0.5 }, // A2
-      { freq: 146.83, dur: 0.5 }, // D3
-    ];
-    
-    let time = now;
-    
-    melody.forEach(note => {
-      // Main melody oscillator (brass-like)
-      const osc = ctx.createOscillator();
-      osc.type = 'triangle';
-      osc.frequency.value = note.freq;
-      
+    this.musicSources = [];
+
+    for (let segment = 0; segment < plan.progression.length; segment++) {
+      const start = now + segment * bar * 2;
+      const duration = bar * 2;
+      const frequency = transposeFrequency(
+        plan.rootHz,
+        plan.progression[segment] + variationShift,
+      );
+      const drone = ctx.createOscillator();
+      drone.type = plan.texture === 'strings' ? 'sawtooth' : 'triangle';
+      drone.frequency.setValueAtTime(frequency, start);
+
+      const droneFilter = ctx.createBiquadFilter();
+      droneFilter.type = 'lowpass';
+      droneFilter.frequency.setValueAtTime(plan.texture === 'open' ? 340 : 230, start);
+      const droneGain = ctx.createGain();
+      droneGain.gain.setValueAtTime(0.0001, start);
+      droneGain.gain.linearRampToValueAtTime(plan.stringLevel, start + beat * 0.75);
+      droneGain.gain.setValueAtTime(plan.stringLevel * 0.85, start + duration - beat * 0.6);
+      droneGain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+      drone.connect(droneFilter);
+      droneFilter.connect(droneGain);
+      droneGain.connect(this.musicGain);
+      drone.start(start);
+      drone.stop(start + duration + 0.02);
+      this.musicSources.push(drone);
+    }
+
+    for (const note of plan.motif) {
+      const start = now + note.bar * bar + note.beat * beat;
+      const duration = Math.max(0.18, note.durationBeats * beat);
+      const frequency = transposeFrequency(
+        plan.rootHz,
+        note.semitones + variationShift,
+        plan.leadOctaves,
+      );
+      const primary = ctx.createOscillator();
+      primary.type = 'triangle';
+      primary.frequency.setValueAtTime(frequency, start);
+      primary.detune.setValueAtTime(-3, start);
+      const harmonic = ctx.createOscillator();
+      harmonic.type = 'sawtooth';
+      harmonic.frequency.setValueAtTime(frequency * 2, start);
+      harmonic.detune.setValueAtTime(4, start);
+
       const filter = ctx.createBiquadFilter();
       filter.type = 'lowpass';
-      filter.frequency.value = 700;
+      filter.frequency.setValueAtTime(
+        plan.texture === 'muted' ? 560 : plan.texture === 'open' ? 920 : 680,
+        start,
+      );
       filter.Q.value = 1.6;
-      
+
       const gain = ctx.createGain();
-      gain.gain.setValueAtTime(0, time);
-      // Keep melody subtle; drums carry the track.
-      gain.gain.linearRampToValueAtTime(0.022, time + 0.035);
-      gain.gain.setValueAtTime(0.015, time + note.dur - 0.08);
-      gain.gain.linearRampToValueAtTime(0, time + note.dur);
-      
-      osc.connect(filter);
+      const level = plan.brassLevel * note.accent;
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.linearRampToValueAtTime(level, start + 0.055);
+      gain.gain.setValueAtTime(level * 0.7, start + Math.max(0.08, duration - 0.16));
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+
+      const harmonicGain = ctx.createGain();
+      harmonicGain.gain.setValueAtTime(0.16, start);
+      primary.connect(filter);
+      harmonic.connect(harmonicGain);
+      harmonicGain.connect(filter);
       filter.connect(gain);
-      gain.connect(this.musicGain!);
-      
-      osc.start(time);
-      osc.stop(time + note.dur);
-      this.musicOscillators.push(osc);
-      
-      time += note.dur;
-    });
-    
-    // Add drum beats
-    const loopDuration = melody.reduce((sum, n) => sum + n.dur, 0);
-    this.playDrumBeat(now, loopDuration);
-    
-    // Loop the melody
-    setTimeout(() => {
-      if (this.musicPlaying) {
-        this.playMarchLoop();
-      }
-    }, loopDuration * 1000);
+      gain.connect(this.musicGain);
+      primary.start(start);
+      harmonic.start(start);
+      primary.stop(start + duration + 0.02);
+      harmonic.stop(start + duration + 0.02);
+      this.musicSources.push(primary, harmonic);
+    }
+
+    this.playDrumBeat(now, loopDuration, plan);
+    this.scheduleNextMusicLoop(
+      sessionId,
+      loopDuration,
+      () => this.playMarchLoop(sessionId),
+    );
   }
 
-  private async playCelloLoop(): Promise<void> {
-    if (!this.musicPlaying || !this.audioContext || !this.musicGain) return;
+  private async playBattleScoreLoop(sessionId: number): Promise<void> {
+    if (
+      !this.musicPlaying ||
+      sessionId !== this.musicSessionId ||
+      !this.audioContext ||
+      !this.musicGain
+    ) return;
 
     const ctx = this.audioContext;
     const out = this.musicGain;
     const now = ctx.currentTime + 0.02;
 
-    // Notes stop on their own; keep only the current loop's oscillators so this doesn't grow unbounded.
-    this.musicOscillators = [];
-
-    const bpm = 84;
-    const beat = 60 / bpm;
+    const phase = this.battleMusicPhase;
+    const plan = getMusicMovement(phase, this.battleLoopCount++);
+    const beat = 60 / plan.bpm;
     const bar = beat * 4;
+    const variationShift = plan.variation === 1
+      ? plan.alternateShift
+      : plan.variation === 2
+        ? -2
+        : 0;
+
+    this.musicSources = [];
 
     const makeNoiseBuffer = (seconds: number, decay: number): AudioBuffer => {
       const bufferSize = Math.max(1, Math.floor(ctx.sampleRate * seconds));
@@ -828,8 +1050,9 @@ class SoundManagerClass {
       const filter = ctx.createBiquadFilter();
       filter.type = 'lowpass';
       filter.Q.value = 0.7;
-      filter.frequency.setValueAtTime(240, start);
-      filter.frequency.linearRampToValueAtTime(180, start + dur);
+      const droneCutoff = plan.texture === 'open' ? 310 : plan.texture === 'muted' ? 205 : 250;
+      filter.frequency.setValueAtTime(droneCutoff, start);
+      filter.frequency.linearRampToValueAtTime(droneCutoff * 0.76, start + dur);
 
       const gain = ctx.createGain();
       gain.gain.setValueAtTime(0.0001, start);
@@ -847,18 +1070,26 @@ class SoundManagerClass {
       lfo.stop(stopAt);
       osc.stop(stopAt);
 
-      this.musicOscillators.push(lfo, osc);
+      this.musicSources.push(lfo, osc);
     };
 
     const scheduleHorn = (freq: number, start: number, dur: number, level: number): void => {
-      const osc = ctx.createOscillator();
-      osc.type = 'triangle';
-      osc.frequency.setValueAtTime(freq, start);
+      const primary = ctx.createOscillator();
+      primary.type = 'triangle';
+      primary.frequency.setValueAtTime(freq, start);
+      primary.detune.setValueAtTime(-4, start);
+      const harmonic = ctx.createOscillator();
+      harmonic.type = 'sawtooth';
+      harmonic.frequency.setValueAtTime(freq * 2, start);
+      harmonic.detune.setValueAtTime(5, start);
 
       const filter = ctx.createBiquadFilter();
       filter.type = 'lowpass';
       filter.Q.value = 1.8;
-      filter.frequency.setValueAtTime(720, start);
+      filter.frequency.setValueAtTime(
+        plan.texture === 'muted' ? 540 : plan.texture === 'open' ? 940 : 680,
+        start,
+      );
 
       const gain = ctx.createGain();
       gain.gain.setValueAtTime(0.0001, start);
@@ -866,12 +1097,18 @@ class SoundManagerClass {
       gain.gain.setValueAtTime(level * 0.75, start + Math.max(0.1, dur - 0.18));
       gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
 
-      osc.connect(filter);
+      const harmonicGain = ctx.createGain();
+      harmonicGain.gain.setValueAtTime(plan.texture === 'open' ? 0.2 : 0.13, start);
+      primary.connect(filter);
+      harmonic.connect(harmonicGain);
+      harmonicGain.connect(filter);
       filter.connect(gain);
       gain.connect(out);
-      osc.start(start);
-      osc.stop(start + dur + 0.02);
-      this.musicOscillators.push(osc);
+      primary.start(start);
+      harmonic.start(start);
+      primary.stop(start + dur + 0.02);
+      harmonic.stop(start + dur + 0.02);
+      this.musicSources.push(primary, harmonic);
     };
 
     const scheduleSnare = (t: number, accent: number): void => {
@@ -884,7 +1121,7 @@ class SoundManagerClass {
       filter.Q.value = 1.1;
 
       const gain = ctx.createGain();
-      gain.gain.setValueAtTime(0.12 * accent, t);
+      gain.gain.setValueAtTime(0.12 * accent * plan.percussionLevel, t);
       gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
 
       noise.connect(filter);
@@ -892,6 +1129,7 @@ class SoundManagerClass {
       gain.connect(out);
       noise.start(t);
       noise.stop(t + 0.18);
+      this.musicSources.push(noise);
     };
 
     const scheduleKick = (t: number, accent: number): void => {
@@ -901,13 +1139,14 @@ class SoundManagerClass {
       osc.frequency.exponentialRampToValueAtTime(38, t + 0.16);
 
       const gain = ctx.createGain();
-      gain.gain.setValueAtTime(0.11 * accent, t);
+      gain.gain.setValueAtTime(0.11 * accent * plan.percussionLevel, t);
       gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.2);
 
       osc.connect(gain);
       gain.connect(out);
       osc.start(t);
       osc.stop(t + 0.2);
+      this.musicSources.push(osc);
     };
 
     const scheduleAir = (start: number, dur: number): void => {
@@ -922,8 +1161,8 @@ class SoundManagerClass {
 
       const gain = ctx.createGain();
       gain.gain.setValueAtTime(0.0001, start);
-      gain.gain.linearRampToValueAtTime(0.026, start + 0.8);
-      gain.gain.setValueAtTime(0.022, start + dur - 0.5);
+      gain.gain.linearRampToValueAtTime(plan.airLevel, start + 0.8);
+      gain.gain.setValueAtTime(plan.airLevel * 0.84, start + dur - 0.5);
       gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
 
       air.connect(filter);
@@ -931,47 +1170,103 @@ class SoundManagerClass {
       gain.connect(out);
       air.start(start);
       air.stop(start + dur);
+      this.musicSources.push(air);
     };
 
-    const loopDuration = bar * 8;
+    const loopDuration = bar * plan.bars;
     scheduleAir(now, loopDuration);
-    scheduleDrone(55.0, now, loopDuration, 0.052); // A1
-    scheduleDrone(73.42, now + bar * 4, bar * 4, 0.035); // D2 answer
 
-    // Sparse, serious field cadence: mostly 1/3 kick with restrained snare answers.
-    for (let barIndex = 0; barIndex < 8; barIndex++) {
+    const harmonicSegmentDuration = loopDuration / plan.progression.length;
+    plan.progression.forEach((semitones, index) => {
+      scheduleDrone(
+        transposeFrequency(plan.rootHz, semitones + variationShift),
+        now + index * harmonicSegmentDuration,
+        harmonicSegmentDuration,
+        plan.stringLevel * (index === 0 ? 1 : 0.86),
+      );
+    });
+
+    for (let barIndex = 0; barIndex < plan.bars; barIndex++) {
       const t = now + barIndex * bar;
-      scheduleKick(t, barIndex % 4 === 0 ? 1.3 : 1.0);
-      scheduleKick(t + beat * 2, 0.8);
-      scheduleSnare(t + beat, 0.85);
-      scheduleSnare(t + beat * 3, 0.7);
+      const strongBar = barIndex % 4 === 0 ? 1.25 : 1;
 
-      if (barIndex === 3 || barIndex === 7) {
+      if (plan.cadence === 'dirge') {
+        scheduleKick(t, strongBar);
+        scheduleSnare(t + beat * 3, 0.48);
+      } else if (plan.cadence === 'patrol') {
+        scheduleKick(t, strongBar);
+        if (barIndex % 2 === 0) scheduleKick(t + beat * 2.5, 0.52);
+        scheduleSnare(t + beat * 2, 0.62);
+      } else if (plan.cadence === 'procession' || plan.cadence === 'inspection') {
+        scheduleKick(t, strongBar);
+        scheduleKick(t + beat * 2, 0.7);
+        scheduleSnare(t + beat, 0.72);
+        scheduleSnare(t + beat * 3, 0.66);
+      } else if (plan.cadence === 'advance') {
+        scheduleKick(t, strongBar);
+        scheduleKick(t + beat * 2, 0.82);
+        scheduleSnare(t + beat, 0.86);
+        scheduleSnare(t + beat * 3, 0.8);
+        if (barIndex % 2 === 1) scheduleKick(t + beat * 3.5, 0.42);
+      } else if (plan.cadence === 'siege') {
+        scheduleKick(t, strongBar * 1.08);
+        scheduleKick(t + beat * 2.5, 0.76);
+        scheduleSnare(t + beat * 1.5, 0.62);
+        scheduleSnare(t + beat * 3, 0.84);
+      } else {
+        scheduleKick(t, strongBar * 1.12);
+        scheduleKick(t + beat * 1.5, 0.66);
+        scheduleKick(t + beat * 2.75, 0.78);
+        scheduleSnare(t + beat, 0.92);
+        scheduleSnare(t + beat * 2, 0.72);
+        scheduleSnare(t + beat * 3, 0.94);
+      }
+
+      const fillBar = barIndex === plan.bars - 1 ||
+        (plan.variation === 2 && barIndex === Math.floor(plan.bars / 2) - 1);
+      if (fillBar && plan.cadence !== 'dirge') {
         scheduleSnare(t + beat * 3.5, 0.45);
         scheduleSnare(t + beat * 3.68, 0.35);
         scheduleSnare(t + beat * 3.84, 0.32);
       }
     }
 
-    // Distant bugle-like fragments in a minor mode, with lots of room between them.
-    scheduleHorn(220.0, now + beat * 0.5, beat * 1.35, 0.026); // A3
-    scheduleHorn(261.63, now + beat * 2.15, beat * 0.9, 0.020); // C4
-    scheduleHorn(293.66, now + bar + beat * 0.5, beat * 1.2, 0.022); // D4
-    scheduleHorn(246.94, now + bar * 2 + beat * 1.0, beat * 1.35, 0.020); // B3
-    scheduleHorn(220.0, now + bar * 4 + beat * 0.5, beat * 1.6, 0.025); // A3
-    scheduleHorn(174.61, now + bar * 6 + beat * 2.0, beat * 1.5, 0.021); // F3
+    for (const note of plan.motif) {
+      const harmonicShift = plan.progression[
+        Math.min(
+          plan.progression.length - 1,
+          Math.floor(note.bar / (plan.bars / plan.progression.length)),
+        )
+      ];
+      const frequency = transposeFrequency(
+        plan.rootHz,
+        note.semitones + harmonicShift + variationShift,
+        plan.leadOctaves,
+      );
+      scheduleHorn(
+        frequency,
+        now + note.bar * bar + note.beat * beat,
+        Math.max(0.18, note.durationBeats * beat),
+        plan.brassLevel * note.accent,
+      );
+    }
 
-    setTimeout(() => {
-      if (this.musicPlaying) this.playCelloLoop();
-    }, loopDuration * 1000);
+    this.scheduleNextMusicLoop(
+      sessionId,
+      loopDuration,
+      () => this.playBattleScoreLoop(sessionId),
+    );
   }
   
-  private async playDrumBeat(startTime: number, duration: number): Promise<void> {
+  private async playDrumBeat(
+    startTime: number,
+    duration: number,
+    plan: DirectedMusicMovement,
+  ): Promise<void> {
     if (!this.audioContext || !this.musicGain) return;
     
     const ctx = this.audioContext;
-    // 120 BPM march feel (quarter = 0.5s, eighth = 0.25s)
-    const q = 0.5;
+    const q = 60 / plan.bpm;
     const e = q / 2;
 
     // Reusable noise buffers for snare/hat.
@@ -996,13 +1291,14 @@ class SoundManagerClass {
       kick.frequency.exponentialRampToValueAtTime(45, t + 0.11);
 
       const kickGain = ctx.createGain();
-      kickGain.gain.setValueAtTime(0.45 * accent, t);
+      kickGain.gain.setValueAtTime(0.17 * accent * plan.percussionLevel, t);
       kickGain.gain.exponentialRampToValueAtTime(0.01, t + 0.16);
 
       kick.connect(kickGain);
       kickGain.connect(this.musicGain!);
       kick.start(t);
       kick.stop(t + 0.16);
+      this.musicSources.push(kick);
     };
 
     const scheduleSnare = (t: number, accent: number): void => {
@@ -1015,7 +1311,7 @@ class SoundManagerClass {
       filter.Q.value = 0.9;
 
       const gain = ctx.createGain();
-      gain.gain.setValueAtTime(0.22 * accent, t);
+      gain.gain.setValueAtTime(0.14 * accent * plan.percussionLevel, t);
       gain.gain.exponentialRampToValueAtTime(0.01, t + 0.14);
 
       noise.connect(filter);
@@ -1023,6 +1319,7 @@ class SoundManagerClass {
       gain.connect(this.musicGain!);
       noise.start(t);
       noise.stop(t + 0.14);
+      this.musicSources.push(noise);
     };
 
     const scheduleHat = (t: number, accent: number): void => {
@@ -1034,7 +1331,7 @@ class SoundManagerClass {
       filter.frequency.setValueAtTime(5000, t);
 
       const gain = ctx.createGain();
-      gain.gain.setValueAtTime(0.065 * accent, t);
+      gain.gain.setValueAtTime(0.045 * accent * plan.percussionLevel, t);
       gain.gain.exponentialRampToValueAtTime(0.01, t + 0.06);
 
       noise.connect(filter);
@@ -1042,6 +1339,7 @@ class SoundManagerClass {
       gain.connect(this.musicGain!);
       noise.start(t);
       noise.stop(t + 0.06);
+      this.musicSources.push(noise);
     };
 
     const scheduleSnareRoll = (t0: number): void => {
@@ -1057,27 +1355,25 @@ class SoundManagerClass {
     for (let t = startTime; t < end - 0.0001; t += e) {
       const step = Math.round((t - startTime) / e);
       const inBar = step % 8; // 8 eighth-notes per bar (4/4)
+      const barIndex = Math.floor(step / 8);
 
-      // Hats on every eighth, accent the offbeats.
-      scheduleHat(t, inBar % 2 === 1 ? 1.1 : 0.85);
+      if (inBar % 2 === 1 && (plan.cadence === 'inspection' || plan.cadence === 'procession')) {
+        scheduleHat(t, plan.cadence === 'inspection' ? 0.42 : 0.3);
+      }
 
-      // Kick on 1 and 3.
       if (inBar === 0 || inBar === 4) {
-        scheduleKick(t, inBar === 0 ? 1.2 : 1.0);
+        scheduleKick(t, inBar === 0 ? (barIndex % 4 === 0 ? 1.25 : 1.05) : 0.78);
       }
 
-      // Snare on 2 and 4.
       if (inBar === 2 || inBar === 6) {
-        scheduleSnare(t, 1.1);
+        scheduleSnare(t, inBar === 2 ? 0.82 : 0.74);
       }
 
-      // Ghost notes for marching feel.
-      if (inBar === 1 || inBar === 5) {
-        scheduleSnare(t, 0.35);
+      if (plan.variation > 0 && (inBar === 1 || inBar === 5) && barIndex % 2 === 1) {
+        scheduleSnare(t, 0.22);
       }
 
-      // Roll at the end of every bar.
-      if (inBar === 7) {
+      if (inBar === 7 && (barIndex + 1) % 4 === 0) {
         scheduleSnareRoll(t + e * 0.35);
       }
     }
@@ -1085,14 +1381,25 @@ class SoundManagerClass {
   
   public stopMusic(): void {
     this.musicPlaying = false;
-    this.musicOscillators.forEach(osc => {
-      try { osc.stop(); } catch (e) { /* already stopped */ }
+    this.musicSessionId++;
+    if (this.musicLoopTimer !== null) {
+      window.clearTimeout(this.musicLoopTimer);
+      this.musicLoopTimer = null;
+    }
+    if (this.musicIntensityTimeout !== null) {
+      window.clearTimeout(this.musicIntensityTimeout);
+      this.musicIntensityTimeout = null;
+    }
+    this.musicSources.forEach(source => {
+      try { source.stop(); } catch (e) { /* already stopped */ }
     });
-    this.musicOscillators = [];
+    this.musicSources = [];
     
-    // Fade out music gain
     if (this.musicGain && this.audioContext) {
-      this.musicGain.gain.linearRampToValueAtTime(0, this.audioContext.currentTime + 0.5);
+      const now = this.audioContext.currentTime;
+      this.musicGain.gain.cancelScheduledValues(now);
+      this.musicGain.gain.setValueAtTime(Math.max(0.0001, this.musicGain.gain.value), now);
+      this.musicGain.gain.linearRampToValueAtTime(0.0001, now + 0.35);
     }
   }
   

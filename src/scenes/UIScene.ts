@@ -1,7 +1,14 @@
 import Phaser from 'phaser';
 import { Team } from '../systems/TurnManager';
+import { GameMode, RelayControl } from '../systems/GameRules';
 import type { AbilityStatus } from '../systems/Abilities';
 import { isWindCalm } from '../systems/Wind';
+import {
+  FactionId,
+  FactionMatchup,
+  getFaction,
+  getFactionSpriteTextureKey,
+} from '../systems/Factions';
 
 interface TurnInfo {
   currentTeam: Team;
@@ -14,12 +21,6 @@ interface TurnInfo {
   roundNumber?: number;
   redActedThisRound?: number;
   blueActedThisRound?: number;
-}
-
-interface AbilityStatusInfo {
-  dig: AbilityStatus;
-  heal: AbilityStatus;
-  special: { name: string; hint: string; armed: boolean } | null;
 }
 
 interface WeaponInfo {
@@ -38,6 +39,8 @@ interface SoldierInfo {
   name: string;
   health: number;
   squadIndex: number;
+  factionId: FactionId;
+  portraitTextureKey: string;
 }
 
 interface CharacterSelectionInfo {
@@ -49,33 +52,73 @@ interface CharacterSelectionInfo {
   soldierX: number;
 }
 
+interface ObjectiveInfo {
+  mode: GameMode;
+  redScore: number;
+  blueScore: number;
+  targetScore: number;
+  owners: RelayControl[];
+}
+
+interface PowerupInfo {
+  name: string;
+  armor: number;
+  airstrikeCharges: number;
+  artilleryCharges: number;
+  crateWeapon?: string | null;
+  crateWeaponArmed?: boolean;
+}
+
 export class UIScene extends Phaser.Scene {
   private turnText!: Phaser.GameObjects.Text;
   private teamText!: Phaser.GameObjects.Text;
   private controlsText!: Phaser.GameObjects.Text;
   private movementBar!: Phaser.GameObjects.Graphics;
   private movementText!: Phaser.GameObjects.Text;
-  private digStatusText!: Phaser.GameObjects.Text;
-  private healStatusText!: Phaser.GameObjects.Text;
-  private specialStatusText!: Phaser.GameObjects.Text;
+  private abilityTexts: Phaser.GameObjects.Text[] = [];
   private windGraphics!: Phaser.GameObjects.Graphics;
   private windText!: Phaser.GameObjects.Text;
+  private objectiveText!: Phaser.GameObjects.Text;
+  private powerupText!: Phaser.GameObjects.Text;
+  private contextText!: Phaser.GameObjects.Text;
   private tacReadoutPanel!: Phaser.GameObjects.Container;
+  private redSquadText!: Phaser.GameObjects.Text;
+  private blueSquadText!: Phaser.GameObjects.Text;
+  private briefingContainer: Phaser.GameObjects.Container | null = null;
   private gameScene!: Phaser.Scene;
   private maxMovement: number = 200;
+  private gameMode: GameMode = 'basic';
+  private factionMatchup: FactionMatchup = {
+    red: 'united-states',
+    blue: 'germany',
+  };
 
   constructor() {
     super({ key: 'UIScene' });
   }
 
-  init(data: { gameScene: Phaser.Scene }): void {
+  init(data: {
+    gameScene: Phaser.Scene;
+    gameMode?: GameMode;
+    factionMatchup?: FactionMatchup;
+  }): void {
     this.gameScene = data.gameScene;
+    this.gameMode = data.gameMode ?? 'basic';
+    this.factionMatchup = data.factionMatchup ?? this.factionMatchup;
   }
 
   create(): void {
+    const chrome = this.add.graphics();
+    chrome.fillStyle(0x071019, 0.82);
+    chrome.fillRect(0, 0, 1280, 96);
+    chrome.fillRect(0, 654, 1280, 66);
+    chrome.lineStyle(1, 0x7f9bad, 0.35);
+    chrome.lineBetween(0, 96, 1280, 96);
+    chrome.lineBetween(0, 654, 1280, 654);
+
     // Turn indicator
-    this.turnText = this.add.text(640, 20, 'Turn 1', {
-      font: 'bold 24px Arial',
+    this.turnText = this.add.text(640, 12, 'Round 1', {
+      font: 'bold 21px Arial',
       color: '#ffffff',
       stroke: '#000000',
       strokeThickness: 4,
@@ -83,8 +126,8 @@ export class UIScene extends Phaser.Scene {
     this.turnText.setOrigin(0.5, 0);
 
     // Current team/worm indicator
-    this.teamText = this.add.text(640, 50, '', {
-      font: '18px Arial',
+    this.teamText = this.add.text(640, 40, '', {
+      font: 'bold 15px Arial',
       color: '#ffffff',
       stroke: '#000000',
       strokeThickness: 3,
@@ -92,53 +135,66 @@ export class UIScene extends Phaser.Scene {
     this.teamText.setOrigin(0.5, 0);
 
     // Team status (top corners)
-    this.add.text(10, 10, '🔴 Red Team', {
+    this.redSquadText = this.add.text(14, 14, '', {
       font: 'bold 16px Arial',
       color: '#ff6666',
       stroke: '#000000',
       strokeThickness: 2,
     });
 
-    this.add.text(1270, 10, '🔵 Blue Team', {
+    this.blueSquadText = this.add.text(1266, 14, '', {
       font: 'bold 16px Arial',
       color: '#6666ff',
       stroke: '#000000',
       strokeThickness: 2,
     }).setOrigin(1, 0);
 
+    this.objectiveText = this.add.text(640, 66, '', {
+      font: 'bold 11px Courier New',
+      color: '#dfe9ef',
+      stroke: '#000000',
+      strokeThickness: 2,
+    });
+    this.objectiveText.setOrigin(0.5, 0);
+    this.objectiveText.setVisible(this.gameMode === 'expanded');
+
     // Movement bar
     this.movementBar = this.add.graphics();
-    this.movementText = this.add.text(640, 640, 'Movement: 200/200', {
-      font: '14px Arial',
+    this.movementText = this.add.text(640, 676, 'Movement: 200/200', {
+      font: '12px Arial',
       color: '#ffffff',
       stroke: '#000000',
       strokeThickness: 2,
     });
     this.movementText.setOrigin(0.5, 0);
 
-    // Ability availability (B Dig In / H Heal), shown just above the movement bar during the player's turn
-    const abilityStyle = { font: 'bold 13px Arial', color: '#ffffff', stroke: '#000000', strokeThickness: 3 };
-    this.digStatusText = this.add.text(630, 602, '', abilityStyle).setOrigin(1, 0).setVisible(false);
-    this.healStatusText = this.add.text(650, 602, '', abilityStyle).setOrigin(0, 0).setVisible(false);
-    this.specialStatusText = this.add.text(640, 582, '', abilityStyle).setOrigin(0.5, 0).setVisible(false);
-
-    // Wind gauge (top center, under the team line)
-    this.windGraphics = this.add.graphics();
-    this.windText = this.add.text(640, 78, '', {
-      font: 'bold 12px Arial',
-      color: '#ffffff',
+    this.powerupText = this.add.text(16, 664, 'SUPPLIES  NONE', {
+      font: 'bold 9px Courier New',
+      color: '#aab7c0',
       stroke: '#000000',
-      strokeThickness: 3,
-    }).setOrigin(0.5, 0);
+      strokeThickness: 2,
+    });
+    this.powerupText.setOrigin(0, 0);
+
+    this.contextText = this.add.text(1264, 663, '', {
+      font: 'bold 9px Courier New',
+      color: '#ffe28a',
+      stroke: '#000000',
+      strokeThickness: 2,
+      align: 'right',
+      wordWrap: { width: 420 },
+    });
+    this.contextText.setOrigin(1, 0);
 
     // Tactical Readout Panel (top left, below team indicator) - military style
     this.tacReadoutPanel = this.add.container(10, 40);
     this.tacReadoutPanel.setVisible(false);
 
     // Controls help - keyboard and mouse
-    this.controlsText = this.add.text(640, 680, 
-      '← → Move | W/S Aim | A/D Scout | SPACE/LMB Fire | RMB Drag | G Grapple | B Dig In | H Heal | Q Special | Scroll Zoom', {
-      font: '13px Arial',
+    const terrainControl = this.gameMode === 'expanded' ? 'B Tunnel | Shift+B Cover 90' : 'B Cover 90';
+    this.controlsText = this.add.text(640, 700,
+      `ARROWS Move | W/S Aim | SHIFT Fine | RMB Pan | HOLD SPACE/LMB Fire | G Grapple | ${terrainControl} | H Heal | Q Crate Weapon`, {
+      font: '11px Arial',
       color: '#ffffff',
       stroke: '#000000',
       strokeThickness: 2,
@@ -151,8 +207,23 @@ export class UIScene extends Phaser.Scene {
     this.gameScene.events.on('movement-update', this.updateMovementBar, this);
     this.gameScene.events.on('ability-status', this.updateAbilityStatus, this);
     this.gameScene.events.on('wind-changed', this.updateWind, this);
+
+    // Wind gauge (top center, under the turn/objective lines)
+    this.windGraphics = this.add.graphics();
+    this.windText = this.add.text(640, 86, '', {
+      font: 'bold 11px Arial',
+      color: '#ffffff',
+      stroke: '#000000',
+      strokeThickness: 3,
+    }).setOrigin(0.5, 0);
     this.gameScene.events.on('character-selection', this.showTacReadout, this);
     this.gameScene.events.on('new-game', this.resetUI, this);
+    this.gameScene.events.on('objectives-update', this.updateObjectives, this);
+    this.gameScene.events.on('powerups-update', this.updatePowerups, this);
+    this.gameScene.events.on('context-update', this.updateContext, this);
+    this.gameScene.events.on('show-operations-briefing', this.showOperationsBriefing, this);
+    this.gameScene.events.on('factions-update', this.updateFactionMatchup, this);
+    this.updateFactionLabels();
   }
 
   private updateTurnDisplay(info: TurnInfo): void {
@@ -161,7 +232,10 @@ export class UIScene extends Phaser.Scene {
     this.turnText.setText(`Round ${roundNum}`);
     
     const teamColor = info.currentTeam === Team.RED ? '#ff6666' : '#6666ff';
-    const teamName = info.currentTeam === Team.RED ? 'Red' : 'Blue';
+    const factionId = info.currentTeam === Team.RED
+      ? this.factionMatchup.red
+      : this.factionMatchup.blue;
+    const teamName = getFaction(factionId).shortName;
     
     // Show how many soldiers have acted vs total alive
     const redActed = info.redActedThisRound || 0;
@@ -169,7 +243,7 @@ export class UIScene extends Phaser.Scene {
     const redRemaining = info.redTeamAlive - redActed;
     const blueRemaining = info.blueTeamAlive - blueActed;
     
-    this.teamText.setText(`${teamName} Team - ${info.currentSoldierName} (🔴${redRemaining} 🔵${blueRemaining} left)`);
+    this.teamText.setText(`${teamName} - ${info.currentSoldierName}  |  R:${redRemaining} B:${blueRemaining} ready`);
     this.teamText.setColor(teamColor);
     
     // Update max movement
@@ -184,17 +258,224 @@ export class UIScene extends Phaser.Scene {
     this.updateMovementBar({ movementUsed: 0, maxMovement: this.maxMovement });
   }
 
-  private updateAbilityStatus(info: AbilityStatusInfo | null): void {
-    this.digStatusText.setVisible(!!info);
-    this.healStatusText.setVisible(!!info);
-    this.specialStatusText.setVisible(!!info?.special);
-    if (!info) return;
-    this.setAbilityText(this.digStatusText, '[B] Dig In', info.dig);
-    this.setAbilityText(this.healStatusText, '[H] Heal', info.heal);
-    if (info.special) {
-      const { name, hint, armed } = info.special;
-      this.specialStatusText.setText(armed ? `★ ${name} ARMED - ${hint} (Q/ESC to put away)` : `[Q] ${name}`);
-      this.specialStatusText.setColor(armed ? '#ffdd33' : '#ffeeaa');
+  private updateObjectives(info: ObjectiveInfo): void {
+    this.gameMode = info.mode;
+    if (info.mode !== 'expanded') {
+      this.objectiveText.setVisible(false);
+      return;
+    }
+
+    const relayState = info.owners
+      .map(owner => owner === Team.RED ? 'R' : owner === Team.BLUE ? 'B' : '-')
+      .join(' ');
+    const redTag = getFaction(this.factionMatchup.red).tag;
+    const blueTag = getFaction(this.factionMatchup.blue).tag;
+    this.objectiveText.setText(
+      `OPERATIONS  ${redTag} ${info.redScore}  |  RELAYS [ ${relayState} ]  |  ${info.blueScore} ${blueTag}  |  TARGET ${info.targetScore}`
+    );
+    this.objectiveText.setVisible(true);
+  }
+
+  private updatePowerups(info: PowerupInfo | null): void {
+    if (!info) {
+      this.powerupText.setText('SUPPLIES  NONE');
+      this.powerupText.setColor('#aab7c0');
+      return;
+    }
+
+    const supplies: string[] = [];
+    if (info.armor > 0) supplies.push(`ARMOR ${info.armor} PASSIVE`);
+    if (info.airstrikeCharges > 0) supplies.push(`X AIRSTRIKE x${info.airstrikeCharges}`);
+    if (info.artilleryCharges > 0) supplies.push(`C HOWITZER x${info.artilleryCharges}`);
+    if (info.crateWeapon) {
+      supplies.push(info.crateWeaponArmed
+        ? `* ${info.crateWeapon.toUpperCase()} ARMED (Q/ESC PUT AWAY)`
+        : `Q ${info.crateWeapon.toUpperCase()}`);
+    }
+
+    this.powerupText.setText(`SUPPLIES  ${supplies.length > 0 ? supplies.join('  |  ') : 'NONE'}`);
+    this.powerupText.setColor(supplies.length > 0 ? '#9eeaff' : '#aab7c0');
+  }
+
+  private updateContext(message: string): void {
+    this.contextText.setText(message);
+    this.contextText.setVisible(message.length > 0);
+  }
+
+  private updateFactionMatchup(matchup: FactionMatchup): void {
+    this.factionMatchup = matchup;
+    this.updateFactionLabels();
+  }
+
+  private updateFactionLabels(): void {
+    if (!this.redSquadText || !this.blueSquadText) return;
+    const redFaction = getFaction(this.factionMatchup.red);
+    const blueFaction = getFaction(this.factionMatchup.blue);
+    this.redSquadText.setText(`RED  ${redFaction.tag}  ${redFaction.shortName.toUpperCase()}`);
+    this.blueSquadText.setText(`${blueFaction.shortName.toUpperCase()}  ${blueFaction.tag}  BLUE`);
+  }
+
+  private showOperationsBriefing(): void {
+    if (this.briefingContainer) return;
+
+    const redFaction = getFaction(this.factionMatchup.red);
+    const blueFaction = getFaction(this.factionMatchup.blue);
+    const container = this.add.container(0, 0);
+    container.setDepth(2000);
+
+    const blocker = this.add.rectangle(640, 360, 1280, 720, 0x02070b, 0.7);
+    blocker.setInteractive();
+
+    const panel = this.add.graphics();
+    panel.fillStyle(0x0b1720, 0.98);
+    panel.fillRect(240, 125, 800, 470);
+    panel.lineStyle(2, 0xd7c98b, 0.9);
+    panel.strokeRect(240, 125, 800, 470);
+    panel.lineStyle(1, 0x7f9bad, 0.5);
+    panel.strokeRect(246, 131, 788, 458);
+    panel.lineBetween(270, 205, 1010, 205);
+    panel.lineBetween(270, 449, 1010, 449);
+
+    const eyebrow = this.add.text(640, 145, 'AXIS / ALLIES CONTACT REPORT', {
+      font: 'bold 12px Courier New',
+      color: '#d7c98b',
+    }).setOrigin(0.5, 0);
+    const title = this.add.text(640, 168, 'FACTION CONTACT', {
+      font: 'bold 27px Arial',
+      color: '#ffffff',
+      stroke: '#000000',
+      strokeThickness: 3,
+    }).setOrigin(0.5, 0);
+
+    const redTeam = this.add.text(400, 216, 'RED COMMAND', {
+      font: 'bold 11px Courier New',
+      color: '#ff7770',
+    }).setOrigin(0.5, 0);
+    const blueTeam = this.add.text(880, 216, 'BLUE COMMAND', {
+      font: 'bold 11px Courier New',
+      color: '#78aaff',
+    }).setOrigin(0.5, 0);
+
+    const redEmblem = this.add.image(400, 257, `faction-emblem-${redFaction.id}`);
+    redEmblem.setDisplaySize(42, 42);
+    const blueEmblem = this.add.image(880, 257, `faction-emblem-${blueFaction.id}`);
+    blueEmblem.setDisplaySize(42, 42);
+
+    const redPortrait = this.add.image(
+      400,
+      323,
+      getFactionSpriteTextureKey(redFaction.id, 'rifle'),
+    );
+    redPortrait.setDisplaySize(104, 104);
+    const bluePortrait = this.add.image(
+      880,
+      323,
+      getFactionSpriteTextureKey(blueFaction.id, 'rifle'),
+    );
+    bluePortrait.setDisplaySize(104, 104);
+    bluePortrait.setFlipX(true);
+
+    const versus = this.add.text(640, 302, 'VS', {
+      font: 'bold 35px Arial',
+      color: '#d7c98b',
+      stroke: '#000000',
+      strokeThickness: 4,
+    }).setOrigin(0.5);
+
+    const redName = this.add.text(400, 377, redFaction.name.toUpperCase(), {
+      font: 'bold 16px Arial',
+      color: '#ffffff',
+      stroke: '#000000',
+      strokeThickness: 2,
+      align: 'center',
+      wordWrap: { width: 280 },
+    }).setOrigin(0.5, 0);
+    const blueName = this.add.text(880, 377, blueFaction.name.toUpperCase(), {
+      font: 'bold 16px Arial',
+      color: '#ffffff',
+      stroke: '#000000',
+      strokeThickness: 2,
+      align: 'center',
+      wordWrap: { width: 280 },
+    }).setOrigin(0.5, 0);
+
+    const redAlliance = this.add.text(400, 402, `${redFaction.alliance.toUpperCase()}  |  ${redFaction.flavor}`, {
+      font: '10px Courier New',
+      color: '#c6d2d9',
+      align: 'center',
+      wordWrap: { width: 280 },
+    }).setOrigin(0.5, 0);
+    const blueAlliance = this.add.text(880, 402, `${blueFaction.alliance.toUpperCase()}  |  ${blueFaction.flavor}`, {
+      font: '10px Courier New',
+      color: '#c6d2d9',
+      align: 'center',
+      wordWrap: { width: 280 },
+    }).setOrigin(0.5, 0);
+
+    const missionTitle = this.add.text(
+      640,
+      462,
+      this.gameMode === 'expanded' ? 'MISSION  SECURE THE SIGNAL NETWORK' : 'MISSION  ELIMINATE THE ENEMY SQUAD',
+      {
+        font: 'bold 13px Courier New',
+        color: '#9eeaff',
+      },
+    ).setOrigin(0.5, 0);
+    const missionCopy = this.add.text(
+      640,
+      488,
+      this.gameMode === 'expanded'
+        ? 'Enter relay rings, end the turn inside to capture, and hold through round end.\nFirst to 7 signal points or total elimination wins.'
+        : 'Use movement, terrain, cover, and class weapons to remove all five enemy soldiers.',
+      {
+        font: '11px Courier New',
+        color: '#dfe9ef',
+        align: 'center',
+        lineSpacing: 5,
+        wordWrap: { width: 680 },
+      },
+    ).setOrigin(0.5, 0);
+
+    const closeBg = this.add.rectangle(640, 558, 210, 36, 0x243745, 1);
+    closeBg.setStrokeStyle(1, 0x9eeaff, 0.9);
+    closeBg.setInteractive({ useHandCursor: true });
+    const closeText = this.add.text(640, 558, 'BEGIN OPERATION', {
+      font: 'bold 13px Courier New',
+      color: '#ffffff',
+    }).setOrigin(0.5, 0);
+    closeText.setOrigin(0.5);
+
+    const close = (): void => this.hideOperationsBriefing();
+    blocker.on('pointerdown', close);
+    closeBg.on('pointerdown', close);
+    container.add([
+      blocker,
+      panel,
+      eyebrow,
+      title,
+      redTeam,
+      blueTeam,
+      redEmblem,
+      blueEmblem,
+      redPortrait,
+      bluePortrait,
+      versus,
+      redName,
+      blueName,
+      redAlliance,
+      blueAlliance,
+      missionTitle,
+      missionCopy,
+      closeBg,
+      closeText,
+    ]);
+    this.briefingContainer = container;
+  }
+
+  private hideOperationsBriefing(): void {
+    if (this.briefingContainer) {
+      this.briefingContainer.destroy(true);
+      this.briefingContainer = null;
     }
   }
 
@@ -202,7 +483,7 @@ export class UIScene extends Phaser.Scene {
     const g = this.windGraphics;
     g.clear();
     const cx = 640;
-    const y = 96;
+    const y = 102;
     const halfWidth = 60;
 
     g.fillStyle(0x000000, 0.45);
@@ -215,22 +496,41 @@ export class UIScene extends Phaser.Scene {
       return;
     }
 
-    const len = Math.abs(wind) * halfWidth;
+    const strength = Math.abs(wind);
+    const len = strength * halfWidth;
     const dir = wind > 0 ? 1 : -1;
-    const color = Math.abs(wind) >= 0.7 ? 0xff5544 : Math.abs(wind) >= 0.4 ? 0xffcc33 : 0x66ddff;
+    const color = strength >= 0.7 ? 0xff5544 : strength >= 0.4 ? 0xffcc33 : 0x66ddff;
     g.fillStyle(color, 1);
     g.fillRect(dir > 0 ? cx : cx - len, y, len, 4);
     const tipX = cx + dir * len;
     g.fillTriangle(tipX + dir * 7, y + 2, tipX, y - 3, tipX, y + 7);
 
-    const arrows = dir > 0 ? '▶'.repeat(Math.ceil(Math.abs(wind) * 3)) : '◀'.repeat(Math.ceil(Math.abs(wind) * 3));
-    const label = Math.abs(wind) >= 0.7 ? 'GALE' : 'WIND';
-    this.windText.setText(dir > 0 ? `${label} ${Math.round(Math.abs(wind) * 100)}% ${arrows}` : `${arrows} ${label} ${Math.round(Math.abs(wind) * 100)}%`);
+    const arrows = (dir > 0 ? '▶' : '◀').repeat(Math.ceil(strength * 3));
+    const label = `${strength >= 0.7 ? 'GALE' : 'WIND'} ${Math.round(strength * 100)}%`;
+    this.windText.setText(dir > 0 ? `${label} ${arrows}` : `${arrows} ${label}`);
   }
 
-  private setAbilityText(text: Phaser.GameObjects.Text, label: string, status: AbilityStatus): void {
-    text.setText(`${label}: ${status.ready ? 'READY' : status.reason}`);
-    text.setColor(status.ready ? '#66ff88' : '#888888');
+  // One line above the movement bar: what B / Shift+B / H will do right now, or why they can't.
+  private updateAbilityStatus(list: { label: string; status: AbilityStatus }[] | null): void {
+    this.abilityTexts.forEach(t => t.destroy());
+    this.abilityTexts = [];
+    if (!list || list.length === 0) return;
+
+    const gap = 22;
+    const texts = list.map(({ label, status }) =>
+      this.add.text(0, 643, `${label}: ${status.reason}`, {
+        font: 'bold 11px Arial',
+        color: status.ready ? '#7dffa0' : '#9a9a9a',
+        stroke: '#000000',
+        strokeThickness: 3,
+      }).setOrigin(0, 0));
+    const total = texts.reduce((w, t) => w + t.width, 0) + gap * (texts.length - 1);
+    let x = 640 - total / 2;
+    for (const t of texts) {
+      t.setX(x);
+      x += t.width + gap;
+    }
+    this.abilityTexts = texts;
   }
 
   private updateMovementBar(info: { movementUsed: number; maxMovement: number }): void {
@@ -239,7 +539,7 @@ export class UIScene extends Phaser.Scene {
     const barWidth = 200;
     const barHeight = 10;
     const x = 640 - barWidth / 2;
-    const y = 625;
+    const y = 663;
     
     // Background
     this.movementBar.fillStyle(0x333333, 0.8);
@@ -272,21 +572,22 @@ export class UIScene extends Phaser.Scene {
 
   private showTacReadout(info: CharacterSelectionInfo): void {
     // The header otherwise keeps showing the previous turn while a new team picks a soldier.
-    const teamName = info.team === Team.RED ? 'Red' : 'Blue';
-    this.teamText.setText(`${teamName} Team — choose a soldier`);
+    const faction = getFaction(info.soldier.factionId);
+    const teamName = faction.shortName;
+    this.teamText.setText(`${teamName} - choose a soldier`);
     this.teamText.setColor(info.team === Team.RED ? '#ff6666' : '#6666ff');
 
     // Clear existing panel
     this.tacReadoutPanel.removeAll(true);
     
-    const panelWidth = 200;
+    const panelWidth = 230;
     const panelHeight = 280;
     
     // Position panel on opposite side from soldier (screen coords)
     // If soldier is on left half of world, show panel on right; otherwise show on left
     const worldWidth = (this.gameScene.physics?.world?.bounds?.width as number | undefined) || 2560;
     const worldMidpoint = worldWidth / 2;
-    const panelX = info.soldierX < worldMidpoint ? 1070 : 10;
+    const panelX = info.soldierX < worldMidpoint ? 1040 : 10;
     this.tacReadoutPanel.setPosition(panelX, 40);
     
     // Create military-style panel background
@@ -324,7 +625,7 @@ export class UIScene extends Phaser.Scene {
     this.tacReadoutPanel.add(panelBg);
     
     // Header - "TAC READOUT"
-    const header = this.add.text(panelWidth / 2, 8, '◆ TAC READOUT ◆', {
+    const header = this.add.text(panelWidth / 2, 8, '[ TAC READOUT ]', {
       font: 'bold 11px Courier New',
       color: '#5aff5a',
     });
@@ -344,12 +645,24 @@ export class UIScene extends Phaser.Scene {
     });
     this.tacReadoutPanel.add(unitLabel);
     
-    const unitName = this.add.text(panelWidth - 10, 30, info.soldier.name.toUpperCase(), {
+    const unitName = this.add.text(
+      panelWidth - 52,
+      30,
+      `${info.soldier.name.toUpperCase()} [${faction.tag}]`,
+      {
       font: 'bold 10px Courier New',
       color: '#ffffff',
-    });
+      },
+    );
     unitName.setOrigin(1, 0);
     this.tacReadoutPanel.add(unitName);
+
+    const portraitFrame = this.add.rectangle(panelWidth - 27, 52, 46, 46, 0x0a1115, 0.9);
+    portraitFrame.setStrokeStyle(1, faction.palette.accent, 0.9);
+    this.tacReadoutPanel.add(portraitFrame);
+    const portrait = this.add.image(panelWidth - 27, 53, info.soldier.portraitTextureKey);
+    portrait.setDisplaySize(42, 42);
+    this.tacReadoutPanel.add(portrait);
     
     // Selection indicator
     const selText = this.add.text(10, 44, 'SELECT:', {
@@ -358,7 +671,7 @@ export class UIScene extends Phaser.Scene {
     });
     this.tacReadoutPanel.add(selText);
     
-    const selValue = this.add.text(panelWidth - 10, 44, `${info.currentIndex + 1}/${info.totalCount}`, {
+    const selValue = this.add.text(panelWidth - 52, 44, `${info.currentIndex + 1}/${info.totalCount}`, {
       font: 'bold 10px Courier New',
       color: '#ffff66',
     });
@@ -382,7 +695,7 @@ export class UIScene extends Phaser.Scene {
     healthBarBg.strokeRect(60, 60, 100, 10);
     this.tacReadoutPanel.add(healthBarBg);
     
-    const healthValue = this.add.text(panelWidth - 10, 60, `${info.soldier.health}%`, {
+    const healthValue = this.add.text(panelWidth - 52, 60, `${info.soldier.health}%`, {
       font: 'bold 9px Courier New',
       color: '#ffffff',
     });
@@ -451,7 +764,7 @@ export class UIScene extends Phaser.Scene {
     this.tacReadoutPanel.add(desc);
     
     // Instructions at bottom
-    const instructions = this.add.text(panelWidth / 2, panelHeight - 32, '◄ ► CYCLE | CLICK SELECT', {
+    const instructions = this.add.text(panelWidth / 2, panelHeight - 32, '< > CYCLE | CLICK SELECT', {
       font: '8px Courier New',
       color: '#5a8a5a',
     });
@@ -469,17 +782,22 @@ export class UIScene extends Phaser.Scene {
   }
 
   private resetUI(): void {
-    this.turnText.setText('Turn 1');
+    this.turnText.setText('Round 1');
     this.teamText.setText('');
     this.tacReadoutPanel.setVisible(false);
+    this.updatePowerups(null);
     this.updateAbilityStatus(null);
     this.windGraphics.clear();
     this.windText.setText('');
+    this.updateContext('');
+    this.hideOperationsBriefing();
+    this.updateFactionLabels();
   }
 
-  private showGameOver(winner: Team | null): void {
+  private showGameOver(winner: Team | null, reason: 'elimination' | 'signal' = 'elimination'): void {
     // Hide tactical readout
     this.tacReadoutPanel.setVisible(false);
+    this.hideOperationsBriefing();
     this.updateAbilityStatus(null);
     
     // Darken background
@@ -489,10 +807,16 @@ export class UIScene extends Phaser.Scene {
     let color: string;
 
     if (winner === Team.RED) {
-      text = '🔴 RED TEAM WINS! 🔴';
+      const faction = getFaction(this.factionMatchup.red);
+      text = reason === 'signal'
+        ? `${faction.shortName.toUpperCase()} SIGNAL VICTORY`
+        : `${faction.shortName.toUpperCase()} WINS`;
       color = '#ff6666';
     } else if (winner === Team.BLUE) {
-      text = '🔵 BLUE TEAM WINS! 🔵';
+      const faction = getFaction(this.factionMatchup.blue);
+      text = reason === 'signal'
+        ? `${faction.shortName.toUpperCase()} SIGNAL VICTORY`
+        : `${faction.shortName.toUpperCase()} WINS`;
       color = '#6666ff';
     } else {
       text = "IT'S A DRAW!";

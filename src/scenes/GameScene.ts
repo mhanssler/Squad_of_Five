@@ -1,13 +1,27 @@
 import Phaser from 'phaser';
+import type { SpecialTool } from '../systems/SpecialActions';
+import { advanceFlight, BALLISTIC_STEP, createFlight, getMuzzle, sweepTerrain } from '../systems/Ballistics';
+import { playBattleExplosion } from '../systems/BattleEffects';
 import { Soldier } from '../entities/Soldier';
 import { Terrain } from '../systems/Terrain';
 import { TurnManager, Team } from '../systems/TurnManager';
 import { Projectile, createProjectile } from '../entities/Projectile';
-import { WeaponConfig, WeaponType, WEAPONS } from '../systems/WeaponTypes';
+import { ALL_WEAPON_TYPES, WeaponConfig, WeaponType, WEAPONS } from '../systems/WeaponTypes';
 import { SoundManager } from '../utils/SoundManager';
-import { AbilityStatus, TurnActionState, getDigInStatus, getHealStatus } from '../systems/Abilities';
-import { HazardField } from '../entities/Hazards';
+import {
+  GameMode,
+  MAX_TUNNELS_PER_TURN,
+  OPERATION_SCORE_TO_WIN,
+  RELAY_CAPTURE_RADIUS,
+  RelayControl,
+  TUNNEL_MOVEMENT_COST,
+  getTunnelPlan,
+  resolveRelayControl,
+} from '../systems/GameRules';
+import { adjustDropXsForTerrain, getDeploymentZone, planTeamDropXs } from '../systems/Deployment';
+import { COVER_MOVEMENT_COST } from '../systems/Cover';
 import { getWindAccel, isWindCalm, rollWind, WIND_PREVIEW_SECONDS } from '../systems/Wind';
+import { HazardField } from '../entities/Hazards';
 import { BanterCategory, emptyShotStats, pickLine, pickShotBanter, ShotStats } from '../systems/Banter';
 import {
   rollSpecialWeapon,
@@ -18,19 +32,59 @@ import {
   type SpecialBehavior,
   type SpecialWeaponDef,
 } from '../systems/SpecialWeapons';
+import {
+  AbilityStatus,
+  TurnActionState,
+  getCoverStatus,
+  getHealStatus,
+  getTunnelStatus,
+} from '../systems/Abilities';
+import {
+  advanceChargePower,
+  getAimAssistProfile,
+  getAimReadout,
+  getLocalPointerAimAngle,
+  resolveKeyboardChargeInput,
+} from '../systems/AimControls';
+import { BattlefieldSky } from '../systems/BattlefieldSky';
+import { getBattlefieldRevealFrame } from '../systems/CameraFraming';
+import {
+  FactionId,
+  FactionMatchup,
+  createFactionMatchup,
+  getFaction,
+} from '../systems/Factions';
+import { sanitizeSquadForMap } from '../systems/SquadRules';
+import {
+  findFirstUnitIntercept,
+  getHorizontalShotProgress,
+  getTerrainObstructionPenalty,
+  type ShotUnit,
+} from '../systems/AIShotSafety';
+import { shouldDeformTerrainOnImpact } from '../systems/ImpactRules';
+import {
+  chooseAIAreaStrikeTargetX,
+  chooseAIGrappleDestination,
+  chooseAIRecoveryAction,
+  chooseSpacedDestinationX,
+  type AIGrappleCandidate,
+  type AIMoveOutcome,
+  type AIMoveStopReason,
+} from '../systems/AITactics';
 
 // Base movement distance (modified by weapon weight)
 const BASE_MOVEMENT_DISTANCE = 320;
 const POWER_MIN = 10;
-// Power now cycles while held, making release timing matter instead of always settling at max.
-// ~2.6s to full charge: fast charge made overshooting the intended power too easy.
-const POWER_CHARGE_UP_PER_SECOND = 35;
-const POWER_CHARGE_DOWN_PER_SECOND = 45;
+// One deliberate pass to full power gives the player a readable release window.
+const POWER_CHARGE_PER_SECOND = 32;
+const AI_MAX_ACCEPTABLE_SHOT_SCORE = 260;
+const AI_FRIENDLY_FIRE_PENALTY = 6000;
+const AI_MAX_NAVIGATION_RECOVERIES = 3;
+const AI_FORMATION_SPACING = 78;
 
-// Mouse aim is smoothed toward the pointer direction instead of snapping, and ignores
-// pointer positions right on top of the soldier where the angle flips wildly.
-const MOUSE_AIM_TURN_SPEED_DEG_PER_SEC = 240;
-const MOUSE_AIM_DEADZONE_PX = 26;
+const KEYBOARD_AIM_SPEED_DEG_PER_SEC = 68;
+const FINE_AIM_SPEED_DEG_PER_SEC = 16;
+const LOCAL_AIM_DEADZONE_PX = 28;
 
 // Normalize an angle in degrees to [-180, 180].
 function wrapDeg(angle: number): number {
@@ -40,8 +94,8 @@ const DEFAULT_MOVE_SPEED = 180;
 
 type SupplyDropType = 'medkit' | 'airstrike' | 'artillery' | 'armor' | 'munitions' | 'weapon';
 
-// What each soldier shouts when firing a special weapon.
-const SPECIAL_FIRE_LINES: Record<string, string> = {
+// What a soldier shouts when firing a crate weapon.
+const CRATE_WEAPON_FIRE_LINES: Record<string, string> = {
   cluster: 'Rain check!',
   holy: 'Hallelujah!',
   teleport: 'Beam me up!',
@@ -128,12 +182,33 @@ type AIShotPlan = {
   score: number;
 };
 
+type AIShotEvaluation = {
+  score: number;
+  minDist: number;
+  impactX: number | null;
+  impactY: number | null;
+  interceptedSoldier: Soldier | null;
+  terrainProgress: number | null;
+};
+
+type RelayObjective = {
+  id: number;
+  x: number;
+  y: number;
+  owner: RelayControl;
+  container: Phaser.GameObjects.Container;
+  graphics: Phaser.GameObjects.Graphics;
+  label: Phaser.GameObjects.Text;
+  highlight: 'none' | 'ready' | 'secured' | 'contested';
+};
+
 export class GameScene extends Phaser.Scene {
   // Battlefield dimensions (wider than viewport). Configurable via MenuScene.
   private worldWidth: number = 2560;
   private worldHeight: number = 720;
   private terrainPreset: 'standard' | 'plains' | 'hills' | 'caves' = 'standard';
   private vsAI: boolean = true;
+  private gameMode: GameMode = 'expanded';
   private aiTurnToken: number = 0;
   // Increments each time a soldier's turn starts; used to guard delayed callbacks from previous turns.
   private turnId: number = 0;
@@ -151,10 +226,15 @@ export class GameScene extends Phaser.Scene {
   private turnManager!: TurnManager;
   private currentSoldier: Soldier | null = null;
   private backgroundGraphics!: Phaser.GameObjects.Graphics;
+  private battlefieldSky!: BattlefieldSky;
 
   // Squad selections from menu
   private redSquad: string[] = [];
   private blueSquad: string[] = [];
+  private factionMatchup: FactionMatchup = {
+    red: 'united-states',
+    blue: 'germany',
+  };
 
   // Input
   private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
@@ -182,14 +262,13 @@ private gKey!: Phaser.Input.Keyboard.Key;
   // Aiming (completely separate from movement)
   private aimAngle: number = -45; // Degrees, -90 is straight up
   private power: number = 50; // 0-100
-  private powerChargeDirection: 1 | -1 = 1;
-  private lastAimInput: 'mouse' | 'keys' = 'keys';
-  private mouseAimTargetAngle: number | null = null; // Smoothed toward, never snapped
   private isCharging: boolean = false;
   private aimLine!: Phaser.GameObjects.Graphics;
   private aimPowerText!: Phaser.GameObjects.Text;
   private hasFired: boolean = false;
-  private lastAbilityStatusKey = '';
+  private specialTool: SpecialTool | null = null;
+  private specialTarget = { x: 0, y: 0 };
+  private specialLabel: Phaser.GameObjects.Text | null = null;
   private isTurnEnding: boolean = false; // Prevent double endTurn calls
 
   // Shot resolution tracking (prevents turns advancing while projectiles are still in flight).
@@ -203,7 +282,28 @@ private gKey!: Phaser.Input.Keyboard.Key;
   // Movement tracking
   private movementUsed: number = 0;
   private maxMovement: number = BASE_MOVEMENT_DISTANCE;
-  private startX: number = 0;
+  private lastMovementX: number = 0;
+  private tunnelsUsedThisTurn: number = 0;
+  private isTunnelActionInProgress: boolean = false;
+  private isCoverActionInProgress: boolean = false;
+  private coverUsedThisTurn: boolean = false;
+  private lastAbilityStatusKey = '';
+
+  // Wind for the current turn (-1..1)
+  private wind: number = 0;
+
+  // Battlefield hazards (explosive barrels, landmines)
+  private hazards!: HazardField;
+
+  // One-shot weapon from a supply crate, armed with Q for this turn.
+  private isCrateWeaponArmed: boolean = false;
+
+  // Who is acting this turn (kill credit, veterancy, banter) and what their attack did.
+  private turnActor: Soldier | null = null;
+  private turnStats: ShotStats = emptyShotStats();
+  private turnActorAttacked: boolean = false;
+  private lastImpact: { x: number; y: number } | null = null;
+  private lastAllyHit: Soldier | null = null;
 
   // Character selection
   private isSelectingCharacter: boolean = false;
@@ -232,7 +332,16 @@ private gKey!: Phaser.Input.Keyboard.Key;
   private introSkipped: boolean = false;
   private introHintText: Phaser.GameObjects.Text | null = null;
   private introOverlayObjects: Phaser.GameObjects.GameObject[] = [];
-  private paraDropPlans: Array<{ x: number; team: Team; name: string; index: number; weaponId: string; spawned: boolean }> = [];
+  private introCameraTween: Phaser.Tweens.Tween | null = null;
+  private paraDropPlans: Array<{
+    x: number;
+    team: Team;
+    factionId: FactionId;
+    name: string;
+    index: number;
+    weaponId: string;
+    spawned: boolean;
+  }> = [];
   private activeDescents: Array<{ soldier: Soldier; parachute: Phaser.GameObjects.Container; landingY: number }> = [];
   private soldiersExpected: number = 10;
   private soldiersLanded: number = 0;
@@ -240,6 +349,13 @@ private gKey!: Phaser.Input.Keyboard.Key;
   // Balance events / airdrops
   private supplyDrops: SupplyDrop[] = [];
   private nextBalanceEventTurn: number = 4;
+
+  // Expanded-mode signal relays create a movement objective beyond pure elimination.
+  private relayObjectives: RelayObjective[] = [];
+  private operationScore: Record<Team, number> = { [Team.RED]: 0, [Team.BLUE]: 0 };
+  private lastRelayIncomeRound: number = 1;
+  private lastRelayContext: string = '';
+  private operationsBriefingShown: boolean = false;
 
   // Call-in / special weapon modes
   private isAirstrikeTargeting: boolean = false;
@@ -251,32 +367,25 @@ private gKey!: Phaser.Input.Keyboard.Key;
   private howitzerBarrel: Phaser.GameObjects.Rectangle | null = null;
   private howitzerHelpText: Phaser.GameObjects.Text | null = null;
 
-  // Battlefield hazards (explosive barrels, landmines)
-  private hazards!: HazardField;
-
-  // Wind for the current turn (-1..1)
-  private wind: number = 0;
-
-  // Who is acting this turn (for kill credit, veterancy and banter) and what their action did.
-  private turnActor: Soldier | null = null;
-  private turnStats: ShotStats = emptyShotStats();
-  private turnActorAttacked: boolean = false;
-  private lastImpact: { x: number; y: number } | null = null;
-  private lastAllyHit: Soldier | null = null;
-
-  // Special weapon from a crate, armed with Q for this turn.
-  private isSpecialArmed: boolean = false;
-
   constructor() {
     super({ key: 'GameScene' });
   }
 
-  init(data: { redSquad?: string[], blueSquad?: string[], mapSize?: 'small' | 'medium' | 'large', terrainPreset?: 'standard' | 'plains' | 'hills' | 'caves', vsAI?: boolean }): void {
+  init(data: { redSquad?: string[], blueSquad?: string[], mapSize?: 'small' | 'medium' | 'large', terrainPreset?: 'standard' | 'plains' | 'hills' | 'caves', vsAI?: boolean, gameMode?: GameMode }): void {
     // Receive squad selections from menu
-    this.redSquad = data.redSquad || ['rifle', 'grenade', 'rocket', 'shotgun', 'sniper'];
-    this.blueSquad = data.blueSquad || ['rifle', 'grenade', 'rocket', 'shotgun', 'sniper'];
-
     const size = data.mapSize ?? 'medium';
+    const defaultSquad = ['rifle', 'grenade', 'rocket', 'sniper', 'mortar'];
+    this.redSquad = sanitizeSquadForMap(
+      data.redSquad ?? defaultSquad,
+      size,
+      ALL_WEAPON_TYPES,
+    );
+    this.blueSquad = sanitizeSquadForMap(
+      data.blueSquad ?? defaultSquad,
+      size,
+      ALL_WEAPON_TYPES,
+    );
+
     if (size === 'small') this.worldWidth = 1920;
     else if (size === 'large') this.worldWidth = 3200;
     else this.worldWidth = 2560;
@@ -284,9 +393,17 @@ private gKey!: Phaser.Input.Keyboard.Key;
 
     this.terrainPreset = data.terrainPreset ?? 'standard';
     this.vsAI = data.vsAI ?? true;
+    this.gameMode = data.gameMode ?? 'basic';
+    this.factionMatchup = createFactionMatchup();
+    this.operationScore = { [Team.RED]: 0, [Team.BLUE]: 0 };
+    this.lastRelayIncomeRound = 1;
+    this.lastRelayContext = '';
+    this.operationsBriefingShown = false;
   }
 
   create(): void {
+    this.specialTool = null;
+    this.specialLabel = null;
     // Set up world bounds (larger than camera)
     this.physics.world.setBounds(0, 0, this.worldWidth, this.worldHeight);
     
@@ -301,19 +418,31 @@ private gKey!: Phaser.Input.Keyboard.Key;
     this.hazards = new HazardField(this, this.terrain, (x, y, radius, damage) => {
       this.handleExplosion(x, y, radius, damage);
     });
+    this.battlefieldSky = new BattlefieldSky(
+      this,
+      this.worldWidth,
+      this.worldHeight,
+      x => this.terrain.getSurfaceY(x),
+    );
+
+    if (this.gameMode === 'expanded') {
+      this.createRelayObjectives();
+    }
 
     // Create aim line graphics
     this.aimLine = this.add.graphics();
     this.aimLine.setDepth(100);
 
-    // Numeric power readout shown while charging (precision was hard with just the bar)
+    // Local fire-control readout stays with the active soldier.
     this.aimPowerText = this.add.text(0, 0, '', {
-      font: 'bold 13px Arial',
+      font: 'bold 12px "Arial Narrow", Arial',
       color: '#ffffff',
       stroke: '#000000',
       strokeThickness: 3,
+      backgroundColor: '#07100dcc',
+      padding: { x: 5, y: 3 },
     });
-    this.aimPowerText.setOrigin(0.5, 1);
+    this.aimPowerText.setOrigin(0.5, 0);
     this.aimPowerText.setDepth(150);
     this.aimPowerText.setVisible(false);
 
@@ -372,13 +501,19 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     }
 
     // Launch UI scene
-    this.scene.launch('UIScene', { gameScene: this });
+    this.scene.launch('UIScene', {
+      gameScene: this,
+      gameMode: this.gameMode,
+      factionMatchup: this.factionMatchup,
+    });
+    this.time.delayedCall(0, () => this.emitOperationStatus());
 
     // Listen for projectile explosions (now includes damage parameter)
     this.events.on('projectile-explode', this.handleExplosion, this);
     
     // Listen for flame damage (flamethrower)
     this.events.on('flame-wave', this.handleFlameWave, this);
+    this.events.on('bullet-near-miss', this.handleBulletNearMiss, this);
     
     // Listen for flame jet ending
     this.events.on('flame-jet-ended', this.handleFlameJetEnded, this);
@@ -396,19 +531,22 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     // Listen for soldier hit checks (raycast collision for bullets)
     this.events.on('check-soldier-hit', this.checkSoldierHit, this);
 
-    // Special weapon projectiles
+    // Crate weapon projectiles
     this.events.on('special-teleport', this.handleTeleportBeacon, this);
-    this.events.on('special-exploded', this.handleSpecialExploded, this);
+    this.events.on('special-exploded', this.handleCrateWeaponExploded, this);
+    this.events.on('soldier-died', this.handleSoldierDeath, this);
     
     // Setup mouse controls
     this.setupMouseControls();
 
     // In-game music. Menu music is stopped when GameScene starts.
     SoundManager.init();
-    SoundManager.startCelloMusic();
+    SoundManager.setBattleMusicPhase('maneuver');
+    SoundManager.startBattleMusic();
 
     // Ensure music stops if this scene is ever shut down.
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+      this.battlefieldSky.destroy();
       SoundManager.stopMusic();
     });
   }
@@ -416,6 +554,13 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
   private setupMouseControls(): void {
     // Right-click or middle-click drag to pan camera
     this.input.on('pointerdown', (pointer: Phaser.Input.Pointer) => {
+      if (this.specialTool) {
+        if (pointer.rightButtonDown()) this.cancelSpecial();
+        else if (pointer.leftButtonDown()) this.confirmSpecial();
+        return;
+      }
+      if (this.currentSoldier && !this.isSelectingCharacter &&
+          (this.currentSoldier.isCurrentlyGrappling() || this.isTunnelActionInProgress || this.isCoverActionInProgress || this.isTeamAI(this.currentSoldier.team))) return;
       // Any click during the intro skips it.
       if (!this.introDone && pointer.leftButtonDown()) {
         this.skipIntro();
@@ -456,16 +601,20 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
       
       // Left click during gameplay - start charging (mouse aim mode)
       if (pointer.leftButtonDown() && !this.isSelectingCharacter && this.currentSoldier && !this.hasFired) {
+        this.updateMouseAimTarget(pointer.x, pointer.y);
         this.isMouseCharging = true;
         this.power = POWER_MIN;
-        this.powerChargeDirection = 1;
-        this.lastAimInput = 'mouse';
         this.mouseChargeTurnId = this.turnId;
         this.mouseChargeSoldier = this.currentSoldier;
       }
     });
     
     this.input.on('pointermove', (pointer: Phaser.Input.Pointer) => {
+      if (this.specialTool && this.currentSoldier) {
+        this.specialTarget = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
+        this.aimAngle = Phaser.Math.RadToDeg(Math.atan2(this.specialTarget.y - this.currentSoldier.y, this.specialTarget.x - this.currentSoldier.x));
+        return;
+      }
       // Handle camera drag
       if (this.isDraggingCamera) {
         const dx = this.dragStartX - pointer.x;
@@ -482,18 +631,10 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
         );
       }
       
-      // Mouse aiming - set the smoothed aim target from the pointer direction.
-      // Pointer positions right on top of the soldier are ignored (angle flips wildly there).
+      // Mouse aiming uses the pointer direction around the active soldier.
+      // Positions right on top of the soldier are ignored because the angle is unstable there.
       if (this.currentSoldier && !this.isSelectingCharacter && !this.isDraggingCamera && !this.isAirstrikeTargeting) {
-        const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
-        const origin = this.getAimOrigin();
-        if (!origin) return;
-        const dx = worldPoint.x - origin.x;
-        const dy = worldPoint.y - origin.y;
-        if (Math.hypot(dx, dy) >= MOUSE_AIM_DEADZONE_PX) {
-          this.lastAimInput = 'mouse';
-          this.mouseAimTargetAngle = Phaser.Math.RadToDeg(Math.atan2(dy, dx));
-        }
+        this.updateMouseAimTarget(pointer.x, pointer.y);
       }
     });
     
@@ -529,6 +670,22 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     
     // Disable context menu on right click
     this.input.mouse!.disableContextMenu();
+  }
+
+  private updateMouseAimTarget(screenX: number, screenY: number): void {
+    const origin = this.getAimOrigin();
+    if (!origin) return;
+    const camera = this.cameras.main;
+    const originScreenX = camera.x + (origin.x - camera.worldView.x) * camera.zoom;
+    const originScreenY = camera.y + (origin.y - camera.worldView.y) * camera.zoom;
+    const targetAngle = getLocalPointerAimAngle(
+      screenX,
+      screenY,
+      originScreenX,
+      originScreenY,
+      LOCAL_AIM_DEADZONE_PX,
+    );
+    if (targetAngle !== null) this.aimAngle = targetAngle;
   }
 
   private adjustZoom(delta: number): void {
@@ -579,10 +736,14 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
       }
     });
     this.supplyDrops = [];
-    this.nextBalanceEventTurn = 4;
     this.hazards.clear();
-    this.turnActor = null;
-    this.isSpecialArmed = false;
+    this.nextBalanceEventTurn = 4;
+
+    this.destroyRelayObjectives();
+    this.operationScore = { [Team.RED]: 0, [Team.BLUE]: 0 };
+    this.lastRelayIncomeRound = 1;
+    this.operationsBriefingShown = false;
+    this.factionMatchup = createFactionMatchup();
     
     // Stop camera follow
     this.cameras.main.stopFollow();
@@ -594,6 +755,10 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     
     // Regenerate terrain with new seed
     this.terrain.regenerate();
+    this.battlefieldSky.refreshGroundAnchors();
+    if (this.gameMode === 'expanded') {
+      this.createRelayObjectives();
+    }
     
     // Reset game state - destroy all soldiers
     this.soldiers.forEach(soldier => soldier.destroy());
@@ -607,10 +772,18 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     
     // Reset UI
     this.events.emit('new-game');
+    this.events.emit('factions-update', this.factionMatchup);
     
     // Reset flags
     this.hasFired = false;
     this.movementUsed = 0;
+    this.tunnelsUsedThisTurn = 0;
+    this.isTunnelActionInProgress = false;
+    this.isCoverActionInProgress = false;
+    this.coverUsedThisTurn = false;
+    this.isCrateWeaponArmed = false;
+    this.turnActor = null;
+    this.emitOperationStatus();
     
     // Allow new game again
     this.isResetting = false;
@@ -638,18 +811,31 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
   private buildParaDropPlans(): void {
     this.paraDropPlans = [];
 
-    const zoneMargin = 80;
-    const zoneWidth = Math.min(550, Math.floor(this.worldWidth * 0.28));
-    const redDropZone = { minX: zoneMargin, maxX: Math.min(this.worldWidth - zoneMargin, zoneMargin + zoneWidth) };
-    const blueDropZone = { minX: Math.max(zoneMargin, this.worldWidth - zoneMargin - zoneWidth), maxX: this.worldWidth - zoneMargin };
-
-    const redNames = ['Sarge', 'Gunner', 'Boom', 'Buck', 'Ghost'];
-    const blueNames = ['Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo'];
+    const redFaction = getFaction(this.factionMatchup.red);
+    const blueFaction = getFaction(this.factionMatchup.blue);
+    const redNames = redFaction.soldierNames;
+    const blueNames = blueFaction.soldierNames;
+    const redZone = getDeploymentZone(this.worldWidth, 'red');
+    const blueZone = getDeploymentZone(this.worldWidth, 'blue');
+    const sampleSurface = (x: number): number => this.terrain.getSurfaceY(x);
+    const redXs = adjustDropXsForTerrain(
+      planTeamDropXs(this.worldWidth, redNames.length, 'red'),
+      redZone,
+      this.worldHeight,
+      sampleSurface,
+    );
+    const blueXs = adjustDropXsForTerrain(
+      planTeamDropXs(this.worldWidth, blueNames.length, 'blue'),
+      blueZone,
+      this.worldHeight,
+      sampleSurface,
+    );
 
     redNames.forEach((name, index) => {
       this.paraDropPlans.push({
-        x: Phaser.Math.Between(redDropZone.minX, redDropZone.maxX),
+        x: redXs[index],
         team: Team.RED,
+        factionId: redFaction.id,
         name,
         index,
         weaponId: this.redSquad[index] || 'rifle',
@@ -659,8 +845,9 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
 
     blueNames.forEach((name, index) => {
       this.paraDropPlans.push({
-        x: Phaser.Math.Between(blueDropZone.minX, blueDropZone.maxX),
+        x: blueXs[index],
         team: Team.BLUE,
+        factionId: blueFaction.id,
         name,
         index,
         weaponId: this.blueSquad[index] || 'rifle',
@@ -672,15 +859,15 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
   private showIntroSkipHint(): void {
     if (this.introHintText) this.introHintText.destroy();
 
-    this.introHintText = this.add.text(this.cameras.main.width / 2, this.cameras.main.height - 36, 'SPACE or CLICK to skip intro', {
-      font: 'bold 15px Arial',
+    this.introHintText = this.add.text(this.cameras.main.width - 24, this.cameras.main.height - 88, 'SPACE / CLICK  SKIP INTRO', {
+      font: 'bold 12px Arial',
       color: '#ffffff',
       stroke: '#000000',
-      strokeThickness: 4,
+      strokeThickness: 3,
       backgroundColor: '#00000066',
-      padding: { x: 10, y: 5 },
+      padding: { x: 9, y: 4 },
     });
-    this.introHintText.setOrigin(0.5);
+    this.introHintText.setOrigin(1, 0.5);
     this.introHintText.setScrollFactor(0);
     this.introHintText.setDepth(1001);
 
@@ -697,6 +884,7 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
   private skipIntro(): void {
     if (this.introDone || this.introSkipped) return;
     this.introSkipped = true;
+    this.stopIntroCameraMove();
 
     SoundManager.stopSpeech();
 
@@ -722,9 +910,26 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     this.transitionFromIntro();
   }
 
-  private spawnSoldierOnGround(plan: { x: number; team: Team; name: string; index: number; weaponId: string }): void {
+  private spawnSoldierOnGround(plan: {
+    x: number;
+    team: Team;
+    factionId: FactionId;
+    name: string;
+    index: number;
+    weaponId: string;
+  }): void {
     const landingY = this.terrain.getSurfaceY(plan.x) - 15;
-    const soldier = new Soldier(this, plan.x, landingY, plan.team, plan.name, plan.index, true, plan.weaponId as WeaponType);
+    const soldier = new Soldier(
+      this,
+      plan.x,
+      landingY,
+      plan.team,
+      plan.name,
+      plan.index,
+      true,
+      plan.weaponId as WeaponType,
+      plan.factionId,
+    );
     this.soldiers.push(soldier);
 
     const body = soldier.sprite.body as Phaser.Physics.Arcade.Body;
@@ -755,12 +960,15 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
   private transitionFromIntro(): void {
     if (this.introDone) return;
     this.introDone = true;
+    this.stopIntroCameraMove();
 
-    // Scatter barrels and mines now that the bombardment has finished reshaping the ground.
+    // Scatter barrels and mines now that the bombardment has finished reshaping the ground,
+    // keeping clear of soldiers and (in Operations) the signal relays.
+    const relayXs = this.gameMode === 'expanded' ? [0.32, 0.5, 0.68].map(r => Math.round(this.worldWidth * r)) : [];
     this.hazards.clear();
     this.hazards.spawn(
       this.worldWidth,
-      this.soldiers.map(s => s.x),
+      [...this.soldiers.map(s => s.x), ...relayXs],
       Math.max(2, Math.round(this.worldWidth / 520)),
       Math.max(2, Math.round(this.worldWidth / 640)),
     );
@@ -771,6 +979,10 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     }
 
     this.startCharacterSelection();
+    if (!this.operationsBriefingShown) {
+      this.operationsBriefingShown = true;
+      this.time.delayedCall(180, () => this.events.emit('show-operations-briefing'));
+    }
   }
 
   private startArtilleryBombardment(): void {
@@ -1001,8 +1213,8 @@ private startParatrooperDrop(): void {
     });
 
     // Create planes
-    const redPlane = this.createPlane(-100, 80, true); // Flying right
-    const bluePlane = this.createPlane(this.worldWidth + 100, 120, false); // Flying left
+    const redPlane = this.createPlane(-100, 80, true, this.factionMatchup.red); // Flying right
+    const bluePlane = this.createPlane(this.worldWidth + 100, 120, false, this.factionMatchup.blue); // Flying left
 
     // Calculate drop timing based on plane speed and target positions
     const planeDuration = 5000;
@@ -1047,19 +1259,33 @@ private startParatrooperDrop(): void {
         if (plan.spawned) return; // Already placed by a skip
         plan.spawned = true;
         const planeY = isRed ? redPlane.y : bluePlane.y;
-        this.dropParatrooper(plan.x, planeY + 20, plan.team, plan.name, plan.index, plan.weaponId);
+        this.dropParatrooper(
+          plan.x,
+          planeY + 20,
+          plan.team,
+          plan.factionId,
+          plan.name,
+          plan.index,
+          plan.weaponId,
+        );
       });
     });
   }
 
-  private createPlane(x: number, y: number, facingRight: boolean): Phaser.GameObjects.Container {
+  private createPlane(
+    x: number,
+    y: number,
+    facingRight: boolean,
+    factionId: FactionId,
+  ): Phaser.GameObjects.Container {
     const plane = this.add.container(x, y);
     plane.setDepth(100);
     
     const graphics = this.add.graphics();
+    const faction = getFaction(factionId);
     
-    // Plane body (simple silhouette)
-    graphics.fillStyle(0x333333, 1);
+    // Faction-toned transport silhouette with a bright team recognition stripe.
+    graphics.fillStyle(faction.palette.helmetDark, 1);
     
     if (facingRight) {
       // Fuselage
@@ -1082,12 +1308,26 @@ private startParatrooperDrop(): void {
       graphics.fillStyle(0x6699cc, 1);
       graphics.fillRect(-35, -6, 15, 12);
     }
+
+    const stripeColor = factionId === this.factionMatchup.red ? 0xbd4a43 : 0x4779b8;
+    graphics.fillStyle(stripeColor, 1);
+    graphics.fillRect(facingRight ? -34 : 28, -8, 6, 16);
     
-    plane.add(graphics);
+    const marking = this.add.image(facingRight ? 7 : -7, 0, `faction-emblem-${factionId}`);
+    marking.setDisplaySize(14, 14);
+    plane.add([graphics, marking]);
     return plane;
   }
 
-  private dropParatrooper(dropX: number, startY: number, team: Team, name: string, squadIndex: number, weaponTypeId: string): void {
+  private dropParatrooper(
+    dropX: number,
+    startY: number,
+    team: Team,
+    factionId: FactionId,
+    name: string,
+    squadIndex: number,
+    weaponTypeId: string,
+  ): void {
     // Calculate landing position FIRST (where the terrain surface is)
     const landingY = this.terrain.getSurfaceY(dropX) - 15;
     
@@ -1095,7 +1335,17 @@ private startParatrooperDrop(): void {
     const weaponType = weaponTypeId as WeaponType;
     
     // Create the soldier with gravity DISABLED from the start
-    const soldier = new Soldier(this, dropX, startY, team, name, squadIndex, true, weaponType);
+    const soldier = new Soldier(
+      this,
+      dropX,
+      startY,
+      team,
+      name,
+      squadIndex,
+      true,
+      weaponType,
+      factionId,
+    );
     this.soldiers.push(soldier);
     
     // Get body reference (gravity already disabled in constructor)
@@ -1110,12 +1360,18 @@ private startParatrooperDrop(): void {
     const chuteGraphics = this.add.graphics();
     
     // Parachute canopy (semi-circle)
-    const chuteColor = team === Team.RED ? 0xff6666 : 0x6699ff;
+    const faction = getFaction(factionId);
+    const chuteColor = faction.palette.uniformLight;
     chuteGraphics.fillStyle(chuteColor, 0.8);
     chuteGraphics.beginPath();
     chuteGraphics.arc(0, 0, 25, Math.PI, 0, false);
     chuteGraphics.closePath();
     chuteGraphics.fillPath();
+
+    chuteGraphics.lineStyle(3, team === Team.RED ? 0xbd4a43 : 0x4779b8, 0.95);
+    chuteGraphics.beginPath();
+    chuteGraphics.arc(0, 0, 23, Math.PI, 0, false);
+    chuteGraphics.strokePath();
     
     // Parachute lines
     chuteGraphics.lineStyle(1, 0x444444, 1);
@@ -1198,6 +1454,36 @@ private startParatrooperDrop(): void {
   private createStarryBackground(): void {
     this.backgroundGraphics = this.add.graphics();
     this.backgroundGraphics.setDepth(-10);
+
+    // Layered sky and distant ridgelines add depth without competing with gameplay silhouettes.
+    this.backgroundGraphics.fillStyle(0x09111f, 1);
+    this.backgroundGraphics.fillRect(0, 0, this.worldWidth, this.worldHeight);
+    this.backgroundGraphics.fillStyle(0x13243a, 1);
+    this.backgroundGraphics.fillRect(0, 260, this.worldWidth, 210);
+
+    this.backgroundGraphics.fillStyle(0x101a28, 1);
+    this.backgroundGraphics.beginPath();
+    this.backgroundGraphics.moveTo(0, 440);
+    for (let x = 0; x <= this.worldWidth; x += 90) {
+      const y = 365 + Math.sin(x * 0.006) * 34 + Math.sin(x * 0.017) * 18;
+      this.backgroundGraphics.lineTo(x, y);
+    }
+    this.backgroundGraphics.lineTo(this.worldWidth, 520);
+    this.backgroundGraphics.lineTo(0, 520);
+    this.backgroundGraphics.closePath();
+    this.backgroundGraphics.fillPath();
+
+    this.backgroundGraphics.fillStyle(0x0b131d, 1);
+    this.backgroundGraphics.beginPath();
+    this.backgroundGraphics.moveTo(0, 500);
+    for (let x = 0; x <= this.worldWidth; x += 70) {
+      const y = 415 + Math.sin(x * 0.009 + 1.6) * 28 + Math.sin(x * 0.025) * 12;
+      this.backgroundGraphics.lineTo(x, y);
+    }
+    this.backgroundGraphics.lineTo(this.worldWidth, 540);
+    this.backgroundGraphics.lineTo(0, 540);
+    this.backgroundGraphics.closePath();
+    this.backgroundGraphics.fillPath();
     
     // Draw stars across entire world width
     for (let i = 0; i < 300; i++) {
@@ -1224,13 +1510,308 @@ private startParatrooperDrop(): void {
     }
   }
 
+  private createRelayObjectives(): void {
+    this.destroyRelayObjectives();
+
+    const positions = [0.32, 0.50, 0.68];
+    positions.forEach((ratio, index) => {
+      const x = Math.round(this.worldWidth * ratio);
+      const y = this.terrain.getSurfaceY(x) - 4;
+      const container = this.add.container(x, y);
+      container.setDepth(35);
+
+      const graphics = this.add.graphics();
+      const label = this.add.text(0, -72, `RELAY ${index + 1}`, {
+        font: 'bold 10px Arial',
+        color: '#e9edf3',
+        stroke: '#000000',
+        strokeThickness: 3,
+      });
+      label.setOrigin(0.5);
+      container.add([graphics, label]);
+
+      const relay: RelayObjective = {
+        id: index + 1,
+        x,
+        y,
+        owner: 'neutral',
+        container,
+        graphics,
+        label,
+        highlight: 'none',
+      };
+      this.relayObjectives.push(relay);
+      this.redrawRelayObjective(relay);
+
+      this.tweens.add({
+        targets: label,
+        alpha: { from: 0.7, to: 1 },
+        duration: 900 + index * 140,
+        yoyo: true,
+        repeat: -1,
+        ease: 'Sine.easeInOut',
+      });
+    });
+  }
+
+  private redrawRelayObjective(relay: RelayObjective): void {
+    const color = relay.owner === Team.RED
+      ? 0xff5544
+      : relay.owner === Team.BLUE
+        ? 0x5599ff
+        : 0xd7c98b;
+    const g = relay.graphics;
+    g.clear();
+
+    const ringColor = relay.highlight === 'contested'
+      ? 0xffcc55
+      : relay.highlight === 'ready'
+        ? 0xffffff
+        : color;
+    const ringAlpha = relay.highlight === 'none' ? 0.55 : 0.95;
+    g.lineStyle(relay.highlight === 'none' ? 2 : 3, ringColor, ringAlpha);
+    for (let segment = 0; segment < 18; segment++) {
+      const start = (segment / 18) * Math.PI * 2;
+      const end = start + Math.PI * 0.075;
+      g.lineBetween(
+        Math.cos(start) * RELAY_CAPTURE_RADIUS,
+        -8 + Math.sin(start) * RELAY_CAPTURE_RADIUS,
+        Math.cos(end) * RELAY_CAPTURE_RADIUS,
+        -8 + Math.sin(end) * RELAY_CAPTURE_RADIUS,
+      );
+    }
+
+    g.fillStyle(0x111820, 0.88);
+    g.fillRect(-18, -9, 36, 9);
+    g.lineStyle(3, 0x253442, 1);
+    g.lineBetween(0, -10, 0, -58);
+    g.lineStyle(2, color, 1);
+    g.lineBetween(-12, -44, 0, -58);
+    g.lineBetween(12, -44, 0, -58);
+    g.lineBetween(-9, -33, 9, -33);
+    g.fillStyle(color, 1);
+    g.fillTriangle(0, -58, 23, -51, 0, -44);
+    g.fillStyle(0xffffff, 0.75);
+    g.fillCircle(0, -58, 3);
+
+    const ownerLabel = relay.owner === Team.RED
+      ? 'RED CONTROL'
+      : relay.owner === Team.BLUE
+        ? 'BLUE CONTROL'
+        : 'NEUTRAL';
+    const stateLabel = relay.highlight === 'contested'
+      ? 'CONTESTED'
+      : relay.highlight === 'ready'
+        ? 'CAPTURE READY'
+        : relay.highlight === 'secured'
+          ? 'SECURED'
+          : ownerLabel;
+    relay.label.setText(`RELAY ${relay.id} - ${stateLabel}`);
+    relay.label.setColor(relay.highlight === 'contested'
+      ? '#ffcc55'
+      : relay.owner === 'neutral'
+        ? '#e9edf3'
+        : `#${color.toString(16).padStart(6, '0')}`);
+  }
+
+  private updateRelayPositions(): void {
+    if (this.gameMode !== 'expanded') return;
+    for (const relay of this.relayObjectives) {
+      const nextY = this.terrain.getSurfaceY(relay.x) - 4;
+      if (Math.abs(nextY - relay.y) > 0.5) {
+        relay.y = nextY;
+        relay.container.y = nextY;
+      }
+    }
+  }
+
+  private updateRelayAwareness(): void {
+    if (this.gameMode !== 'expanded' || !this.currentSoldier || !this.currentSoldier.isAlive()) {
+      for (const relay of this.relayObjectives) {
+        if (relay.highlight !== 'none') {
+          relay.highlight = 'none';
+          this.redrawRelayObjective(relay);
+        }
+      }
+      this.emitRelayContext('');
+      return;
+    }
+
+    const soldier = this.currentSoldier;
+    const opponents = this.soldiers.filter(candidate =>
+      candidate.isAlive() && candidate.team !== soldier.team
+    );
+    let context = '';
+    let nearest: { relay: RelayObjective; distance: number } | null = null;
+
+    for (const relay of this.relayObjectives) {
+      const distance = Phaser.Math.Distance.Between(soldier.x, soldier.y, relay.x, relay.y);
+      if (!nearest || distance < nearest.distance) nearest = { relay, distance };
+
+      let highlight: RelayObjective['highlight'] = 'none';
+      if (distance <= RELAY_CAPTURE_RADIUS) {
+        const enemyPresent = opponents.some(opponent =>
+          Phaser.Math.Distance.Between(opponent.x, opponent.y, relay.x, relay.y) <= RELAY_CAPTURE_RADIUS
+        );
+        if (enemyPresent) {
+          highlight = 'contested';
+          context = `RELAY ${relay.id}: CONTESTED | CLEAR THE RING`;
+        } else if (relay.owner === soldier.team) {
+          highlight = 'secured';
+          context = `RELAY ${relay.id}: SECURED | HOLD FOR ROUND SCORE`;
+        } else {
+          highlight = 'ready';
+          context = `RELAY ${relay.id}: CAPTURE READY | END TURN IN RING`;
+        }
+      }
+
+      if (relay.highlight !== highlight) {
+        relay.highlight = highlight;
+        this.redrawRelayObjective(relay);
+      }
+    }
+
+    if (!context && nearest && nearest.distance <= RELAY_CAPTURE_RADIUS + 140) {
+      context = `RELAY ${nearest.relay.id}: NEARBY | ENTER DASHED RING`;
+    }
+    this.emitRelayContext(context);
+  }
+
+  private emitRelayContext(message: string): void {
+    if (message === this.lastRelayContext) return;
+    this.lastRelayContext = message;
+    this.events.emit('context-update', message);
+  }
+
+  private destroyRelayObjectives(): void {
+    this.relayObjectives.forEach(relay => {
+      this.tweens.killTweensOf(relay.label);
+      relay.container.destroy(true);
+    });
+    this.relayObjectives = [];
+  }
+
+  private processRelayCaptures(): Team | null {
+    if (this.gameMode !== 'expanded') return null;
+
+    for (const relay of this.relayObjectives) {
+      const redSoldiers = this.soldiers.filter(s => s.isAlive() && s.team === Team.RED);
+      const blueSoldiers = this.soldiers.filter(s => s.isAlive() && s.team === Team.BLUE);
+      const redDistances = redSoldiers.map(s => Phaser.Math.Distance.Between(s.x, s.y, relay.x, relay.y));
+      const blueDistances = blueSoldiers.map(s => Phaser.Math.Distance.Between(s.x, s.y, relay.x, relay.y));
+      const control = resolveRelayControl(redDistances, blueDistances);
+
+      if (control === 'neutral' || control === 'contested' || control === relay.owner) continue;
+
+      relay.owner = control;
+      const team = control === 'red' ? Team.RED : Team.BLUE;
+      this.operationScore[team]++;
+      this.redrawRelayObjective(relay);
+      this.updateBattleMusicPhase();
+
+      const nearby = (team === Team.RED ? redSoldiers : blueSoldiers)
+        .filter(s => Phaser.Math.Distance.Between(s.x, s.y, relay.x, relay.y) <= RELAY_CAPTURE_RADIUS)
+        .sort((a, b) =>
+          Phaser.Math.Distance.Between(a.x, a.y, relay.x, relay.y) -
+          Phaser.Math.Distance.Between(b.x, b.y, relay.x, relay.y)
+        );
+      nearby[0]?.sayQuip('objective');
+      nearby[0]?.playActionAnimation('celebrate', nearby[0].sprite.flipX ? -1 : 1);
+
+      const teamName = team === Team.RED ? 'RED' : 'BLUE';
+      this.showWorldBanner(`${teamName} TOOK RELAY ${relay.id}`, '+1 capture | Held relays score each round');
+      SoundManager.playObjectiveStinger(team === Team.RED ? 'red' : 'blue');
+      SoundManager.pulseMusicIntensity(1, 1.8);
+      this.emitOperationStatus();
+    }
+
+    return this.getOperationWinner();
+  }
+
+  private awardRelayIncome(roundNumber: number): Team | null {
+    if (this.gameMode !== 'expanded' || roundNumber <= this.lastRelayIncomeRound) return null;
+    this.lastRelayIncomeRound = roundNumber;
+
+    const redHeld = this.relayObjectives.filter(relay => relay.owner === Team.RED).length;
+    const blueHeld = this.relayObjectives.filter(relay => relay.owner === Team.BLUE).length;
+    this.operationScore[Team.RED] += redHeld;
+    this.operationScore[Team.BLUE] += blueHeld;
+    this.updateBattleMusicPhase();
+
+    if (redHeld + blueHeld > 0) {
+      this.showWorldBanner('RELAY SIGNALS SCORED', `Red +${redHeld}   Blue +${blueHeld}`);
+      SoundManager.pulseMusicIntensity(0.78, 1.2);
+    }
+    this.emitOperationStatus();
+    return this.getOperationWinner();
+  }
+
+  private getOperationWinner(): Team | null {
+    const red = this.operationScore[Team.RED];
+    const blue = this.operationScore[Team.BLUE];
+    if (red >= OPERATION_SCORE_TO_WIN && blue >= OPERATION_SCORE_TO_WIN) {
+      if (red === blue) return null;
+      return red > blue ? Team.RED : Team.BLUE;
+    }
+    if (red >= OPERATION_SCORE_TO_WIN) return Team.RED;
+    if (blue >= OPERATION_SCORE_TO_WIN) return Team.BLUE;
+    return null;
+  }
+
+  private emitOperationStatus(): void {
+    this.events.emit('objectives-update', {
+      mode: this.gameMode,
+      redScore: this.operationScore[Team.RED],
+      blueScore: this.operationScore[Team.BLUE],
+      targetScore: OPERATION_SCORE_TO_WIN,
+      owners: this.relayObjectives.map(relay => relay.owner),
+    });
+  }
+
+  private updateBattleMusicPhase(): void {
+    if (!this.turnManager) return;
+    const info = this.turnManager.getTurnInfo();
+    const totalAlive = info.redTeamAlive + info.blueTeamAlive;
+    const leadingScore = Math.max(this.operationScore[Team.RED], this.operationScore[Team.BLUE]);
+
+    if (info.roundNumber >= 5 || totalAlive <= 4 || leadingScore >= 5) {
+      SoundManager.setBattleMusicPhase('finale');
+    } else if (info.roundNumber >= 3 || totalAlive <= 7 || leadingScore >= 2) {
+      SoundManager.setBattleMusicPhase('pressure');
+    } else {
+      SoundManager.setBattleMusicPhase('maneuver');
+    }
+  }
+
   private showBattlefieldOverview(): void {
-    // Zoom out to show entire battlefield and bombardment + paratrooper drop
+    // Fill the viewport and sweep across the battlefield. Fitting the entire map width
+    // made Medium and Large maps occupy only the upper half of the screen.
     const viewW = this.cameras.main.width || 1280;
-    const zoomToFitWidth = viewW / this.worldWidth;
-    this.cameras.main.setZoom(Math.min(0.6, Math.max(0.35, zoomToFitWidth)));
-    this.cameras.main.centerOn(this.worldWidth / 2, this.worldHeight / 2);
+    const viewH = this.cameras.main.height || 720;
+    const frame = getBattlefieldRevealFrame(
+      viewW,
+      viewH,
+      this.worldWidth,
+      this.worldHeight,
+    );
+    this.stopIntroCameraMove();
     this.cameras.main.stopFollow();
+    this.cameras.main.setZoom(frame.zoom);
+    this.cameras.main.centerOn(frame.startCenterX, frame.centerY);
+    this.cameras.main.fadeIn(260, 4, 8, 12);
+
+    const targetScrollX = frame.endCenterX - viewW / (2 * frame.zoom);
+    const targetScrollY = frame.centerY - viewH / (2 * frame.zoom);
+    this.introCameraTween = this.tweens.add({
+      targets: this.cameras.main,
+      scrollX: targetScrollX,
+      scrollY: targetScrollY,
+      duration: 10500,
+      ease: 'Sine.easeInOut',
+      onComplete: () => {
+        this.introCameraTween = null;
+      },
+    });
 
     // Normally the intro hands over control as soon as everyone has landed
     // (see maybeFinishIntro). This is only a safety net so a lost callback
@@ -1240,6 +1821,12 @@ private startParatrooperDrop(): void {
       if (token !== this.introToken) return;
       this.transitionFromIntro();
     });
+  }
+
+  private stopIntroCameraMove(): void {
+    if (!this.introCameraTween) return;
+    this.introCameraTween.stop();
+    this.introCameraTween = null;
   }
 
   private startCharacterSelection(): void {
@@ -1332,7 +1919,7 @@ private startParatrooperDrop(): void {
     
     this.tweens.add({
       targets: this.cameras.main,
-      zoom: 0.8,
+      zoom: 1,
       duration: 500,
       ease: 'Power2',
     });
@@ -1367,7 +1954,7 @@ private startParatrooperDrop(): void {
     this.selectionIndicator.strokeCircle(selectedSoldier.x, selectedSoldier.y, 25);
     
     // Show selection prompt text
-    this.selectionText.setText('▶ ENTER/SPACE TO SELECT ◀');
+    this.selectionText.setText('< ENTER/SPACE TO SELECT >');
     this.selectionText.setPosition(selectedSoldier.x, selectedSoldier.y - 80);
     this.selectionText.setVisible(true);
   }
@@ -1484,7 +2071,11 @@ private startParatrooperDrop(): void {
 
     this.hasFired = false;
     this.isTurnEnding = false; // Reset turn ending flag
-    this.isSpecialArmed = false;
+    this.tunnelsUsedThisTurn = 0;
+    this.isTunnelActionInProgress = false;
+    this.isCoverActionInProgress = false;
+    this.coverUsedThisTurn = false;
+    this.isCrateWeaponArmed = false;
     this.turnActor = this.currentSoldier;
     this.turnStats = emptyShotStats();
     this.turnActorAttacked = false;
@@ -1509,11 +2100,11 @@ private startParatrooperDrop(): void {
       const baseMovement = Math.floor(BASE_MOVEMENT_DISTANCE / weight);
       const bonusMovement = Math.floor(BASE_MOVEMENT_DISTANCE * mobilityBonus);
       const movementFloor = this.getCloseRangeMovementFloor(this.currentSoldier.getWeaponType());
-      this.maxMovement = Math.max(baseMovement + bonusMovement, movementFloor);
+      this.maxMovement = Math.floor(Math.max(baseMovement + bonusMovement, movementFloor) * this.currentSoldier.getMovementAllowanceMultiplier());
       // Veterans move further.
       this.maxMovement = Math.round(this.maxMovement * (1 + this.currentSoldier.getRank().movementBonus));
       this.movementUsed = 0;
-      this.startX = this.currentSoldier.x;
+      this.lastMovementX = this.currentSoldier.x;
       this.currentSoldier.setMoveSpeed(this.getSoldierMoveSpeed(this.currentSoldier.getWeaponType()));
       
       // Zoom in and pan to current soldier
@@ -1534,9 +2125,7 @@ private startParatrooperDrop(): void {
 
     // Reset aiming
     this.aimAngle = -45;
-    this.mouseAimTargetAngle = null;
     this.power = 50;
-    this.powerChargeDirection = 1;
     this.isCharging = false;
     this.isMouseCharging = false;
 
@@ -1546,6 +2135,9 @@ private startParatrooperDrop(): void {
       maxMovement: this.maxMovement,
       movementUsed: this.movementUsed,
     });
+    this.emitPowerupStatus();
+    this.updateBattleMusicPhase();
+    SoundManager.settleBattleMusic();
 
     // Queue AI action if this unit is AI-controlled.
     this.queueAITurnIfNeeded();
@@ -1553,6 +2145,7 @@ private startParatrooperDrop(): void {
 
   update(_time: number, delta: number): void {
     const dt = Math.min(50, Math.max(0, delta)) / 1000;
+    this.battlefieldSky.update(dt);
     // Handle new game key
     if (Phaser.Input.Keyboard.JustDown(this.nKey)) {
       this.newGame();
@@ -1583,7 +2176,7 @@ private startParatrooperDrop(): void {
     this.soldiers.forEach(soldier => {
       if (soldier.isAlive()) {
         soldier.update(dt, this.terrain);
-        const grounded = this.terrain.checkCollision(soldier.sprite);
+        const grounded = soldier.isCurrentlyGrappling() ? false : this.terrain.checkCollision(soldier.sprite);
         soldier.setGrounded(grounded);
         this.checkOutOfBounds(soldier);
       }
@@ -1594,21 +2187,68 @@ private startParatrooperDrop(): void {
 
     // Barrels settle/fall with the terrain; mines check for anyone stepping close.
     this.hazards.update(dt, this.soldiers, this.worldHeight);
+    this.updateRelayPositions();
+    this.updateRelayAwareness();
 
     // Handle character selection mode
     if (this.isSelectingCharacter) {
       this.handleCharacterSelection();
-      this.emitAbilityStatus(null, null);
       return;
     }
 
-    if (!this.currentSoldier || !this.currentSoldier.isAlive()) {
+    // SPACE after firing detonates a walking Kamikaze Goat early.
+    if (this.hasFired && this.currentSoldier && !this.isTeamAI(this.currentSoldier.team) &&
+        Phaser.Input.Keyboard.JustDown(this.spaceKey)) {
+      this.events.emit('special-detonate');
+    }
+
+    if (
+      !this.currentSoldier ||
+      !this.currentSoldier.isAlive() ||
+      this.hasFired ||
+      this.isShotResolving()
+    ) {
+      this.emitAbilityStatus(null);
       return;
     }
+
+    // Account for both human and AI locomotion before either input path returns.
+    const distanceMoved = Math.abs(this.currentSoldier.x - this.lastMovementX);
+    this.movementUsed = Math.min(this.maxMovement, this.movementUsed + distanceMoved);
+    this.lastMovementX = this.currentSoldier.x;
+    const canMove = this.movementUsed < this.maxMovement;
 
     // During AI turns, player input is ignored. The AI runs via timers.
     if (this.isTeamAI(this.currentSoldier.team)) {
-      this.emitAbilityStatus(null, null);
+      this.emitAbilityStatus(null);
+      return;
+    }
+
+    // Keep the tunnel / cover / heal availability line current.
+    this.emitAbilityStatus(this.getAbilityStatuses());
+
+    if (this.specialTool) {
+      this.currentSoldier.stopMoving();
+      if (Phaser.Input.Keyboard.JustDown(this.escKey)) { this.cancelSpecial(); return; }
+      const adjust = (this.sKey.isDown ? 1 : 0) - (this.wKey.isDown ? 1 : 0);
+      if (adjust) {
+        const distance = Math.min(400, Math.hypot(this.specialTarget.x - this.currentSoldier.x, this.specialTarget.y - this.currentSoldier.y));
+        this.aimAngle = wrapDeg(this.aimAngle + adjust * 55 * dt);
+        const angle = Phaser.Math.DegToRad(this.aimAngle);
+        this.specialTarget = { x: this.currentSoldier.x + Math.cos(angle) * distance, y: this.currentSoldier.y + Math.sin(angle) * distance };
+      }
+      if (Phaser.Input.Keyboard.JustDown(this.enterKey) ||
+          Phaser.Input.Keyboard.JustDown(this.gKey) || Phaser.Input.Keyboard.JustDown(this.bKey)) {
+        this.confirmSpecial();
+        return;
+      }
+      this.drawSpecialPreview();
+      return;
+    }
+
+    if (this.isTunnelActionInProgress || this.isCoverActionInProgress) {
+      this.currentSoldier.stopMoving();
+      this.drawAimLine();
       return;
     }
 
@@ -1622,18 +2262,19 @@ private startParatrooperDrop(): void {
         this.exitHowitzerMode();
         return;
       }
-      if (this.isSpecialArmed) {
-        this.isSpecialArmed = false;
+      if (this.isCrateWeaponArmed) {
+        this.isCrateWeaponArmed = false;
+        this.emitPowerupStatus();
         return;
       }
       this.deselectSoldier();
       return;
     }
 
-    // Calculate remaining movement
-    const distanceMoved = Math.abs(this.currentSoldier.x - this.startX);
-    this.movementUsed = distanceMoved;
-    const canMove = this.movementUsed < this.maxMovement;
+    // Q arms / puts away the crate weapon.
+    if (Phaser.Input.Keyboard.JustDown(this.qKey)) {
+      this.toggleCrateWeapon();
+    }
 
     // A/D to pan camera for scouting (releases follow)
     if (!this.isShotResolving()) {
@@ -1668,7 +2309,6 @@ private startParatrooperDrop(): void {
 
       this.currentSoldier.stopMoving();
       this.updateAirstrikeMarker();
-      this.emitAbilityStatus(this.getCurrentDigInStatus(), this.getCurrentHealStatus());
 
       // Keep UI updated.
       this.events.emit('movement-update', {
@@ -1712,74 +2352,48 @@ private startParatrooperDrop(): void {
       this.currentSoldier.jump();
     }
 
-    // Handle aiming (W/S keys - completely independent from movement)
-    // Allow full 360 degree aiming
-    if (this.wKey.isDown) {
-      this.lastAimInput = 'keys';
-      this.aimAngle -= 1.5;
-      if (this.aimAngle < -180) this.aimAngle += 360;
-    }
-    if (this.sKey.isDown) {
-      this.lastAimInput = 'keys';
-      this.aimAngle += 1.5;
-      if (this.aimAngle > 180) this.aimAngle -= 360;
-    }
-
-    // If the mouse was the last aim input, keep the aim target in sync with the pointer —
-    // but NOT while the player is panning the camera (A/D or drag). Panning used to drag
-    // the aim with the scrolling world, making shots impossible to line up.
-    if (this.lastAimInput === 'mouse' && !this.isDraggingCamera && !this.isPanningCamera && !this.isAirstrikeTargeting) {
-      const pointer = this.input.activePointer;
-      if (pointer) {
-        const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
-        const origin = this.getAimOrigin();
-        if (!origin) return;
-        const dx = worldPoint.x - origin.x;
-        const dy = worldPoint.y - origin.y;
-        if (Math.hypot(dx, dy) >= MOUSE_AIM_DEADZONE_PX) {
-          this.mouseAimTargetAngle = Phaser.Math.RadToDeg(Math.atan2(dy, dx));
-        }
-      }
-    }
-
-    // Rotate the aim toward the mouse target at a capped speed instead of snapping.
-    // Small corrections land instantly; big pointer swings sweep over deliberately.
-    if (this.lastAimInput === 'mouse' && this.mouseAimTargetAngle !== null) {
-      const maxStep = MOUSE_AIM_TURN_SPEED_DEG_PER_SEC * dt;
-      const diff = wrapDeg(this.mouseAimTargetAngle - this.aimAngle);
-      if (Math.abs(diff) <= maxStep) {
-        this.aimAngle = this.mouseAimTargetAngle;
-      } else {
-        this.aimAngle = wrapDeg(this.aimAngle + Math.sign(diff) * maxStep);
-      }
+    // W/S rotates the local sight. Holding Shift enables deliberate fine adjustment.
+    const aimDirection = Number(this.sKey.isDown) - Number(this.wKey.isDown);
+    if (aimDirection !== 0) {
+      const aimSpeed = this.shiftKey.isDown
+        ? FINE_AIM_SPEED_DEG_PER_SEC
+        : KEYBOARD_AIM_SPEED_DEG_PER_SEC;
+      this.aimAngle = wrapDeg(this.aimAngle + aimDirection * aimSpeed * dt);
     }
 
     // Keep any placed weapon visuals in sync with the current aim.
     this.updateHowitzerVisual();
 
-    // Handle power adjustment (hold space to charge, release to fire)
-    // Only start charging if not currently grappling
-    if (this.spaceKey.isDown && !this.hasFired && !this.currentSoldier.isCurrentlyGrappling()) {
-      if (!this.isCharging) {
-        this.isCharging = true;
-        this.power = POWER_MIN; // Start at minimum power
-        this.powerChargeDirection = 1;
-        this.keyboardChargeTurnId = this.turnId;
-        this.keyboardChargeSoldier = this.currentSoldier;
-      }
+    // A charge must begin with a fresh gameplay keydown. This prevents the Space
+    // used to select a soldier or skip the intro from firing when it is released.
+    const keyboardChargeIntent = resolveKeyboardChargeInput({
+      wasCharging: this.isCharging,
+      keyIsDown: this.spaceKey.isDown,
+      keyJustDown: Phaser.Input.Keyboard.JustDown(this.spaceKey),
+      keyJustUp: Phaser.Input.Keyboard.JustUp(this.spaceKey),
+      canCharge: !this.hasFired && !this.currentSoldier.isCurrentlyGrappling(),
+      contextMatches:
+        this.keyboardChargeTurnId === this.turnId &&
+        this.keyboardChargeSoldier === this.currentSoldier,
+    });
+
+    if (keyboardChargeIntent.startCharge) {
+      this.power = POWER_MIN;
+      this.keyboardChargeTurnId = this.turnId;
+      this.keyboardChargeSoldier = this.currentSoldier;
+    }
+    if (keyboardChargeIntent.continueCharge) {
       this.updateChargePower(dt);
     }
 
-    // Only fire on space release if we were actually charging (not from grapple)
-    if (this.isCharging && Phaser.Input.Keyboard.JustUp(this.spaceKey) && !this.currentSoldier.isCurrentlyGrappling()) {
-      const sameTurn = this.keyboardChargeTurnId === this.turnId;
-      const sameSoldier = this.keyboardChargeSoldier === this.currentSoldier;
+    this.isCharging = keyboardChargeIntent.nextCharging;
+    if (keyboardChargeIntent.fireOnRelease) {
       this.keyboardChargeTurnId = 0;
       this.keyboardChargeSoldier = null;
-      if (sameTurn && sameSoldier) {
-        this.fireProjectile();
-      }
-      this.isCharging = false;
+      this.fireProjectile();
+    } else if (!this.isCharging) {
+      this.keyboardChargeTurnId = 0;
+      this.keyboardChargeSoldier = null;
     }
     
     // Handle mouse charging (left mouse button held) - also check not grappling
@@ -1792,44 +2406,10 @@ private startParatrooperDrop(): void {
       this.endTurn();
     }
 
-// Handle grappling hook (G key) - completely separate from firing
-    // Only allow if: not fired, not charging, not already grappling
-    if (Phaser.Input.Keyboard.JustDown(this.gKey) && 
-        !this.hasFired && 
-        !this.isCharging && 
-        !this.isMouseCharging &&
-        !this.isHowitzerMode &&
-        !this.currentSoldier.isCurrentlyGrappling()) {
-      // Use aim angle and power to determine grapple target
-      const angleRad = Phaser.Math.DegToRad(this.aimAngle);
-      const grappleDistance = 150 + this.power * 2.5; // 150-400 range (increased)
-      const targetX = this.currentSoldier.x + Math.cos(angleRad) * grappleDistance;
-      const targetY = this.currentSoldier.y + Math.sin(angleRad) * grappleDistance;
-      
-      // Check for Shift+G (jetpack mode - no terrain required)
-      const isJetpackMode = this.shiftKey.isDown;
-      
-      // Try to grapple - jetpack mode doesn't require terrain
-      if (this.currentSoldier.startGrapple(targetX, targetY, this.terrain, !isJetpackMode)) {
-        this.movementUsed = this.maxMovement; // Uses all movement
-      }
-    }
-
-    // Shift+G for jetpack mode (separate check for just Shift+G without regular G trigger)
-    if (Phaser.Input.Keyboard.JustDown(this.gKey) && this.shiftKey.isDown &&
-        !this.hasFired && 
-        !this.isCharging && 
-        !this.isMouseCharging &&
-        !this.isHowitzerMode &&
-        !this.currentSoldier.isCurrentlyGrappling()) {
-      const angleRad = Phaser.Math.DegToRad(this.aimAngle);
-      const grappleDistance = 150 + this.power * 2.5;
-      const targetX = this.currentSoldier.x + Math.cos(angleRad) * grappleDistance;
-      const targetY = this.currentSoldier.y + Math.sin(angleRad) * grappleDistance;
-      
-      if (this.currentSoldier.startGrapple(targetX, targetY, this.terrain, false)) {
-        this.movementUsed = this.maxMovement;
-      }
+    if (Phaser.Input.Keyboard.JustDown(this.gKey) && !this.hasFired && !this.isCharging &&
+        !this.isMouseCharging && !this.isHowitzerMode && !this.currentSoldier.isCurrentlyGrappling()) {
+      this.beginSpecial(this.shiftKey.isDown ? 'jetpack' : 'grapple');
+      return;
     }
 
     // Abilities (consume the turn action; only when not fired/charging/grappling)
@@ -1842,30 +2422,17 @@ private startParatrooperDrop(): void {
         this.enterAirstrikeTargeting();
       } else if (Phaser.Input.Keyboard.JustDown(this.cKey)) {
         this.enterHowitzerMode();
+      } else if (Phaser.Input.Keyboard.JustDown(this.bKey)) {
+        const tool: SpecialTool = this.gameMode === 'expanded' && !this.shiftKey.isDown ? 'dig' : 'cover';
+        const status = tool === 'dig' ? this.getTunnelStatusNow() : this.getCoverStatusNow();
+        if (status.ready) this.beginSpecial(tool);
+        else this.showAbilityBlocked(`Can't ${tool === 'dig' ? 'dig' : 'build cover'}: ${status.reason}`);
+      } else if (Phaser.Input.Keyboard.JustDown(this.hKey)) {
+        const status = this.getHealStatusNow();
+        if (status.ready) this.tryMedicHeal();
+        else this.showAbilityBlocked(`Can't heal: ${status.reason}`);
       }
     }
-
-    // Q arms/disarms the special weapon picked up from a crate.
-    if (Phaser.Input.Keyboard.JustDown(this.qKey)) {
-      this.toggleSpecialWeapon();
-    }
-
-    // SPACE after firing detonates a walking goat early.
-    if (this.hasFired && Phaser.Input.Keyboard.JustDown(this.spaceKey)) {
-      this.events.emit('special-detonate');
-    }
-
-    // Dig In / Heal: always check the key so a blocked press explains why instead of silently doing nothing.
-    const digStatus = this.getCurrentDigInStatus();
-    const healStatus = this.getCurrentHealStatus();
-    if (Phaser.Input.Keyboard.JustDown(this.bKey)) {
-      if (digStatus.ready) this.tryDigIn();
-      else this.showAbilityBlocked(`Can't dig in: ${digStatus.reason}`);
-    } else if (Phaser.Input.Keyboard.JustDown(this.hKey)) {
-      if (healStatus.ready) this.tryMedicHeal();
-      else this.showAbilityBlocked(`Can't heal: ${healStatus.reason}`);
-    }
-    this.emitAbilityStatus(digStatus, healStatus);
 
     // Update aim line
     this.drawAimLine();
@@ -1887,9 +2454,7 @@ private startParatrooperDrop(): void {
     // Check if soldier is out of bounds
     if (y > this.worldHeight + margin || x < -margin || x > this.worldWidth + margin) {
       // Soldier fell off the map - instant death!
-      const wasAlive = soldier.isAlive();
       soldier.fallToDeath();
-      if (wasAlive) this.onSoldierKilled(soldier);
       
       // Create dramatic falling death effect
       this.createFallDeathEffect(x, Math.min(y, this.worldHeight));
@@ -1987,6 +2552,8 @@ private startParatrooperDrop(): void {
         name: soldier.name,
         health: soldier.getHealth(),
         squadIndex: soldier.squadIndex,
+        factionId: soldier.getFactionId(),
+        portraitTextureKey: soldier.getPortraitTextureKey(),
       },
       weapon: {
         name: weapon.name,
@@ -2003,6 +2570,7 @@ private startParatrooperDrop(): void {
       totalCount: this.selectableSoldiers.length,
       soldierX: soldier.x,
     });
+    this.emitPowerupStatus(soldier);
   }
 
   private getAimOrigin(): { x: number; y: number } | null {
@@ -2019,21 +2587,18 @@ private startParatrooperDrop(): void {
   private getActiveWeaponConfig(): WeaponConfig | null {
     if (!this.currentSoldier) return null;
     if (this.isHowitzerMode) return HOWITZER_CONFIG;
-    const special = this.getArmedSpecial();
-    if (special?.config) return special.config;
+    const crateWeapon = this.getArmedCrateWeapon();
+    if (crateWeapon?.config) return crateWeapon.config;
     return this.currentSoldier.weapon;
   }
 
   private updateChargePower(dt: number): void {
-    const rate = this.powerChargeDirection > 0 ? POWER_CHARGE_UP_PER_SECOND : POWER_CHARGE_DOWN_PER_SECOND;
-    this.power += this.powerChargeDirection * rate * dt;
+    const previousPower = this.power;
+    this.power = advanceChargePower(this.power, dt, POWER_CHARGE_PER_SECOND, POWER_MIN, 100);
 
-    if (this.power >= 100) {
-      this.power = 100;
-      this.powerChargeDirection = -1;
-    } else if (this.power <= POWER_MIN) {
-      this.power = POWER_MIN;
-      this.powerChargeDirection = 1;
+    // Full power fires immediately, matching the committed timing of classic artillery controls.
+    if (previousPower < 100 && this.power >= 100 && !this.hasFired) {
+      this.fireProjectile();
     }
   }
 
@@ -2060,84 +2625,62 @@ private startParatrooperDrop(): void {
     const angleRad = Phaser.Math.DegToRad(this.aimAngle);
 
     // Sledgehammer: melee, so just show the swing reach.
-    const armedSpecial = this.getArmedSpecial();
-    if (armedSpecial && !armedSpecial.config) {
-      this.aimLine.lineStyle(3, armedSpecial.color, 0.8);
+    const crateWeapon = this.getArmedCrateWeapon();
+    if (crateWeapon && !crateWeapon.config) {
+      this.aimLine.lineStyle(3, crateWeapon.color, 0.8);
       this.aimLine.beginPath();
       this.aimLine.arc(startX, startY, SLEDGE_RANGE, angleRad - 1.2, angleRad + 1.2);
       this.aimLine.strokePath();
-      this.aimLine.fillStyle(armedSpecial.color, 0.15);
+      this.aimLine.fillStyle(crateWeapon.color, 0.15);
       this.aimLine.slice(startX, startY, SLEDGE_RANGE, angleRad - 1.2, angleRad + 1.2);
       this.aimLine.fillPath();
       this.aimPowerText.setVisible(false);
       return;
     }
     
-    // Get weapon config for trajectory physics
-    const speed = (this.power / 100) * weaponConfig.projectileSpeed;
-    const gravityMultiplier = weaponConfig.gravity;
-    const worldGravity = 500;
-    const effectiveGravity = worldGravity * gravityMultiplier;
-    
-    // Calculate trajectory points
-    const vx = Math.cos(angleRad) * speed;
-    const vy = Math.sin(angleRad) * speed;
-
-    // Wind bends slow ordnance. When it's windy the preview only shows the start of the arc -
-    // judging the rest is the skill.
+    const muzzle = this.isHowitzerMode ? getMuzzle(startX, startY, this.aimAngle, 34, 34) : getMuzzle(startX, startY, this.aimAngle);
+    let flight = createFlight(muzzle.x, muzzle.y, this.aimAngle, this.power, weaponConfig.projectileSpeed);
+    const trajectoryPoints: { x: number; y: number }[] = [{ x: flight.x, y: flight.y }];
+    const solid = (x: number, y: number): boolean => this.terrain.isPointSolid(x, y);
+    const radius = this.isBulletWeapon(weaponConfig.type) ? 0 : weaponConfig.projectileSize / 2;
+    const units = this.getLiveShotUnits();
+    const isFlame = weaponConfig.type === WeaponType.FLAMER;
+    // Wind bends slow ordnance. Basic keeps its full, wind-accurate solution; in Operations a windy
+    // preview only shows the start of the arc and the rest is the player's judgement.
     const windAccel = getWindAccel(this.wind, weaponConfig.type);
-    const windLimited = windAccel !== 0 && !isWindCalm(this.wind);
-    
-// Simulate trajectory with fine time steps
-    const trajectoryPoints: { x: number; y: number }[] = [];
-    const timeStep = 0.016; // ~60fps simulation
-    const maxTime = windLimited ? WIND_PREVIEW_SECONDS : 12.0; // Longer preview for long-range shots (mortar, rocket)
-    let t = 0;
-    let reachedImpact = false;
-    
-    while (t < maxTime) {
-      const px = startX + vx * t + 0.5 * windAccel * t * t;
-      const py = startY + vy * t + 0.5 * effectiveGravity * t * t;
-      
-      // Stop if out of world bounds
-      if (px < 0 || px > this.worldWidth || py > this.worldHeight) {
-        reachedImpact = true;
-        break;
-      }
-      
-      // Stop if hits terrain. Refine the collision point so the impact marker is accurate.
-      if (py > 0 && this.terrain.isPointSolid(px, py)) {
-        reachedImpact = true;
-        if (trajectoryPoints.length > 0) {
-          // Binary search between the last non-solid point and the first solid point.
-          let ax = trajectoryPoints[trajectoryPoints.length - 1].x;
-          let ay = trajectoryPoints[trajectoryPoints.length - 1].y;
-          let bx = px;
-          let by = py;
-          for (let i = 0; i < 10; i++) {
-            const mx = (ax + bx) * 0.5;
-            const my = (ay + by) * 0.5;
-            if (this.terrain.isPointSolid(mx, my)) {
-              bx = mx;
-              by = my;
-            } else {
-              ax = mx;
-              ay = my;
-            }
-          }
-          trajectoryPoints.push({ x: ax, y: ay });
-        }
-        break;
-      }
-      
-      trajectoryPoints.push({ x: px, y: py });
-      t += timeStep;
+    const windLimited = this.gameMode === 'expanded' && windAccel !== 0 && !isWindCalm(this.wind);
+    const previewSteps = windLimited ? WIND_PREVIEW_SECONDS / BALLISTIC_STEP : 10 / BALLISTIC_STEP;
+    let reachedImpact = isFlame;
+    if (isFlame) {
+      const range = 100 + this.power;
+      const endX = muzzle.x + Math.cos(angleRad) * range;
+      const endY = muzzle.y + Math.sin(angleRad) * range;
+      const hit = sweepTerrain(muzzle.x, muzzle.y, endX, endY, solid);
+      trajectoryPoints.push(hit ? { x: hit.x, y: hit.y } : { x: endX, y: endY });
     }
+    for (let i = 0; !isFlame && i < previewSteps; i++) {
+      const previous = flight;
+      const result = advanceFlight(flight, weaponConfig, solid, BALLISTIC_STEP, radius, windAccel);
+      flight = result.state;
+      const hit = findFirstUnitIntercept(previous.x, previous.y, flight.x, flight.y, units,
+        this.isBulletWeapon(weaponConfig.type) || previous.age < 0.4 ? this.currentSoldier : null, 18);
+      trajectoryPoints.push(hit ? { x: hit.x, y: hit.y } : { x: flight.x, y: flight.y });
+      if (hit || result.ended || flight.x < 0 || flight.x > this.worldWidth || flight.y > this.worldHeight - 2) {
+        reachedImpact = true;
+        break;
+      }
+    }
+
+    const lastTrajectoryPoint = trajectoryPoints.length > 0
+      ? trajectoryPoints[trajectoryPoints.length - 1]
+      : { x: startX, y: startY };
+    const horizontalRange = Math.abs(lastTrajectoryPoint.x - startX);
+    const aimAssist = getAimAssistProfile(horizontalRange, this.gameMode);
     
-    // Draw laser-style dotted trajectory line
+    // Operations mode becomes less exact with range; Basic retains the full solution.
     if (trajectoryPoints.length > 1) {
-      const dotSpacing = 10; // Slightly wider spacing for clarity
-      const dotSize = 3; // Larger dot size for better visibility
+      const dotSpacing = 10;
+      const dotSize = 3;
       let accumulatedDistance = 0;
       
       for (let i = 1; i < trajectoryPoints.length; i++) {
@@ -2152,72 +2695,110 @@ private startParatrooperDrop(): void {
           const dotX = p0.x + (p1.x - p0.x) * ratio;
           const dotY = p0.y + (p1.y - p0.y) * ratio;
           
-          // Calculate fade: dots fade out further along trajectory
           const totalDist = accumulatedDistance + localDist;
-          const maxDist = 1200; // Fade over longer distance for long-range weapons
-          const alpha = Math.max(0.3, 1 - totalDist / maxDist);
-          
-          // Bright trajectory color with glow effect
-          this.aimLine.fillStyle(0xff2222, alpha * 0.95);
-          this.aimLine.fillCircle(dotX, dotY, dotSize);
-          
-          // Inner bright core
-          this.aimLine.fillStyle(0xff6666, alpha);
-          this.aimLine.fillCircle(dotX, dotY, dotSize * 0.6);
+          const alpha = Math.max(aimAssist.alphaFloor, 1 - totalDist / 1200);
+          const dotIndex = Math.floor(totalDist / dotSpacing);
+          const distanceToImpact = Phaser.Math.Distance.Between(
+            dotX,
+            dotY,
+            lastTrajectoryPoint.x,
+            lastTrajectoryPoint.y,
+          );
+          const hidesExactCenter = !aimAssist.exactImpact &&
+            distanceToImpact < aimAssist.uncertaintyRadius * 1.65;
+
+          if (dotIndex % aimAssist.dotStride === 0 && !hidesExactCenter) {
+            this.aimLine.fillStyle(0xff3b2f, alpha * 0.95);
+            this.aimLine.fillCircle(dotX, dotY, dotSize);
+
+            this.aimLine.fillStyle(0xff8a70, alpha);
+            this.aimLine.fillCircle(dotX, dotY, dotSize * 0.6);
+          }
           
           localDist += dotSpacing;
         }
         accumulatedDistance += segmentDist;
       }
       
-      // Draw impact marker at end of trajectory (not when wind cut the preview short)
+      // Distant Operations shots show a landing bracket rather than an exact center.
+      // (No marker at all when wind cut the preview short.)
       if (trajectoryPoints.length > 2 && (reachedImpact || !windLimited)) {
-        const lastPoint = trajectoryPoints[trajectoryPoints.length - 1];
-        
-        // Crosshair at impact point
-        this.aimLine.lineStyle(2, 0xff0000, 0.8);
-        this.aimLine.strokeCircle(lastPoint.x, lastPoint.y, 10);
-        this.aimLine.lineBetween(lastPoint.x - 16, lastPoint.y, lastPoint.x + 16, lastPoint.y);
-        this.aimLine.lineBetween(lastPoint.x, lastPoint.y - 16, lastPoint.x, lastPoint.y + 16);
-        
-        // Show explosion radius for explosive weapons (non-bullet types)
-        const isExplosive = weaponConfig.type !== WeaponType.RIFLE && 
-                           weaponConfig.type !== WeaponType.SNIPER && 
-                           weaponConfig.type !== WeaponType.PISTOL && 
-                           weaponConfig.type !== WeaponType.SMG && 
-                           weaponConfig.type !== WeaponType.MINIGUN && 
-                           weaponConfig.type !== WeaponType.CARBINE && 
-                           weaponConfig.type !== WeaponType.SHOTGUN && 
-                           weaponConfig.type !== WeaponType.SLUG &&
-                           weaponConfig.type !== WeaponType.FLAMER;
-        
-        if (isExplosive && weaponConfig.explosionRadius > 10) {
-          // Draw explosion radius ring
-          this.aimLine.lineStyle(2, 0xff8800, 0.6);
-          this.aimLine.strokeCircle(lastPoint.x, lastPoint.y, weaponConfig.explosionRadius);
-          
-          // Fill with low opacity to show blast zone
-          this.aimLine.fillStyle(0xff6600, 0.1);
-          this.aimLine.fillCircle(lastPoint.x, lastPoint.y, weaponConfig.explosionRadius);
-          
-          // Draw damage info
-          this.aimLine.fillStyle(0xffaa00, 0.9);
-          this.aimLine.fillCircle(lastPoint.x, lastPoint.y - weaponConfig.explosionRadius - 20, 12);
-          this.aimLine.fillStyle(0x000000, 1);
-          this.aimLine.fillCircle(lastPoint.x, lastPoint.y - weaponConfig.explosionRadius - 20, 8);
+        const lastPoint = lastTrajectoryPoint;
+
+        if (aimAssist.exactImpact) {
+          this.aimLine.lineStyle(2, 0xff3b2f, 0.8);
+          this.aimLine.strokeCircle(lastPoint.x, lastPoint.y, 10);
+          this.aimLine.lineBetween(lastPoint.x - 16, lastPoint.y, lastPoint.x + 16, lastPoint.y);
+          this.aimLine.lineBetween(lastPoint.x, lastPoint.y - 16, lastPoint.x, lastPoint.y + 16);
+
+          const isExplosive = weaponConfig.type !== WeaponType.RIFLE &&
+                             weaponConfig.type !== WeaponType.SNIPER &&
+                             weaponConfig.type !== WeaponType.PISTOL &&
+                             weaponConfig.type !== WeaponType.SMG &&
+                             weaponConfig.type !== WeaponType.MINIGUN &&
+                             weaponConfig.type !== WeaponType.CARBINE &&
+                             weaponConfig.type !== WeaponType.SHOTGUN &&
+                             weaponConfig.type !== WeaponType.SLUG &&
+                             weaponConfig.type !== WeaponType.FLAMER;
+
+          if (isExplosive && weaponConfig.explosionRadius > 10) {
+            this.aimLine.lineStyle(2, 0xff9d38, 0.6);
+            this.aimLine.strokeCircle(lastPoint.x, lastPoint.y, weaponConfig.explosionRadius);
+
+            this.aimLine.fillStyle(0xff6d24, 0.1);
+            this.aimLine.fillCircle(lastPoint.x, lastPoint.y, weaponConfig.explosionRadius);
+          }
+        } else {
+          const radius = aimAssist.uncertaintyRadius;
+          const corner = 8;
+          this.aimLine.lineStyle(2, 0xffc45c, 0.82);
+          this.aimLine.lineBetween(lastPoint.x - radius, lastPoint.y - radius, lastPoint.x - radius + corner, lastPoint.y - radius);
+          this.aimLine.lineBetween(lastPoint.x - radius, lastPoint.y - radius, lastPoint.x - radius, lastPoint.y - radius + corner);
+          this.aimLine.lineBetween(lastPoint.x + radius, lastPoint.y - radius, lastPoint.x + radius - corner, lastPoint.y - radius);
+          this.aimLine.lineBetween(lastPoint.x + radius, lastPoint.y - radius, lastPoint.x + radius, lastPoint.y - radius + corner);
+          this.aimLine.lineBetween(lastPoint.x - radius, lastPoint.y + radius, lastPoint.x - radius + corner, lastPoint.y + radius);
+          this.aimLine.lineBetween(lastPoint.x - radius, lastPoint.y + radius, lastPoint.x - radius, lastPoint.y + radius - corner);
+          this.aimLine.lineBetween(lastPoint.x + radius, lastPoint.y + radius, lastPoint.x + radius - corner, lastPoint.y + radius);
+          this.aimLine.lineBetween(lastPoint.x + radius, lastPoint.y + radius, lastPoint.x + radius, lastPoint.y + radius - corner);
         }
       }
     }
     
-    // Draw weapon muzzle indicator (small bright dot at start)
-    this.aimLine.fillStyle(0xff6666, 1);
-    this.aimLine.fillCircle(startX + Math.cos(angleRad) * 20, startY + Math.sin(angleRad) * 20, 4);
+    // The angle dial stays centered on the initiator, independent of camera scouting.
+    const dialRadius = 42;
+    this.aimLine.lineStyle(1, 0xe8e2cf, 0.34);
+    this.aimLine.strokeCircle(startX, startY, dialRadius);
+    for (let tick = 0; tick < 8; tick++) {
+      const tickAngle = tick * Math.PI / 4;
+      const inner = dialRadius - (tick % 2 === 0 ? 6 : 4);
+      this.aimLine.lineBetween(
+        startX + Math.cos(tickAngle) * inner,
+        startY + Math.sin(tickAngle) * inner,
+        startX + Math.cos(tickAngle) * dialRadius,
+        startY + Math.sin(tickAngle) * dialRadius,
+      );
+    }
 
-    // Draw power indicator bar (sleek horizontal bar)
-    const barX = startX - 25;
-    const barY = startY - 35;
-    const barWidth = 50;
-    const barHeight = 4;
+    const sightStart = 23;
+    const sightEnd = 58;
+    this.aimLine.lineStyle(3, 0xffd164, 0.96);
+    this.aimLine.lineBetween(
+      startX + Math.cos(angleRad) * sightStart,
+      startY + Math.sin(angleRad) * sightStart,
+      startX + Math.cos(angleRad) * sightEnd,
+      startY + Math.sin(angleRad) * sightEnd,
+    );
+    this.aimLine.fillStyle(0xfff0b0, 1);
+    this.aimLine.fillCircle(
+      startX + Math.cos(angleRad) * sightEnd,
+      startY + Math.sin(angleRad) * sightEnd,
+      3,
+    );
+
+    const barWidth = 72;
+    const barHeight = 5;
+    const barX = startX - barWidth / 2;
+    const barY = startY + 48;
     
     // Background
     this.aimLine.fillStyle(0x000000, 0.5);
@@ -2237,14 +2818,21 @@ private startParatrooperDrop(): void {
     this.aimLine.fillStyle(color, 1);
     this.aimLine.fillRect(barX, barY, barWidth * (this.power / 100), barHeight);
 
-    // Numeric readout while charging — the bar alone made precise power hard to judge.
-    if (this.isCharging || this.isMouseCharging) {
-      this.aimPowerText.setText(`${Math.round(this.power)}%`);
-      this.aimPowerText.setPosition(startX, barY - 6);
-      this.aimPowerText.setVisible(true);
-    } else {
-      this.aimPowerText.setVisible(false);
-    }
+    // Persistent readout keeps fine angle and power adjustments legible.
+    const readout = getAimReadout(this.aimAngle);
+    const estimateLabel = aimAssist.exactImpact ? '' : '  |  EST';
+    this.aimPowerText.setText(
+      `ANG ${readout.elevation.toFixed(1)} ${readout.direction}  |  PWR ${Math.round(this.power).toString().padStart(3, '0')}${estimateLabel}`,
+    );
+    const camera = this.cameras.main;
+    const readoutHalfWidth = (this.aimPowerText.width / 2 + 6) / camera.zoom;
+    const readoutX = Phaser.Math.Clamp(
+      startX,
+      camera.worldView.left + readoutHalfWidth,
+      camera.worldView.right - readoutHalfWidth,
+    );
+    this.aimPowerText.setPosition(readoutX, barY + 10);
+    this.aimPowerText.setVisible(true);
   }
 
   private fireProjectile(): void {
@@ -2254,8 +2842,8 @@ private startParatrooperDrop(): void {
       this.fireHowitzerShot();
       return;
     }
-    if (this.getArmedSpecial()) {
-      this.fireSpecialWeapon();
+    if (this.getArmedCrateWeapon()) {
+      this.fireCrateWeapon();
       return;
     }
     this.hasFired = true;
@@ -2266,6 +2854,7 @@ private startParatrooperDrop(): void {
     this.mouseChargeSoldier = null;
     this.keyboardChargeTurnId = 0;
     this.keyboardChargeSoldier = null;
+    SoundManager.pulseMusicIntensity(0.9, 2.4);
     
     // Stop following the soldier
     this.cameras.main.stopFollow();
@@ -2317,8 +2906,8 @@ private startParatrooperDrop(): void {
   }
 
   private fireHowitzerShot(): void {
-    this.turnActorAttacked = true;
     if (!this.currentSoldier || this.hasFired) return;
+    this.turnActorAttacked = true;
 
     const shooter = this.currentSoldier;
     if (!shooter.consumeArtilleryCharge()) {
@@ -2326,6 +2915,7 @@ private startParatrooperDrop(): void {
       this.exitHowitzerMode();
       return;
     }
+    this.emitPowerupStatus(shooter);
 
     this.hasFired = true;
     this.clearChargeState();
@@ -2339,8 +2929,9 @@ private startParatrooperDrop(): void {
     const angleRad = Phaser.Math.DegToRad(shotAngle);
 
     const origin = this.getAimOrigin() ?? { x: shooter.x, y: shooter.y - 10 };
-    const muzzleX = origin.x + Math.cos(angleRad) * 34;
-    const muzzleY = origin.y + Math.sin(angleRad) * 34;
+    const muzzle = getMuzzle(origin.x, origin.y, shotAngle, 34, 34);
+    const muzzleX = muzzle.x;
+    const muzzleY = muzzle.y;
 
     // Flash + recoil on the placed weapon (fallback: soldier sprite).
     const muzzleFlash = this.add.circle(muzzleX, muzzleY, 22, 0xffdd88, 0.95);
@@ -2569,11 +3160,12 @@ private startParatrooperDrop(): void {
   }
 
   private callAirstrikeAt(targetX: number): void {
-    this.turnActorAttacked = true;
     if (!this.currentSoldier || this.hasFired) return;
+    this.turnActorAttacked = true;
 
     const shooter = this.currentSoldier;
     if (!shooter.consumeAirstrikeCharge()) return;
+    this.emitPowerupStatus(shooter);
 
     this.hasFired = true;
     this.clearChargeState();
@@ -2597,7 +3189,7 @@ private startParatrooperDrop(): void {
     const planeY = 75 + Phaser.Math.Between(0, 40);
     const duration = 4200;
 
-    const plane = this.createPlane(startX, planeY, facingRight);
+    const plane = this.createPlane(startX, planeY, facingRight, shooter.getFactionId());
     plane.setDepth(120);
 
     this.tweens.add({
@@ -2641,11 +3233,20 @@ private startParatrooperDrop(): void {
     });
   }
 
-  private tryDigIn(): void {
-    if (!this.currentSoldier || this.hasFired) return;
+  private tryDigIn(): boolean {
+    if (!this.currentSoldier || this.hasFired) return false;
     const turnId = this.turnId;
 
     const soldier = this.currentSoldier;
+    if (this.coverUsedThisTurn || this.isCoverActionInProgress) {
+      soldier.sayQuip('tired');
+      return false;
+    }
+    if (this.getMovementRemaining(soldier) < COVER_MOVEMENT_COST) {
+      soldier.sayQuip('tired');
+      return false;
+    }
+
     const digX = soldier.x;
     const digY = soldier.y;
 
@@ -2653,9 +3254,9 @@ private startParatrooperDrop(): void {
     const facing: -1 | 1 = Math.cos(angleRad) < 0 ? -1 : 1;
 
     // Compute ground at the soldier's feet (not the global "top surface" heightmap, which can be wrong in caves).
-    // Also sample at the barrier X (buildCrudeBarrier offsets by facing*26) so the berm anchors correctly on slopes.
-    const barrierX = digX + facing * 26;
-    const footY = digY + 14;
+    // Also sample at the barrier X so the wall anchors correctly on slopes.
+    const barrierX = digX + facing * 40;
+    const footY = digY + 16;
     const soldierGroundY = this.terrain.findSurfaceYAtOrBelow(digX, footY - 6, 320) ?? this.terrain.getSurfaceY(digX);
     let groundY = this.terrain.findSurfaceYAtOrBelow(barrierX, footY - 6, 320);
     if (groundY === null || Math.abs(groundY - soldierGroundY) > 70) {
@@ -2665,9 +3266,16 @@ private startParatrooperDrop(): void {
 
     // Small dirt burst + hammering animation
     soldier.sayQuip('moving');
-    this.hasFired = true;
+    this.coverUsedThisTurn = true;
+    this.isCoverActionInProgress = true;
+    this.movementUsed = Math.min(this.maxMovement, this.movementUsed + COVER_MOVEMENT_COST);
+    this.lastMovementX = soldier.x;
+    this.events.emit('movement-update', {
+      movementUsed: Math.floor(this.movementUsed),
+      maxMovement: this.maxMovement,
+    });
 
-    const digText = this.add.text(digX, digY - 70, 'DIGGING IN', {
+    const digText = this.add.text(digX, digY - 70, 'BUILDING COVER', {
       font: 'bold 14px Arial',
       color: '#d0c080',
       stroke: '#000000',
@@ -2685,10 +3293,10 @@ private startParatrooperDrop(): void {
       onComplete: () => digText.destroy(),
     });
 
-    // Quick "shovel" jiggle
+    // Quick shovel motion without displacing the physics body.
     this.tweens.add({
       targets: soldier.sprite,
-      x: soldier.sprite.x + facing * 3,
+      angle: facing * 4,
       duration: 70,
       yoyo: true,
       repeat: 6,
@@ -2722,225 +3330,206 @@ private startParatrooperDrop(): void {
       if (this.currentSoldier !== soldier) return;
       // Build the barrier after the short animation windup
       this.terrain.buildCrudeBarrier(digX, groundY, facing);
+      this.isCoverActionInProgress = false;
+      digText.setText('COVER READY');
+    });
 
-      // End turn quickly
-      this.time.delayedCall(650, () => {
-        if (turnId !== this.turnId) return;
-        if (!this.isTurnEnding) this.endTurn();
+    return true;
+  }
+
+  private beginSpecial(tool: SpecialTool): void {
+    if (!this.currentSoldier || this.hasFired) return;
+    this.clearChargeState();
+    this.currentSoldier.stopMoving();
+    this.specialTool = tool;
+    const angle = Phaser.Math.DegToRad(this.aimAngle);
+    const range = tool === 'grapple' || tool === 'jetpack' ? 350 : 92;
+    this.specialTarget = { x: this.currentSoldier.x + Math.cos(angle) * range, y: this.currentSoldier.y + Math.sin(angle) * range };
+    this.specialLabel = this.add.text(this.scale.width / 2, this.scale.height - 108, '', {
+      font: 'bold 15px Arial', color: '#aee5dc', stroke: '#142125', strokeThickness: 4,
+    }).setOrigin(0.5).setScrollFactor(0).setDepth(350);
+    this.drawSpecialPreview();
+  }
+
+  private cancelSpecial(): void {
+    this.specialTool = null;
+    this.specialLabel?.destroy();
+    this.specialLabel = null;
+    this.aimLine?.clear();
+  }
+
+  private drawSpecialPreview(): void {
+    const soldier = this.currentSoldier;
+    if (!soldier || !this.specialTool) return;
+    this.aimLine.clear();
+    this.aimPowerText.setVisible(false);
+    let end = this.specialTarget;
+    let ready = true;
+    let reason = '';
+    if (this.specialTool === 'grapple' || this.specialTool === 'jetpack') {
+      const hit = sweepTerrain(soldier.x, soldier.y - 16, end.x, end.y, (x, y) => this.terrain.isPointSolid(x, y));
+      ready = Math.hypot(end.x - soldier.x, end.y - soldier.y) <= 400 && soldier.getRemainingGrapples() > 0 && (this.specialTool === 'jetpack' || !!hit);
+      if (hit) end = hit;
+    } else if (this.specialTool === 'dig') {
+      const plan = getTunnelPlan(soldier.x, soldier.y, this.aimAngle, this.worldWidth);
+      end = { x: plan.endX, y: plan.endY };
+      const status = this.getTunnelStatusNow();
+      ready = status.ready;
+      reason = status.reason;
+      this.aimLine.lineStyle(plan.radius * 2, ready ? 0x80cdb2 : 0xe77664, 0.2);
+      this.aimLine.lineBetween(plan.startX, plan.startY, end.x, end.y);
+    } else {
+      const facing = end.x >= soldier.x ? 1 : -1;
+      end = { x: soldier.x + facing * 40, y: soldier.y + 5 };
+      const status = this.getCoverStatusNow();
+      ready = status.ready;
+      reason = status.reason;
+      this.aimLine.lineStyle(3, 0xd6c59d, 0.8);
+      this.aimLine.strokeRoundedRect(end.x - 29, end.y - 18, 58, 36, 4);
+    }
+    this.aimLine.lineStyle(2, ready ? 0x8de2cc : 0xef796d, 0.9);
+    this.aimLine.lineBetween(soldier.x, soldier.y - 12, end.x, end.y);
+    this.aimLine.strokeCircle(end.x, end.y, 8);
+    const toolName = this.specialTool === 'dig' ? 'TUNNEL' : this.specialTool.toUpperCase();
+    const confirmHint = ready ? '  -  ENTER/B to confirm, W/S to angle, ESC to cancel' : '';
+    this.specialLabel?.setText(`${toolName} / ${ready ? (reason || 'READY') : `UNAVAILABLE - ${reason || 'out of range'}`}${confirmHint}`);
+  }
+
+  private confirmSpecial(): void {
+    const soldier = this.currentSoldier, tool = this.specialTool;
+    if (!soldier || !tool || !soldier.isAlive() || this.hasFired) { this.cancelSpecial(); return; }
+    const target = this.specialTarget;
+    this.cancelSpecial();
+    if (tool === 'dig') this.tryTunnel();
+    else if (tool === 'cover') this.tryDigIn();
+    else if (soldier.startGrapple(target.x, target.y, this.terrain, tool !== 'jetpack')) this.movementUsed = this.maxMovement;
+  }
+
+  private tryTunnel(): boolean {
+    if (this.gameMode !== 'expanded' || !this.currentSoldier || this.hasFired) return false;
+    if (this.isTunnelActionInProgress) return false;
+
+    const soldier = this.currentSoldier;
+    if (this.tunnelsUsedThisTurn >= MAX_TUNNELS_PER_TURN) {
+      soldier.sayQuip('tired');
+      return false;
+    }
+    if (this.getMovementRemaining(soldier) < TUNNEL_MOVEMENT_COST) {
+      soldier.sayQuip('tired');
+      return false;
+    }
+
+    const plan = getTunnelPlan(soldier.x, soldier.y, this.aimAngle, this.worldWidth);
+    const hasGround = Array.from({ length: 13 }, (_, i) => {
+      const t = i / 12;
+      const x = plan.startX + (plan.endX - plan.startX) * t;
+      const y = plan.startY + (plan.endY - plan.startY) * t;
+      return [-12, 0, 12].some(offset => this.terrain.isPointSolid(x, y + offset));
+    }).filter(Boolean).length >= 2;
+    if (!hasGround) {
+      soldier.sayQuip('blocked');
+      this.showAbilityBlocked("Can't dig: no ground there - aim into the dirt");
+      return false;
+    }
+    const turn = this.turnId;
+    for (let stroke = 0; stroke < 3; stroke++) {
+      this.time.delayedCall(stroke * 240, () => {
+        if (turn !== this.turnId || this.currentSoldier !== soldier || !soldier.isAlive()) return;
+        const a = stroke / 3, b = (stroke + 1) / 3;
+        this.terrain.digTunnel(
+          plan.startX + (plan.endX - plan.startX) * a, plan.startY + (plan.endY - plan.startY) * a,
+          plan.startX + (plan.endX - plan.startX) * b, plan.startY + (plan.endY - plan.startY) * b, plan.radius);
+        soldier.playActionAnimation('dig', plan.facing);
+        SoundManager.playDig();
       });
-    });
-  }
+    }
 
-  private getWoundedAlliesInRange(): Soldier[] {
-    if (!this.currentSoldier) return [];
-    const range = 150;
-    return this.soldiers
-      .filter(s =>
-        s.isAlive() &&
-        s.team === this.currentSoldier!.team &&
-        s !== this.currentSoldier &&
-        s.getHealth() < 100 &&
-        Phaser.Math.Distance.Between(this.currentSoldier!.x, this.currentSoldier!.y, s.x, s.y) <= range
-      )
-      .sort((a, b) =>
-        Phaser.Math.Distance.Between(this.currentSoldier!.x, this.currentSoldier!.y, a.x, a.y) -
-        Phaser.Math.Distance.Between(this.currentSoldier!.x, this.currentSoldier!.y, b.x, b.y)
+    this.isTunnelActionInProgress = true;
+    this.tunnelsUsedThisTurn++;
+    this.movementUsed = Math.min(this.maxMovement, this.movementUsed + TUNNEL_MOVEMENT_COST);
+    soldier.stopMoving();
+    soldier.sayQuip('tunneling');
+
+    for (let i = 0; i < 16; i++) {
+      const t = Math.random();
+      const x = plan.startX + (plan.endX - plan.startX) * t;
+      const y = plan.startY + (plan.endY - plan.startY) * t;
+      const dirt = this.add.rectangle(
+        x + (Math.random() - 0.5) * 16,
+        y + (Math.random() - 0.5) * 12,
+        3 + Math.random() * 4,
+        3 + Math.random() * 3,
+        Math.random() > 0.5 ? 0x8b653d : 0x59402a,
+        0.9,
       );
-  }
-
-  private getTurnActionState(): TurnActionState {
-    return {
-      hasFired: this.hasFired,
-      isCharging: this.isCharging || this.isMouseCharging,
-      isHowitzerMode: this.isHowitzerMode,
-      isAirstrikeTargeting: this.isAirstrikeTargeting,
-      isGrappling: !!this.currentSoldier?.isCurrentlyGrappling(),
-    };
-  }
-
-  private getCurrentDigInStatus(): AbilityStatus {
-    return getDigInStatus({
-      ...this.getTurnActionState(),
-      isOnGround: !!this.currentSoldier?.isSteadyOnGround(),
-    });
-  }
-
-  private getCurrentHealStatus(): AbilityStatus {
-    return getHealStatus({
-      ...this.getTurnActionState(),
-      isMedic: this.currentSoldier?.getWeaponType() === WeaponType.PISTOL,
-      woundedAlliesInRange: this.getWoundedAlliesInRange().length,
-    });
-  }
-
-  private emitAbilityStatus(dig: AbilityStatus | null, heal: AbilityStatus | null): void {
-    const specialId = this.currentSoldier?.getSpecialWeapon() ?? null;
-    const special = dig && heal && specialId
-      ? { name: SPECIAL_WEAPONS[specialId].name, hint: SPECIAL_WEAPONS[specialId].hint, armed: this.isSpecialArmed }
-      : null;
-    const key = dig && heal ? `${dig.reason}|${heal.reason}|${specialId}|${this.isSpecialArmed}` : 'hidden';
-    if (key === this.lastAbilityStatusKey) return;
-    this.lastAbilityStatusKey = key;
-    this.events.emit('ability-status', dig && heal ? { dig, heal, special } : null);
-  }
-
-  private showAbilityBlocked(message: string): void {
-    if (!this.currentSoldier) return;
-    const text = this.add.text(this.currentSoldier.x, this.currentSoldier.y - 70, message, {
-      font: 'bold 13px Arial',
-      color: '#ff9a7a',
-      stroke: '#000000',
-      strokeThickness: 3,
-    });
-    text.setOrigin(0.5);
-    text.setDepth(200);
-    this.tweens.add({
-      targets: text,
-      y: text.y - 18,
-      alpha: 0,
-      delay: 500,
-      duration: 700,
-      onComplete: () => text.destroy(),
-    });
-  }
-
-  // ===== Damage, kills, veterancy =====
-
-  /** All soldier damage goes through here so kills, veterancy and banter can see it. */
-  private damageSoldier(soldier: Soldier, amount: number): void {
-    if (!soldier.isAlive() || amount <= 0) return;
-    const actor = this.turnActor;
-    const damage = Math.round(amount * (actor ? actor.getRank().damageMultiplier : 1));
-
-    if (actor) {
-      if (soldier === actor) this.turnStats.selfDamage += damage;
-      else if (soldier.team === actor.team) {
-        this.turnStats.allyDamage += damage;
-        this.lastAllyHit = soldier;
-      } else this.turnStats.enemyDamage += damage;
+      dirt.setDepth(165);
+      this.tweens.add({
+        targets: dirt,
+        x: dirt.x - plan.facing * (10 + Math.random() * 24),
+        y: dirt.y - (12 + Math.random() * 30),
+        angle: Phaser.Math.Between(-90, 90),
+        alpha: 0,
+        duration: 420 + Math.random() * 280,
+        ease: 'Quad.easeOut',
+        onComplete: () => dirt.destroy(),
+      });
     }
 
-    soldier.takeDamage(damage);
-    if (!soldier.isAlive()) this.onSoldierKilled(soldier);
-  }
+    this.showPowerupText(
+      soldier.x,
+      soldier.y - 72,
+      `TUNNEL ${this.tunnelsUsedThisTurn}/${MAX_TUNNELS_PER_TURN}`,
+      0xd8bd82,
+    );
 
-  private onSoldierKilled(victim: Soldier): void {
-    const killer = this.turnActor;
-
-    if (killer && killer !== victim) {
-      if (killer.team !== victim.team) {
-        this.turnStats.enemyKills++;
-        const promotion = killer.addKill();
-        if (killer.isAlive()) this.speak(killer, 'kill', 250);
-        if (promotion) {
-          this.time.delayedCall(700, () => {
-            const bonus = Math.round((promotion.damageMultiplier - 1) * 100);
-            const extras = [
-              `+${bonus}% damage`,
-              promotion.movementBonus > 0 ? `+${Math.round(promotion.movementBonus * 100)}% movement` : '',
-              promotion.promotionArmor > 0 ? `+${promotion.promotionArmor} armor` : '',
-            ].filter(Boolean).join(' · ');
-            this.showWorldBanner(`${killer.name.toUpperCase()} PROMOTED: ${promotion.title.toUpperCase()} ${promotion.stars}`, extras);
-            SoundManager.playSelect();
-            if (killer.isAlive()) this.speak(killer, 'promotion', 1400);
-          });
-        }
-      } else {
-        this.turnStats.allyKills++;
+    this.time.delayedCall(900, () => {
+      if (this.currentSoldier === soldier && soldier.isAlive()) {
+        this.isTunnelActionInProgress = false;
+        this.lastMovementX = soldier.x;
       }
-    }
-
-    // A nearby teammate reacts.
-    const buddy = this.findNearest(victim.x, victim.y, s => s.isAlive() && s.team === victim.team && s !== victim, 520);
-    if (buddy) this.speak(buddy, 'allyDown', 1100, { name: victim.name });
-
-    // Killed on their own turn before acting (e.g. stepped on a mine): move on.
-    if (victim === this.currentSoldier && !this.hasFired && !this.isTurnEnding) {
-      const turnId = this.turnId;
-      const tryEnd = (): void => {
-        if (turnId !== this.turnId || this.isTurnEnding) return;
-        if (this.hazards.isBusy()) {
-          this.time.delayedCall(250, tryEnd);
-          return;
-        }
-        this.endTurn();
-      };
-      this.time.delayedCall(1300, tryEnd);
-    }
-  }
-
-  private findNearest(x: number, y: number, filter: (s: Soldier) => boolean, maxDist: number = Infinity): Soldier | null {
-    let best: Soldier | null = null;
-    let bestDist = maxDist;
-    for (const s of this.soldiers) {
-      if (!filter(s)) continue;
-      const d = Phaser.Math.Distance.Between(x, y, s.x, s.y);
-      if (d < bestDist) {
-        best = s;
-        bestDist = d;
-      }
-    }
-    return best;
-  }
-
-  private speak(soldier: Soldier, category: BanterCategory, delayMs: number = 0, vars: Record<string, string> = {}): void {
-    const line = pickLine(category, vars);
-    this.time.delayedCall(delayMs, () => {
-      if (soldier.isAlive()) soldier.say(line);
     });
+
+    return true;
   }
 
-  private playShotBanter(shooter: Soldier, stats: ShotStats): void {
-    const banter = pickShotBanter(stats);
-    if (banter.shooter && shooter.isAlive() && Math.random() < 0.8) {
-      this.speak(shooter, banter.shooter, 100);
-    }
-    if (banter.ally && this.lastAllyHit?.isAlive()) {
-      this.speak(this.lastAllyHit, banter.ally, 800);
-    }
-    if (banter.enemy && Math.random() < 0.6) {
-      const at = this.lastImpact ?? { x: shooter.x, y: shooter.y };
-      const enemy = this.findNearest(at.x, at.y, s => s.isAlive() && s.team !== shooter.team, 600);
-      if (enemy) this.speak(enemy, banter.enemy, 900);
-    }
-  }
+  // ===== Crate weapons (one-shot specials from supply drops) =====
 
-  // ===== Special weapons (from crates) =====
-
-  private getArmedSpecial(): SpecialWeaponDef | null {
-    if (!this.isSpecialArmed || !this.currentSoldier) return null;
+  private getArmedCrateWeapon(): SpecialWeaponDef | null {
+    if (!this.isCrateWeaponArmed || !this.currentSoldier) return null;
     const id = this.currentSoldier.getSpecialWeapon();
     return id ? SPECIAL_WEAPONS[id] : null;
   }
 
-  private toggleSpecialWeapon(): void {
+  private toggleCrateWeapon(): void {
     const soldier = this.currentSoldier;
     if (!soldier) return;
     const id = soldier.getSpecialWeapon();
     if (!id) {
-      this.showAbilityBlocked('No special weapon - grab a crate!');
+      this.showAbilityBlocked('No special weapon - grab a supply crate!');
       return;
     }
     if (this.hasFired || this.isCharging || this.isMouseCharging || this.isHowitzerMode || this.isAirstrikeTargeting) return;
-    this.isSpecialArmed = !this.isSpecialArmed;
-    if (this.isSpecialArmed) {
+    this.isCrateWeaponArmed = !this.isCrateWeaponArmed;
+    if (this.isCrateWeaponArmed) {
       const def = SPECIAL_WEAPONS[id];
-      this.showPowerupText(soldier.x, soldier.y - 50, `${def.name.toUpperCase()} ARMED`, def.color);
+      this.showPowerupText(soldier.x, soldier.y - 50, `${def.name.toUpperCase()} ARMED`, def.color, def.hint.toUpperCase());
       SoundManager.playSelect();
     }
+    this.emitPowerupStatus();
   }
 
-  private fireSpecialWeapon(): void {
+  private fireCrateWeapon(): void {
     const soldier = this.currentSoldier;
-    const def = this.getArmedSpecial();
+    const def = this.getArmedCrateWeapon();
     if (!soldier || !def) return;
 
     this.hasFired = true;
-    this.turnActorAttacked = def.behavior !== 'teleport'; // relocating isn't an attack - no "missed!" banter
-    this.isSpecialArmed = false;
+    this.isCrateWeaponArmed = false;
     soldier.setSpecialWeapon(null);
     this.clearChargeState();
-    soldier.say(SPECIAL_FIRE_LINES[def.id] ?? 'Special delivery!');
+    this.emitPowerupStatus();
+    soldier.say(CRATE_WEAPON_FIRE_LINES[def.id] ?? 'Special delivery!');
+    this.onCrateWeaponFired(def);
 
     if (!def.config) {
       this.swingSledgehammer(soldier);
@@ -2948,29 +3537,29 @@ private startParatrooperDrop(): void {
     }
 
     this.cameras.main.stopFollow();
-    const angleRad = Phaser.Math.DegToRad(this.aimAngle);
-    const speed = (this.power / 100) * def.config.projectileSpeed;
+    const muzzle = getMuzzle(soldier.x, soldier.y - 10, this.aimAngle);
+    const flight = createFlight(muzzle.x, muzzle.y, this.aimAngle, this.power, def.config.projectileSpeed);
     this.beginShotResolution(soldier, def.config);
     const projectile = new Projectile(
-      this,
-      soldier.x + Math.cos(angleRad) * 20,
-      soldier.y + Math.sin(angleRad) * 10,
-      Math.cos(angleRad) * speed,
-      Math.sin(angleRad) * speed,
-      def.config,
-      this.terrain,
-      soldier,
+      this, flight.x, flight.y, flight.vx, flight.vy, def.config, this.terrain, soldier,
       { behavior: def.behavior ?? undefined },
     );
     this.events.emit('projectile-spawned', projectile);
     this.events.emit('projectile-created', projectile);
+    soldier.playActionAnimation('fire', Math.cos(Phaser.Math.DegToRad(this.aimAngle)) < 0 ? -1 : 1);
     this.cameras.main.shake(100, 0.004);
+  }
+
+  // A teleport relocates rather than attacks - no "missed!" banter for it.
+  private onCrateWeaponFired(def: SpecialWeaponDef): void {
+    this.turnActorAttacked = def.behavior !== 'teleport';
   }
 
   private swingSledgehammer(soldier: Soldier): void {
     const turnId = this.turnId;
     const angleRad = Phaser.Math.DegToRad(this.aimAngle);
-    const facing = Math.cos(angleRad) < 0 ? -1 : 1;
+    const facing: -1 | 1 = Math.cos(angleRad) < 0 ? -1 : 1;
+    soldier.playActionAnimation('fire', facing);
 
     // Swing arc visual
     const arc = this.add.graphics().setDepth(190);
@@ -2980,12 +3569,15 @@ private startParatrooperDrop(): void {
     arc.strokePath();
     this.tweens.add({ targets: arc, alpha: 0, duration: 300, onComplete: () => arc.destroy() });
 
-    // Hit the closest soldier in front of us (within range and roughly in the aim direction).
-    const target = this.findNearest(soldier.x, soldier.y, s => {
-      if (!s.isAlive() || s === soldier) return false;
-      const toTarget = Math.atan2(s.y - soldier.y, s.x - soldier.x);
-      return Math.abs(Phaser.Math.Angle.Wrap(toTarget - angleRad)) < 1.2;
-    }, SLEDGE_RANGE);
+    // Hit the closest soldier in front of us (within reach and roughly in the aim direction).
+    const target = this.soldiers
+      .filter(s => {
+        if (!s.isAlive() || s === soldier) return false;
+        if (Phaser.Math.Distance.Between(soldier.x, soldier.y, s.x, s.y) > SLEDGE_RANGE) return false;
+        const toTarget = Math.atan2(s.y - soldier.y, s.x - soldier.x);
+        return Math.abs(Phaser.Math.Angle.Wrap(toTarget - angleRad)) < 1.2;
+      })
+      .sort((a, b) => Phaser.Math.Distance.Between(soldier.x, soldier.y, a.x, a.y) - Phaser.Math.Distance.Between(soldier.x, soldier.y, b.x, b.y))[0];
 
     if (!target) {
       this.showPowerupText(soldier.x + facing * 30, soldier.y - 30, 'WHIFF!', 0xaaaaaa);
@@ -3024,16 +3616,17 @@ private startParatrooperDrop(): void {
       this.tweens.add({ targets: ring, scale: 2.2, alpha: 0, duration: 450, onComplete: () => ring.destroy() });
     };
     flash(shooter.x, shooter.y);
-
     const body = shooter.sprite.body as Phaser.Physics.Arcade.Body;
     body.setVelocity(0, 0);
-    shooter.sprite.setPosition(x, surface - 16);
+    shooter.sprite.setPosition(x, surface - 17);
+    // Terrain collision tracks each body's last position; start it fresh at the destination.
+    this.terrain.resetCollisionState(shooter.sprite);
     flash(shooter.x, shooter.y);
     SoundManager.playSelect();
     this.cameras.main.startFollow(shooter.sprite, true, 0.1, 0.1);
   }
 
-  private handleSpecialExploded(behavior: SpecialBehavior, _x: number, _y: number): void {
+  private handleCrateWeaponExploded(behavior: SpecialBehavior): void {
     if (behavior === 'holy') {
       this.showWorldBanner('HALLELUJAH!', 'Holy Grenade');
       this.cameras.main.shake(500, 0.02);
@@ -3043,19 +3636,203 @@ private startParatrooperDrop(): void {
     }
   }
 
+  /** All soldier damage goes through here so kill credit, veterancy and banter can see it. */
+  private damageSoldier(soldier: Soldier, amount: number): void {
+    if (!soldier.isAlive() || amount <= 0) return;
+    const actor = this.turnActor;
+    const damage = Math.round(amount * (actor ? actor.getRank().damageMultiplier : 1));
+
+    if (actor) {
+      if (soldier === actor) this.turnStats.selfDamage += damage;
+      else if (soldier.team === actor.team) {
+        this.turnStats.allyDamage += damage;
+        this.lastAllyHit = soldier;
+      } else this.turnStats.enemyDamage += damage;
+    }
+
+    soldier.takeDamage(damage);
+  }
+
+  /** Credit the acting soldier with a kill (and promote them if they earned it). */
+  private creditKill(fallen: Soldier): void {
+    const killer = this.turnActor;
+    if (!killer || killer === fallen) return;
+    if (killer.team === fallen.team) {
+      this.turnStats.allyKills++;
+      return;
+    }
+
+    this.turnStats.enemyKills++;
+    const promotion = killer.addKill();
+    if (killer.isAlive()) this.time.delayedCall(250, () => { if (killer.isAlive()) killer.sayQuip('kill'); });
+    if (!promotion) return;
+
+    this.time.delayedCall(700, () => {
+      const bonus = Math.round((promotion.damageMultiplier - 1) * 100);
+      const extras = [
+        `+${bonus}% damage`,
+        promotion.movementBonus > 0 ? `+${Math.round(promotion.movementBonus * 100)}% movement` : '',
+        promotion.promotionArmor > 0 ? `+${promotion.promotionArmor} armor` : '',
+      ].filter(Boolean).join('  ·  ');
+      this.showWorldBanner(`${killer.name.toUpperCase()} PROMOTED: ${promotion.title.toUpperCase()} ${promotion.stars}`, extras);
+      SoundManager.playSelect();
+      if (killer.isAlive()) this.speak(killer, 'promotion', 1400);
+      this.emitPowerupStatus();
+    });
+  }
+
+  private speak(soldier: Soldier, category: BanterCategory, delayMs: number = 0, vars: Record<string, string> = {}): void {
+    const line = pickLine(category, vars);
+    this.time.delayedCall(delayMs, () => {
+      if (soldier.isAlive()) soldier.say(line);
+    });
+  }
+
+  private nearestSoldier(x: number, y: number, filter: (s: Soldier) => boolean, maxDist: number): Soldier | null {
+    let best: Soldier | null = null;
+    let bestDist = maxDist;
+    for (const s of this.soldiers) {
+      if (!filter(s)) continue;
+      const d = Phaser.Math.Distance.Between(x, y, s.x, s.y);
+      if (d < bestDist) {
+        best = s;
+        bestDist = d;
+      }
+    }
+    return best;
+  }
+
+  /** After an attack resolves: brag, apologise, or get taunted. */
+  private playShotBanter(shooter: Soldier, stats: ShotStats): void {
+    const banter = pickShotBanter(stats);
+    if (banter.shooter && shooter.isAlive() && Math.random() < 0.8) {
+      this.speak(shooter, banter.shooter, 100);
+    }
+    if (banter.ally && this.lastAllyHit?.isAlive()) {
+      this.speak(this.lastAllyHit, banter.ally, 800);
+    }
+    if (banter.enemy && Math.random() < 0.6) {
+      const at = this.lastImpact ?? { x: shooter.x, y: shooter.y };
+      const enemy = this.nearestSoldier(at.x, at.y, s => s.isAlive() && s.team !== shooter.team, 600);
+      if (enemy) this.speak(enemy, banter.enemy, 900);
+    }
+  }
+
+  // ===== Ability availability (HUD + blocked-press feedback) =====
+
+  private getTurnActionState(): TurnActionState {
+    return {
+      hasFired: this.hasFired,
+      isCharging: this.isCharging || this.isMouseCharging,
+      isHowitzerMode: this.isHowitzerMode,
+      isAirstrikeTargeting: this.isAirstrikeTargeting,
+      isGrappling: !!this.currentSoldier?.isCurrentlyGrappling(),
+      isBusy: this.isTunnelActionInProgress || this.isCoverActionInProgress,
+    };
+  }
+
+  private getTunnelStatusNow(): AbilityStatus {
+    return getTunnelStatus({
+      ...this.getTurnActionState(),
+      isOperations: this.gameMode === 'expanded',
+      tunnelsUsed: this.tunnelsUsedThisTurn,
+      maxTunnels: MAX_TUNNELS_PER_TURN,
+      movementRemaining: this.currentSoldier ? this.getMovementRemaining(this.currentSoldier) : 0,
+      movementCost: TUNNEL_MOVEMENT_COST,
+    });
+  }
+
+  private getCoverStatusNow(): AbilityStatus {
+    return getCoverStatus({
+      ...this.getTurnActionState(),
+      coverUsed: this.coverUsedThisTurn,
+      movementRemaining: this.currentSoldier ? this.getMovementRemaining(this.currentSoldier) : 0,
+      movementCost: COVER_MOVEMENT_COST,
+    });
+  }
+
+  private getWoundedAlliesInRange(): Soldier[] {
+    const medic = this.currentSoldier;
+    if (!medic) return [];
+    const range = 150;
+    return this.soldiers
+      .filter(s =>
+        s.isAlive() &&
+        s.team === medic.team &&
+        s !== medic &&
+        s.getHealth() < 100 &&
+        Phaser.Math.Distance.Between(medic.x, medic.y, s.x, s.y) <= range
+      )
+      .sort((a, b) =>
+        Phaser.Math.Distance.Between(medic.x, medic.y, a.x, a.y) -
+        Phaser.Math.Distance.Between(medic.x, medic.y, b.x, b.y)
+      );
+  }
+
+  private getHealStatusNow(): AbilityStatus {
+    return getHealStatus({
+      ...this.getTurnActionState(),
+      isMedic: this.currentSoldier?.getWeaponType() === WeaponType.PISTOL,
+      woundedAlliesInRange: this.getWoundedAlliesInRange().length,
+    });
+  }
+
+  private getAbilityStatuses(): { label: string; status: AbilityStatus }[] {
+    const list: { label: string; status: AbilityStatus }[] = [];
+    if (this.gameMode === 'expanded') {
+      list.push({ label: '[B] Tunnel', status: this.getTunnelStatusNow() });
+      list.push({ label: '[Shift+B] Cover', status: this.getCoverStatusNow() });
+    } else {
+      list.push({ label: '[B] Cover', status: this.getCoverStatusNow() });
+    }
+    // Only medics can heal - don't clutter everyone else's HUD with it.
+    if (this.currentSoldier?.getWeaponType() === WeaponType.PISTOL) {
+      list.push({ label: '[H] Heal', status: this.getHealStatusNow() });
+    }
+    return list;
+  }
+
+  private emitAbilityStatus(list: { label: string; status: AbilityStatus }[] | null): void {
+    const key = list ? list.map(a => a.label + a.status.reason).join('|') : 'hidden';
+    if (key === this.lastAbilityStatusKey) return;
+    this.lastAbilityStatusKey = key;
+    this.events.emit('ability-status', list);
+  }
+
+  private showAbilityBlocked(message: string): void {
+    const soldier = this.currentSoldier;
+    if (!soldier) return;
+    const text = this.add.text(soldier.x, soldier.y - 78, message, {
+      font: 'bold 13px Arial',
+      color: '#ff9a7a',
+      stroke: '#000000',
+      strokeThickness: 3,
+    });
+    text.setOrigin(0.5);
+    text.setDepth(260);
+    this.tweens.add({
+      targets: text,
+      y: text.y - 18,
+      alpha: 0,
+      delay: 700,
+      duration: 700,
+      onComplete: () => text.destroy(),
+    });
+  }
+
   private tryMedicHeal(): void {
     if (!this.currentSoldier || this.hasFired) return;
     if (this.currentSoldier.getWeaponType() !== WeaponType.PISTOL) return; // Medic class
     const turnId = this.turnId;
 
     const candidates = this.getWoundedAlliesInRange();
-
     if (candidates.length === 0) return;
 
     this.hasFired = true;
 
     const target = candidates[0];
     this.currentSoldier.sayQuip('healing');
+    this.currentSoldier.playActionAnimation('heal', this.currentSoldier.sprite.flipX ? -1 : 1);
 
     // Heal beam
     const beam = this.add.graphics();
@@ -3222,36 +3999,59 @@ private startParatrooperDrop(): void {
   }
 
   private handleExplosion(x: number, y: number, radius: number, baseDamage: number = 50, shooter: Soldier | null = null): void {
-    // Destroy terrain (skip for tiny bullet impacts)
-    if (radius > 5) {
+    const isBulletImpact = shooter !== null;
+    const blastExposure = new Map<Soldier, number>();
+    this.soldiers.forEach(soldier => {
+      if (!soldier.isAlive() || soldier === shooter) return;
+      if (Phaser.Math.Distance.Between(x, y, soldier.x, soldier.y) >= radius) return;
+      blastExposure.set(soldier, this.terrain.getBlastExposure(x, y, soldier.x, soldier.y - 6));
+    });
+
+    // Direct-fire rounds leave sparks and dust, not fresh craters or regenerated grass.
+    if (shouldDeformTerrainOnImpact(radius, isBulletImpact)) {
       this.terrain.destroyCircle(x, y, radius);
     }
+    if (radius >= 45) SoundManager.pulseMusicIntensity(0.95, 1.4);
 
-    // Damage soldiers in radius. `shooter` is only set for bullet impacts — their tiny
+    // Damage soldiers in radius. `shooter` is only set for bullet impacts, so their tiny
     // splash never harms the one who fired (big explosives still self-damage as usual).
     this.soldiers.forEach(soldier => {
       if (soldier === shooter) return;
       if (soldier.isAlive()) {
         const distance = Phaser.Math.Distance.Between(x, y, soldier.x, soldier.y);
         if (distance < radius) {
-          const damage = Math.round((1 - distance / radius) * baseDamage);
+          const rawDamage = Math.round((1 - distance / radius) * baseDamage);
+          const exposure = blastExposure.get(soldier) ?? 1;
+          const damage = Math.round(rawDamage * exposure);
           this.damageSoldier(soldier, damage);
+          if (exposure < 1 && rawDamage - damage >= 2) {
+            this.showCoverProtection(soldier, rawDamage - damage);
+          }
 
           // Apply knockback (reduced for bullets)
           if (radius > 10) {
             const angle = Phaser.Math.Angle.Between(x, y, soldier.x, soldier.y);
             const strength = 1 - distance / radius;
-            const knockback = strength * 230;
+            const knockback = strength * 230 * exposure;
             soldier.applyKnockback(
               Math.cos(angle) * knockback,
-              Phaser.Math.Clamp(Math.sin(angle) * knockback - strength * 45, -140, 110)
+              Phaser.Math.Clamp((Math.sin(angle) * strength * 230 - strength * 45) * exposure, -140, 110)
             );
           }
         }
       }
     });
 
-    if (radius > 5) this.lastImpact = { x, y };
+    if (radius >= 25) {
+      const nearMiss = this.soldiers
+        .filter(soldier => soldier.isAlive() && soldier !== shooter)
+        .map(soldier => ({ soldier, distance: Phaser.Math.Distance.Between(x, y, soldier.x, soldier.y) }))
+        .filter(entry => entry.distance >= radius && entry.distance <= radius + 72)
+        .sort((a, b) => a.distance - b.distance)[0];
+      if (nearMiss && Math.random() < 0.72) nearMiss.soldier.sayQuip('nearMiss');
+    }
+
+    if (!isBulletImpact && radius > 5) this.lastImpact = { x, y };
 
     // Barrels/mines caught in the blast go off too (chain reactions).
     this.hazards.onExplosion(x, y, radius);
@@ -3279,8 +4079,11 @@ private startParatrooperDrop(): void {
       }
     }
 
-    // Play appropriate sound and create effect based on explosion size
-    if (radius > 15) {
+    // Bullet hit radii describe hit forgiveness, not explosion size.
+    if (isBulletImpact) {
+      SoundManager.playBulletImpact();
+      this.createBulletSparkEffect(x, y);
+    } else if (radius > 15) {
       // Big explosion (rocket, mortar, grenade)
       if (radius >= 80) {
         SoundManager.playExplosion('large');
@@ -3288,16 +4091,61 @@ private startParatrooperDrop(): void {
         SoundManager.playExplosion('medium');
       }
       this.createExplosionEffect(x, y, radius);
-    } else if (radius <= 5) {
-      // Tiny bullet spark effect
-      SoundManager.playBulletImpact();
-      this.createBulletSparkEffect(x, y);
     } else {
-      // Small explosion (shotgun pellets, etc)
+      // Small non-bullet explosive impact.
       SoundManager.playExplosion('small');
 
       this.createSmallImpactEffect(x, y, radius);
     }
+  }
+
+  private showCoverProtection(soldier: Soldier, blockedDamage: number): void {
+    const text = this.add.text(soldier.x, soldier.y - 62, `COVER -${blockedDamage}`, {
+      font: 'bold 13px Arial',
+      color: '#bde8ff',
+      stroke: '#071018',
+      strokeThickness: 3,
+    });
+    text.setOrigin(0.5);
+    text.setDepth(220);
+    this.tweens.add({
+      targets: text,
+      y: text.y - 18,
+      alpha: 0,
+      duration: 850,
+      ease: 'Quad.easeOut',
+      onComplete: () => text.destroy(),
+    });
+  }
+
+  private handleSoldierDeath(fallen: Soldier): void {
+    this.updateBattleMusicPhase();
+    SoundManager.pulseMusicIntensity(0.84, 1.6);
+    this.creditKill(fallen);
+
+    // Killed on their own turn before attacking (e.g. stepped on a mine): move on once any
+    // chain reaction has finished. (Shots and falls already end the turn themselves.)
+    if (fallen === this.currentSoldier && !this.hasFired && !this.isTurnEnding) {
+      const turnId = this.turnId;
+      const tryEnd = (): void => {
+        if (turnId !== this.turnId || this.isTurnEnding) return;
+        if (this.hazards.isBusy()) {
+          this.time.delayedCall(250, tryEnd);
+          return;
+        }
+        this.endTurn();
+      };
+      this.time.delayedCall(1300, tryEnd);
+    }
+
+    const witness = this.soldiers
+      .filter(soldier => soldier.isAlive() && soldier.team === fallen.team && soldier !== fallen)
+      .map(soldier => ({ soldier, distance: Phaser.Math.Distance.Between(soldier.x, soldier.y, fallen.x, fallen.y) }))
+      .filter(entry => entry.distance <= 420)
+      .sort((a, b) => a.distance - b.distance)[0];
+
+    if (!witness) return;
+    this.speak(witness.soldier, 'allyDown', 650, { name: fallen.name });
   }
   
   private createBulletSparkEffect(x: number, y: number): void {
@@ -3358,116 +4206,7 @@ private startParatrooperDrop(): void {
   }
 
   private createExplosionEffect(x: number, y: number, radius: number): void {
-    // === ENHANCED EXPLOSION WITH PIZZAZZ ===
-    
-    // Multiple flash layers for dramatic effect
-    const flashColors = [0xffffff, 0xffff00, 0xff8800, 0xff4400];
-    flashColors.forEach((color, i) => {
-      const flash = this.add.circle(x, y, radius * (1 - i * 0.15), color, 0.9 - i * 0.15);
-      flash.setDepth(200 + i);
-      this.tweens.add({
-        targets: flash,
-        alpha: 0,
-        scale: 1.8 - i * 0.2,
-        duration: 150 + i * 50,
-        ease: 'Power2',
-        onComplete: () => flash.destroy(),
-      });
-    });
-    
-    // Fire/smoke particles - MORE of them
-    const particles = this.add.particles(x, y, 'explosion-particle', {
-      speed: { min: 150, max: 400 },
-      scale: { start: 1.5, end: 0 },
-      lifespan: 600,
-      quantity: 35,
-      emitting: false,
-      tint: [0xffaa00, 0xff6600, 0xff3300, 0x333333],
-    });
-    particles.setDepth(199);
-    particles.explode(35);
-    
-    // Debris particles (dirt chunks)
-    for (let i = 0; i < 20; i++) {
-      const angle = Math.random() * Math.PI * 2;
-      const speed = 150 + Math.random() * 250;
-      const size = 3 + Math.random() * 6;
-      
-      const debris = this.add.rectangle(x, y, size, size, 0x5c4033);
-      debris.setDepth(198);
-      
-      this.tweens.add({
-        targets: debris,
-        x: x + Math.cos(angle) * speed * 0.8,
-        y: y + Math.sin(angle) * speed * 0.5 + 80, // Gravity arc
-        rotation: Math.random() * 10,
-        alpha: 0,
-        duration: 600 + Math.random() * 400,
-        ease: 'Power1',
-        onComplete: () => debris.destroy(),
-      });
-    }
-    
-    // Sparks
-    for (let i = 0; i < 15; i++) {
-      const angle = Math.random() * Math.PI * 2;
-      const dist = radius * 0.5 + Math.random() * radius;
-      
-      const spark = this.add.circle(x, y, 2, 0xffff88);
-      spark.setDepth(201);
-      
-      this.tweens.add({
-        targets: spark,
-        x: x + Math.cos(angle) * dist,
-        y: y + Math.sin(angle) * dist,
-        alpha: 0,
-        scale: 0,
-        duration: 200 + Math.random() * 200,
-        onComplete: () => spark.destroy(),
-      });
-    }
-    
-    // Shockwave ring
-    const shockwave = this.add.circle(x, y, radius * 0.3, 0xffffff, 0);
-    shockwave.setStrokeStyle(4, 0xffffff, 0.6);
-    shockwave.setDepth(195);
-    
-    this.tweens.add({
-      targets: shockwave,
-      scale: 3,
-      alpha: 0,
-      duration: 300,
-      ease: 'Power2',
-      onComplete: () => shockwave.destroy(),
-    });
-    
-    // SCREEN SHAKE - intensity based on explosion size
-    const shakeIntensity = Math.min(0.025, 0.008 + (radius / 100) * 0.012);
-    this.cameras.main.shake(300, shakeIntensity);
-    
-    // Brief zoom punch for big explosions
-    if (radius > 40) {
-      const currentZoom = this.cameras.main.zoom;
-      this.tweens.add({
-        targets: this.cameras.main,
-        zoom: currentZoom * 1.05,
-        duration: 50,
-        yoyo: true,
-        ease: 'Power2',
-      });
-    }
-    
-    // Smoke cloud that lingers
-    const smoke = this.add.circle(x, y, radius * 0.6, 0x333333, 0.4);
-    smoke.setDepth(150);
-    this.tweens.add({
-      targets: smoke,
-      scale: 2,
-      alpha: 0,
-      duration: 1500,
-      ease: 'Power1',
-      onComplete: () => smoke.destroy(),
-    });
+    playBattleExplosion(this, x, y, radius);
   }
 
   private handleFlameWave(
@@ -3497,7 +4236,8 @@ private startParatrooperDrop(): void {
       const closestX = startX + dx * t;
       const closestY = startY + dy * t;
 
-      if (Phaser.Math.Distance.Between(soldier.x, soldier.y, closestX, closestY) <= corridorRadius) {
+      if (Phaser.Math.Distance.Between(soldier.x, soldier.y, closestX, closestY) <= corridorRadius &&
+          !sweepTerrain(startX, startY, soldier.x, soldier.y - 6, (x, y) => this.terrain.isPointSolid(x, y))) {
         this.damageSoldier(soldier, damage);
       }
     });
@@ -3524,6 +4264,8 @@ private startParatrooperDrop(): void {
     if (this.isTurnEnding) return;
     this.isTurnEnding = true;
 
+    const relayWinner = this.processRelayCaptures();
+
     // Clear any in-flight shot bookkeeping and timers.
     this.clearShotResolution();
     this.exitAirstrikeTargeting();
@@ -3532,12 +4274,12 @@ private startParatrooperDrop(): void {
     if (this.currentSoldier) {
       this.currentSoldier.setActive(false);
     }
+    this.isCrateWeaponArmed = false;
 
     if (this.turnActor && this.turnActorAttacked) {
       this.playShotBanter(this.turnActor, this.turnStats);
     }
     this.turnActor = null;
-    this.isSpecialArmed = false;
 
     // Prevent any pending "release-to-fire" from firing after the turn changes.
     this.clearChargeState();
@@ -3546,21 +4288,33 @@ private startParatrooperDrop(): void {
     this.aimLine.clear();
     this.aimPowerText.setVisible(false);
     this.power = 50;
-    this.powerChargeDirection = 1;
     this.aimAngle = -45;
-    this.mouseAimTargetAngle = null;
     this.cameras.main.stopFollow();
     this.currentSoldier = null;
+    this.emitPowerupStatus(null);
 
     // Check for game over
     const gameState = this.turnManager.checkGameOver();
     if (gameState.isOver) {
-      this.events.emit('game-over', gameState.winner);
+      this.events.emit('game-over', gameState.winner, 'elimination');
+      return;
+    }
+    if (relayWinner) {
+      this.events.emit('game-over', relayWinner, 'signal');
       return;
     }
 
     // Next turn - switch to other team
+    const previousRound = this.turnManager.getTurnInfo().roundNumber;
     this.turnManager.nextTurn();
+    const nextRound = this.turnManager.getTurnInfo().roundNumber;
+    const relayIncomeWinner = nextRound > previousRound
+      ? this.awardRelayIncome(nextRound)
+      : null;
+    if (relayIncomeWinner) {
+      this.events.emit('game-over', relayIncomeWinner, 'signal');
+      return;
+    }
 
     // Occasionally drop something that can swing the fight (helps the losing side more often).
     this.maybeTriggerBalanceEvent();
@@ -3572,9 +4326,9 @@ private startParatrooperDrop(): void {
   }
 
   private clearChargeState(): void {
+    this.cancelSpecial();
     this.isCharging = false;
     this.isMouseCharging = false;
-    this.powerChargeDirection = 1;
     this.mouseChargeTurnId = 0;
     this.mouseChargeSoldier = null;
     this.keyboardChargeTurnId = 0;
@@ -3755,7 +4509,10 @@ private startParatrooperDrop(): void {
 
     SoundManager.playPlaneEngine(4);
 
-    const plane = this.createPlane(startX, planeY, facingRight);
+    const factionId = favoredTeam === Team.RED
+      ? this.factionMatchup.red
+      : this.factionMatchup.blue;
+    const plane = this.createPlane(startX, planeY, facingRight, factionId);
     plane.setDepth(120);
 
     this.tweens.add({
@@ -3790,6 +4547,15 @@ private startParatrooperDrop(): void {
     return 'AIRSTRIKE';
   }
 
+  private getSupplyDropPurpose(type: SupplyDropType): string {
+    if (type === 'medkit') return 'INSTANT HEAL';
+    if (type === 'artillery') return 'PRESS C TO USE';
+    if (type === 'armor') return 'PASSIVE DEFENSE';
+    if (type === 'munitions') return 'X + C CALL-INS';
+    if (type === 'weapon') return 'PRESS Q TO ARM';
+    return 'PRESS X TO USE';
+  }
+
   private dropSupplyCrate(dropX: number, startY: number, type: SupplyDropType): void {
     const landingY = this.terrain.getSurfaceY(dropX) - 10;
 
@@ -3822,6 +4588,15 @@ private startParatrooperDrop(): void {
     });
     label.setOrigin(0.5, 0);
     crate.add(label);
+
+    const purpose = this.add.text(0, 31, this.getSupplyDropPurpose(type), {
+      font: 'bold 7px Courier New',
+      color: Phaser.Display.Color.IntegerToColor(glowColor).rgba,
+      stroke: '#000000',
+      strokeThickness: 2,
+    });
+    purpose.setOrigin(0.5, 0);
+    crate.add(purpose);
 
     // Parachute
     const parachute = this.add.container(dropX, startY - 30);
@@ -4017,68 +4792,101 @@ private startParatrooperDrop(): void {
   }
 
   private applySupplyDropToSoldier(type: SupplyDropType, soldier: Soldier, x: number, y: number): void {
-    // Small confirmation sound
     SoundManager.playSelect();
+    soldier.sayQuip('supply');
 
-    if (type === 'weapon') {
-      const def = SPECIAL_WEAPONS[rollSpecialWeapon()];
-      soldier.setSpecialWeapon(def.id);
-      this.showPowerupText(x, y - 20, `${def.name.toUpperCase()} (Q)`, def.color);
-      this.speak(soldier, 'pickup', 300);
-      return;
-    }
+    let title = '';
+    let subtitle = '';
+    let color = 0xffffff;
 
     if (type === 'medkit') {
       const amount = Phaser.Math.Between(25, 45);
       const healed = soldier.heal(amount);
-      this.showPowerupText(x, y - 20, healed > 0 ? 'MEDKIT' : 'MEDKIT (FULL)', 0x44ff66);
-      return;
-    }
-
-    if (type === 'artillery') {
+      title = healed > 0 ? `MEDKIT +${healed} HP` : 'MEDKIT - HEALTH FULL';
+      subtitle = 'APPLIED ON PICKUP';
+      color = 0x44ff66;
+    } else if (type === 'artillery') {
       soldier.addArtilleryCharges(1);
-      this.showPowerupText(x, y - 20, 'HOWITZER READY (C)', 0xffaa00);
-      return;
-    }
-
-    if (type === 'armor') {
+      title = 'HOWITZER READY';
+      subtitle = 'PRESS C TO DEPLOY';
+      color = 0xffaa00;
+    } else if (type === 'armor') {
       soldier.addArmor(40);
-      this.showPowerupText(x, y - 20, 'ARMOR PLATES', 0x66ccff);
-      return;
-    }
-
-    if (type === 'munitions') {
+      title = 'ARMOR +40';
+      subtitle = 'PASSIVE: ABSORBS 65% OF DAMAGE';
+      color = 0x66ccff;
+    } else if (type === 'weapon') {
+      const def = SPECIAL_WEAPONS[rollSpecialWeapon()];
+      soldier.setSpecialWeapon(def.id);
+      title = def.name.toUpperCase();
+      subtitle = `PRESS Q TO ARM - ${def.hint.toUpperCase()}`;
+      color = def.color;
+    } else if (type === 'munitions') {
       soldier.addAirstrikeCharges(1);
       soldier.addArtilleryCharges(1);
-      this.showPowerupText(x, y - 20, 'MUNITIONS CACHE', 0xff66cc);
-      return;
+      title = 'MUNITIONS CACHE';
+      subtitle = 'X AIRSTRIKE + C HOWITZER';
+      color = 0xff66cc;
+    } else {
+      soldier.addAirstrikeCharges(1);
+      title = 'AIRSTRIKE READY';
+      subtitle = 'PRESS X TO TARGET';
+      color = 0x66ffff;
     }
 
-    soldier.addAirstrikeCharges(1);
-    this.showPowerupText(x, y - 20, 'AIRSTRIKE READY (X)', 0x66ffff);
+    this.showPowerupText(x, y - 20, title, color, subtitle);
+    this.emitPowerupStatus(soldier);
   }
 
-  private showPowerupText(x: number, y: number, text: string, color: number): void {
-    const label = this.add.text(x, y, text, {
+  private showPowerupText(
+    x: number,
+    y: number,
+    text: string,
+    color: number,
+    subtitle: string = '',
+  ): void {
+    const container = this.add.container(x, y);
+    container.setDepth(250);
+    const label = this.add.text(0, 0, text, {
       font: 'bold 16px Arial',
       color: '#ffffff',
       stroke: '#000000',
       strokeThickness: 4,
     });
     label.setOrigin(0.5);
-    label.setDepth(250);
-
-    // Color glow outline via shadow
     label.setShadow(0, 0, Phaser.Display.Color.IntegerToColor(color).rgba, 8, true, true);
+    container.add(label);
+
+    if (subtitle) {
+      const detail = this.add.text(0, 19, subtitle, {
+        font: 'bold 9px Courier New',
+        color: Phaser.Display.Color.IntegerToColor(color).rgba,
+        stroke: '#000000',
+        strokeThickness: 3,
+      });
+      detail.setOrigin(0.5);
+      container.add(detail);
+    }
 
     this.tweens.add({
-      targets: label,
+      targets: container,
       y: y - 55,
       alpha: 0,
-      duration: 1200,
+      duration: subtitle ? 1900 : 1200,
       ease: 'Power2',
-      onComplete: () => label.destroy(),
+      onComplete: () => container.destroy(true),
     });
+  }
+
+  private emitPowerupStatus(soldier: Soldier | null = this.currentSoldier): void {
+    this.events.emit('powerups-update', soldier ? {
+      name: soldier.name,
+      armor: soldier.getArmor(),
+      airstrikeCharges: soldier.getAirstrikeCharges(),
+      artilleryCharges: soldier.getArtilleryCharges(),
+      crateWeapon: soldier.getSpecialWeapon() ? SPECIAL_WEAPONS[soldier.getSpecialWeapon()!].name : null,
+      crateWeaponArmed: soldier === this.currentSoldier && this.isCrateWeaponArmed,
+    } : null);
   }
 
   private isTeamAI(team: Team): boolean {
@@ -4091,7 +4899,11 @@ private startParatrooperDrop(): void {
     const enemies = this.soldiers.filter(s => s.isAlive() && s.team !== team);
     if (enemies.length === 0) return choices[0];
 
-    // Pick the unit with the closest enemy (reduces wasted long shots).
+    // Favor useful engagement range, but activate crowded soldiers early so they
+    // can spread out before the rest of the squad takes its turns.
+    const teammates = this.soldiers.filter(
+      soldier => soldier.isAlive() && soldier.team === team,
+    );
     let best = choices[0];
     let bestScore = Number.POSITIVE_INFINITY;
     for (const s of choices) {
@@ -4100,8 +4912,18 @@ private startParatrooperDrop(): void {
         const d = Phaser.Math.Distance.Between(s.x, s.y, e.x, e.y);
         if (d < nearest) nearest = d;
       }
-      if (nearest < bestScore) {
-        bestScore = nearest;
+      const congestion = teammates
+        .filter(other => other !== s)
+        .reduce((score, other) => {
+          const gap = Phaser.Math.Distance.Between(s.x, s.y, other.x, other.y);
+          return score + Math.max(0, 100 - gap);
+        }, 0);
+      const utilityReadiness =
+        (s.getAirstrikeCharges() + s.getArtilleryCharges()) * 28;
+      const tacticalScore = nearest - congestion * 0.35 - utilityReadiness;
+
+      if (tacticalScore < bestScore) {
+        bestScore = tacticalScore;
         best = s;
       }
     }
@@ -4130,9 +4952,145 @@ private startParatrooperDrop(): void {
   }
 
   private getMovementRemaining(soldier: Soldier): number {
-    // startX/maxMovement are set at startTurn() for the active unit.
-    const used = Math.abs(soldier.x - this.startX);
-    return Math.max(0, this.maxMovement - used);
+    if (soldier !== this.currentSoldier) return 0;
+    return Math.max(0, this.maxMovement - this.movementUsed);
+  }
+
+  private getAISpacedDestinationX(
+    soldier: Soldier,
+    goalX: number,
+    desiredMove: number,
+    minimumSpacing: number = AI_FORMATION_SPACING,
+  ): number {
+    const direction = Math.sign(goalX - soldier.x) || 1;
+    const preferredX = Phaser.Math.Clamp(
+      soldier.x + direction * Math.max(0, desiredMove),
+      28,
+      this.worldWidth - 28,
+    );
+    const allyXs = this.soldiers
+      .filter(ally => ally !== soldier && ally.isAlive() && ally.team === soldier.team)
+      .map(ally => ally.x);
+
+    return chooseSpacedDestinationX({
+      originX: soldier.x,
+      goalX,
+      preferredX,
+      worldWidth: this.worldWidth,
+      squadIndex: soldier.squadIndex,
+      allyXs,
+      minimumSpacing,
+    });
+  }
+
+  private hasAITunnelObstruction(soldier: Soldier, goalX: number): boolean {
+    const direction = Math.sign(goalX - soldier.x) || 1;
+    const probeDistances = [18, 28, 40, 54];
+    const probeHeights = [-12, -2, 9];
+
+    return probeDistances.some(distance =>
+      probeHeights.some(offsetY =>
+        this.terrain.isPointSolid(
+          soldier.x + direction * distance,
+          soldier.y + offsetY,
+        )
+      )
+    );
+  }
+
+  private isAIBodyClear(x: number, y: number): boolean {
+    const xOffsets = [-7, 0, 7];
+    const yOffsets = [-18, -9, 1, 13];
+    return xOffsets.every(offsetX =>
+      yOffsets.every(offsetY =>
+        !this.terrain.isPointSolid(x + offsetX, y + offsetY)
+      )
+    );
+  }
+
+  private getAIWalkableSurfaceYs(x: number): number[] {
+    const surfaces: number[] = [];
+    for (let y = 26; y < this.worldHeight - 4; y++) {
+      if (
+        this.terrain.isPointSolid(x, y) &&
+        !this.terrain.isPointSolid(x, y - 1)
+      ) {
+        const soldierY = y - 16;
+        if (this.isAIBodyClear(x, soldierY)) {
+          surfaces.push(y);
+        }
+      }
+    }
+    return surfaces;
+  }
+
+  private findAIGrappleDestination(
+    soldier: Soldier,
+    goalX: number,
+  ): AIGrappleCandidate | null {
+    if (soldier.getRemainingGrapples() <= 0) return null;
+
+    const direction = Math.sign(goalX - soldier.x) || 1;
+    const candidates: AIGrappleCandidate[] = [];
+    const distances = [100, 150, 210, 270, 330];
+
+    for (const distance of distances) {
+      const x = Phaser.Math.Clamp(
+        soldier.x + direction * distance,
+        26,
+        this.worldWidth - 26,
+      );
+
+      for (const surfaceY of this.getAIWalkableSurfaceYs(x)) {
+        const y = surfaceY - 16;
+        const pathClear = !this.isLineBlockedByTerrain(
+          soldier.x,
+          soldier.y - 5,
+          x,
+          y - 5,
+          3,
+        );
+        candidates.push({
+          x,
+          y,
+          pathClear,
+          bodyClear: this.isAIBodyClear(x, y),
+          stableLanding: true,
+        });
+      }
+
+      // An open point over a nearby floor lets the hook vault a crater or low wall.
+      const airY = Phaser.Math.Clamp(soldier.y - 78, 48, this.worldHeight - 80);
+      const floorBelow = this.terrain.findSurfaceYAtOrBelow(x, airY + 16, 190);
+      if (floorBelow !== null) {
+        candidates.push({
+          x,
+          y: airY,
+          pathClear: !this.isLineBlockedByTerrain(
+            soldier.x,
+            soldier.y - 5,
+            x,
+            airY - 5,
+            3,
+          ),
+          bodyClear: this.isAIBodyClear(x, airY),
+          stableLanding: false,
+        });
+      }
+    }
+
+    const allyXs = this.soldiers
+      .filter(ally => ally !== soldier && ally.isAlive() && ally.team === soldier.team)
+      .map(ally => ally.x);
+
+    return chooseAIGrappleDestination({
+      originX: soldier.x,
+      originY: soldier.y,
+      goalX,
+      worldWidth: this.worldWidth,
+      allyXs,
+      candidates,
+    });
   }
 
   private aiMoveTowardX(
@@ -4140,7 +5098,7 @@ private startParatrooperDrop(): void {
     soldier: Soldier,
     targetX: number,
     desiredMove: number,
-    onDone: () => void
+    onDone: (outcome: AIMoveOutcome) => void,
   ): void {
     if (token !== this.aiTurnToken) return;
     if (this.currentSoldier !== soldier) return;
@@ -4150,7 +5108,11 @@ private startParatrooperDrop(): void {
     const remaining = this.getMovementRemaining(soldier);
     const moveDist = Math.min(Math.max(0, desiredMove), remaining);
     if (moveDist < 6) {
-      onDone();
+      onDone({
+        reason: remaining < 6 ? 'budget' : 'goal',
+        distanceMoved: 0,
+        requestedDistance: moveDist,
+      });
       return;
     }
 
@@ -4166,16 +5128,21 @@ private startParatrooperDrop(): void {
     let lastX = soldier.x;
     let stuckTicks = 0;
 
-    const finish = (): void => {
+    const finish = (reason: AIMoveStopReason): void => {
       if (done) return;
       done = true;
       soldier.stopMoving();
+      const outcome: AIMoveOutcome = {
+        reason,
+        distanceMoved: Math.abs(soldier.x - legStartX),
+        requestedDistance: moveDist,
+      };
       this.time.delayedCall(220, () => {
         if (token !== this.aiTurnToken) return;
         if (this.currentSoldier !== soldier) return;
         if (!soldier.isAlive()) return;
         if (this.hasFired || this.isTurnEnding) return;
-        onDone();
+        onDone(outcome);
       });
     };
 
@@ -4187,27 +5154,26 @@ private startParatrooperDrop(): void {
 
         if (token !== this.aiTurnToken) {
           tick.destroy();
-          finish();
+          finish('cancelled');
           return;
         }
         if (this.currentSoldier !== soldier) {
           tick.destroy();
-          finish();
+          finish('cancelled');
           return;
         }
         if (!soldier.isAlive() || this.hasFired || this.isTurnEnding) {
           tick.destroy();
-          finish();
+          finish('cancelled');
           return;
         }
 
         const movedLeg = Math.abs(soldier.x - legStartX);
-        const movedTurn = Math.abs(soldier.x - this.startX);
 
         const reachedLeg =
           movedLeg >= moveDist - 2 ||
           (dir > 0 ? soldier.x >= legGoalX : soldier.x <= legGoalX);
-        const reachedTurn = movedTurn >= this.maxMovement - 2;
+        const reachedTurn = this.getMovementRemaining(soldier) <= 2;
         const nearBounds = soldier.x < 20 || soldier.x > this.worldWidth - 20;
 
         // Probe the ground ahead — high-mobility AI units used to sprint straight
@@ -4219,9 +5185,16 @@ private startParatrooperDrop(): void {
         else stuckTicks = 0;
         lastX = soldier.x;
 
-        if (reachedLeg || reachedTurn || nearBounds || cliffAhead || stuckTicks >= 8) {
+        let stopReason: AIMoveStopReason | null = null;
+        if (reachedLeg) stopReason = 'goal';
+        else if (reachedTurn) stopReason = 'budget';
+        else if (nearBounds) stopReason = 'bounds';
+        else if (cliffAhead) stopReason = 'cliff';
+        else if (stuckTicks >= 8) stopReason = 'blocked';
+
+        if (stopReason) {
           tick.destroy();
-          finish();
+          finish(stopReason);
         }
       },
     });
@@ -4230,8 +5203,258 @@ private startParatrooperDrop(): void {
     this.time.delayedCall(1800, () => {
       if (done) return;
       tick.destroy();
-      finish();
+      const moved = Math.abs(soldier.x - legStartX);
+      finish(moved >= moveDist * 0.85 ? 'goal' : 'timeout');
     });
+  }
+
+  private aiNavigateTowardX(
+    token: number,
+    soldier: Soldier,
+    goalX: number,
+    destinationX: number,
+    onDone: () => void,
+    recoveryCount: number = 0,
+  ): void {
+    const requestedDistance = Math.abs(destinationX - soldier.x);
+    this.aiMoveTowardX(
+      token,
+      soldier,
+      destinationX,
+      requestedDistance,
+      outcome => {
+        if (token !== this.aiTurnToken) return;
+        if (this.currentSoldier !== soldier || !soldier.isAlive()) return;
+        if (this.hasFired || this.isTurnEnding) return;
+
+        if (
+          recoveryCount >= AI_MAX_NAVIGATION_RECOVERIES ||
+          outcome.reason === 'goal' ||
+          outcome.reason === 'budget' ||
+          outcome.reason === 'bounds' ||
+          outcome.reason === 'cancelled'
+        ) {
+          onDone();
+          return;
+        }
+
+        const grappleDestination = this.findAIGrappleDestination(soldier, goalX);
+        const canTunnel = this.hasAITunnelObstruction(soldier, goalX);
+        const recovery = chooseAIRecoveryAction({
+          reason: outcome.reason,
+          distanceMoved: outcome.distanceMoved,
+          requestedDistance: outcome.requestedDistance,
+          expandedMode: this.gameMode === 'expanded',
+          movementRemaining: this.getMovementRemaining(soldier),
+          tunnelMovementCost: TUNNEL_MOVEMENT_COST,
+          tunnelsRemaining: MAX_TUNNELS_PER_TURN - this.tunnelsUsedThisTurn,
+          canTunnel,
+          grapplesRemaining: soldier.getRemainingGrapples(),
+          hasGrappleDestination: grappleDestination !== null,
+        });
+
+        let shouldGrapple = recovery === 'grapple';
+        if (recovery === 'tunnel') {
+          this.aimAngle = goalX >= soldier.x ? 0 : 180;
+          if (this.tryTunnel()) {
+            this.time.delayedCall(700, () => {
+              if (token !== this.aiTurnToken) return;
+              if (this.currentSoldier !== soldier || !soldier.isAlive()) return;
+              if (this.hasFired || this.isTurnEnding) return;
+              this.aiNavigateTowardX(
+                token,
+                soldier,
+                goalX,
+                destinationX,
+                onDone,
+                recoveryCount + 1,
+              );
+            });
+            return;
+          }
+          shouldGrapple = true;
+        }
+
+        if (
+          shouldGrapple &&
+          grappleDestination &&
+          soldier.getRemainingGrapples() > 0 &&
+          soldier.startGrapple(
+            grappleDestination.x,
+            grappleDestination.y,
+            this.terrain,
+            false,
+          )
+        ) {
+          this.movementUsed = this.maxMovement;
+          this.events.emit('movement-update', {
+            movementUsed: Math.floor(this.movementUsed),
+            maxMovement: this.maxMovement,
+          });
+          this.time.delayedCall(760, () => {
+            if (token !== this.aiTurnToken) return;
+            if (this.currentSoldier !== soldier || !soldier.isAlive()) return;
+            if (this.hasFired || this.isTurnEnding) return;
+            onDone();
+          });
+          return;
+        }
+
+        onDone();
+      },
+    );
+  }
+
+  private tryAIUseAirstrike(
+    shooter: Soldier,
+    enemies: Soldier[],
+    useForBlockedTarget: boolean,
+  ): boolean {
+    if (shooter.getAirstrikeCharges() <= 0) return false;
+
+    const plan = chooseAIAreaStrikeTargetX(
+      this.soldiers
+        .filter(soldier => soldier.isAlive())
+        .map(soldier => ({
+          x: soldier.x,
+          allegiance: soldier.team === shooter.team
+            ? 'friendly' as const
+            : 'enemy' as const,
+        })),
+      this.worldWidth,
+    );
+    if (!plan || plan.friendlyHits > 0) return false;
+
+    const clusteredTarget = plan.enemyHits >= 2 && plan.score >= 4;
+    const blockedFallback =
+      useForBlockedTarget &&
+      plan.enemyHits >= 1 &&
+      plan.score >= 2 &&
+      enemies.length > 0;
+    if (!clusteredTarget && !blockedFallback) return false;
+
+    shooter.sayQuip('supply');
+    this.callAirstrikeAt(plan.x);
+    return this.hasFired;
+  }
+
+  private tryAIUseHowitzer(
+    token: number,
+    shooter: Soldier,
+    enemies: Soldier[],
+    preferredTarget: Soldier,
+    useForBlockedTarget: boolean,
+  ): boolean {
+    if (shooter.getArtilleryCharges() <= 0) return false;
+
+    const targetDistance = Phaser.Math.Distance.Between(
+      shooter.x,
+      shooter.y,
+      preferredTarget.x,
+      preferredTarget.y,
+    );
+    if (!useForBlockedTarget && targetDistance < 520) return false;
+
+    const plan = this.chooseAIShotPlan(
+      shooter,
+      enemies,
+      preferredTarget,
+      HOWITZER_CONFIG,
+    );
+    if (!plan) return false;
+
+    this.enterHowitzerMode();
+    if (!this.isHowitzerMode) return false;
+
+    this.aimAngle = plan.angle;
+    this.power = plan.power;
+    this.drawAimLine();
+    shooter.sayQuip('supply');
+
+    this.time.delayedCall(650, () => {
+      if (token !== this.aiTurnToken) return;
+      if (this.currentSoldier !== shooter || !shooter.isAlive()) return;
+      if (this.hasFired || this.isTurnEnding || !this.isHowitzerMode) return;
+      this.fireProjectile();
+    });
+    return true;
+  }
+
+  private tryAIBuildCover(
+    token: number,
+    shooter: Soldier,
+    threat: Soldier,
+    onDone: () => void,
+  ): boolean {
+    if (shooter.getHealth() > 52) return false;
+    if (this.coverUsedThisTurn || this.isCoverActionInProgress) return false;
+    if (this.getMovementRemaining(shooter) < COVER_MOVEMENT_COST) return false;
+
+    // A barrier inside a narrow cave would worsen the congestion it is meant to solve.
+    const topSurfaceY = this.terrain.getSurfaceY(shooter.x);
+    if (shooter.y > topSurfaceY + 56) return false;
+
+    const threatDistance = Phaser.Math.Distance.Between(
+      shooter.x,
+      shooter.y,
+      threat.x,
+      threat.y,
+    );
+    if (threatDistance < 150 || threatDistance > 760) return false;
+
+    this.aimAngle = Phaser.Math.RadToDeg(
+      Math.atan2(threat.y - shooter.y, threat.x - shooter.x),
+    );
+    if (!this.tryDigIn()) return false;
+
+    this.time.delayedCall(560, () => {
+      if (token !== this.aiTurnToken) return;
+      if (this.currentSoldier !== shooter || !shooter.isAlive()) return;
+      if (this.hasFired || this.isTurnEnding) return;
+      onDone();
+    });
+    return true;
+  }
+
+  private chooseAISupplyDrop(shooter: Soldier): SupplyDrop | null {
+    let best: SupplyDrop | null = null;
+    let bestScore = 35;
+
+    for (const drop of this.supplyDrops) {
+      if (!drop.landed || drop.collected || !drop.crate.active) continue;
+
+      const distance = Phaser.Math.Distance.Between(
+        shooter.x,
+        shooter.y,
+        drop.crate.x,
+        drop.crate.y,
+      );
+      if (distance > 380) continue;
+
+      let value = 0;
+      if (drop.type === 'medkit') {
+        value = shooter.getHealth() < 70 ? 170 - shooter.getHealth() : 0;
+      } else if (drop.type === 'armor') {
+        value = shooter.getArmor() < 35 ? 115 - shooter.getArmor() : 0;
+      } else if (drop.type === 'airstrike') {
+        value = shooter.getAirstrikeCharges() === 0 ? 115 : 65;
+      } else if (drop.type === 'artillery') {
+        value = shooter.getArtilleryCharges() === 0 ? 115 : 65;
+      } else {
+        value =
+          shooter.getAirstrikeCharges() + shooter.getArtilleryCharges() === 0
+            ? 145
+            : 85;
+      }
+
+      const score = value - distance * 0.22;
+      if (score > bestScore) {
+        bestScore = score;
+        best = drop;
+      }
+    }
+
+    return best;
   }
 
   private takeAITurn(token: number): void {
@@ -4247,7 +5470,10 @@ private startParatrooperDrop(): void {
       return;
     }
 
-    const aimAndFire = (preferredTarget: Soldier): void => {
+    const aimAndFire = (
+      preferredTarget: Soldier,
+      allowTerrainAction: boolean = true,
+    ): void => {
       if (token !== this.aiTurnToken) return;
       if (!this.currentSoldier || this.currentSoldier !== shooter || !shooter.isAlive()) return;
       if (!this.isTeamAI(shooter.team)) return;
@@ -4256,6 +5482,23 @@ private startParatrooperDrop(): void {
       const currentEnemies = this.soldiers.filter(s => s.isAlive() && s.team !== shooter.team);
       const plan = this.chooseAIShotPlan(shooter, currentEnemies, preferredTarget);
       if (!plan) {
+        const canOpenLane =
+          allowTerrainAction &&
+          this.gameMode === 'expanded' &&
+          this.getMovementRemaining(shooter) >= TUNNEL_MOVEMENT_COST &&
+          this.hasAITunnelObstruction(shooter, preferredTarget.x);
+        if (canOpenLane) {
+          this.aimAngle = preferredTarget.x >= shooter.x ? 0 : 180;
+          if (this.tryTunnel()) {
+            this.time.delayedCall(700, () => {
+              if (token !== this.aiTurnToken) return;
+              if (this.currentSoldier !== shooter || !shooter.isAlive()) return;
+              if (this.hasFired || this.isTurnEnding) return;
+              aimAndFire(preferredTarget, false);
+            });
+            return;
+          }
+        }
         if (!this.isTurnEnding) this.endTurn();
         return;
       }
@@ -4308,10 +5551,31 @@ private startParatrooperDrop(): void {
       // Decide whether to reposition before firing.
       const remainingMove = this.getMovementRemaining(shooter);
       const dist = Phaser.Math.Distance.Between(startX, startY, target.x, target.y - 10);
+      const hasBlockedDirectTarget =
+        losPreferred &&
+        visibleEnemies.length === 0;
+
+      if (this.tryAIUseAirstrike(shooter, liveEnemies, hasBlockedDirectTarget)) {
+        return;
+      }
+      if (
+        this.tryAIUseHowitzer(
+          token,
+          shooter,
+          liveEnemies,
+          target,
+          hasBlockedDirectTarget,
+        )
+      ) {
+        return;
+      }
+      if (this.tryAIBuildCover(token, shooter, target, attack)) {
+        return;
+      }
 
       let desiredMove = 0;
       if (weaponType === WeaponType.FLAMER) {
-        const desiredRange = 220;
+        const desiredRange = 185;
         if (dist > desiredRange) desiredMove = dist - desiredRange;
       } else if (
         weaponType === WeaponType.SHOTGUN ||
@@ -4331,7 +5595,12 @@ private startParatrooperDrop(): void {
       desiredMove = Math.min(desiredMove, remainingMove);
 
       if (desiredMove > 12) {
-        this.aiMoveTowardX(token, shooter, target.x, desiredMove, () => {
+        const destinationX = this.getAISpacedDestinationX(
+          shooter,
+          target.x,
+          desiredMove,
+        );
+        this.aiNavigateTowardX(token, shooter, target.x, destinationX, () => {
           if (token !== this.aiTurnToken) return;
           if (!this.currentSoldier || this.currentSoldier !== shooter || !shooter.isAlive()) return;
           if (this.hasFired || this.isTurnEnding) return;
@@ -4357,6 +5626,85 @@ private startParatrooperDrop(): void {
 
       aimAndFire(target);
     };
+
+    const supplyTarget = this.chooseAISupplyDrop(shooter);
+    if (supplyTarget && this.getMovementRemaining(shooter) > 30) {
+      const horizontalDistance = Math.abs(supplyTarget.crate.x - shooter.x);
+      const desired = Math.min(
+        this.getMovementRemaining(shooter),
+        Math.max(36, horizontalDistance - 18),
+      );
+      const direction = Math.sign(supplyTarget.crate.x - shooter.x) || 1;
+      const destinationX = Phaser.Math.Clamp(
+        shooter.x + direction * desired,
+        28,
+        this.worldWidth - 28,
+      );
+      this.aiNavigateTowardX(
+        token,
+        shooter,
+        supplyTarget.crate.x,
+        destinationX,
+        () => {
+          if (token !== this.aiTurnToken) return;
+          if (this.currentSoldier !== shooter || !shooter.isAlive()) return;
+          if (this.hasFired || this.isTurnEnding) return;
+          attack();
+        },
+      );
+      return;
+    }
+
+    // In Operations mode the AI will sometimes trade its shot for signal control.
+    if (this.gameMode === 'expanded' && this.relayObjectives.length > 0) {
+      const relayTarget = [...this.relayObjectives]
+        .filter(relay => relay.owner !== team)
+        .sort((a, b) =>
+          Phaser.Math.Distance.Between(shooter.x, shooter.y, a.x, a.y) -
+          Phaser.Math.Distance.Between(shooter.x, shooter.y, b.x, b.y)
+        )[0];
+
+      if (relayTarget) {
+        const relayDistance = Phaser.Math.Distance.Between(shooter.x, shooter.y, relayTarget.x, relayTarget.y);
+        if (relayDistance <= RELAY_CAPTURE_RADIUS) {
+          shooter.sayQuip('objective');
+          this.time.delayedCall(500, () => {
+            if (token === this.aiTurnToken && !this.isTurnEnding) this.endTurn();
+          });
+          return;
+        }
+
+        const remaining = this.getMovementRemaining(shooter);
+        const shouldContest = relayTarget.owner !== 'neutral' || Math.random() < 0.55;
+        if (shouldContest && remaining > 40) {
+          const desired = Math.min(remaining, Math.max(48, relayDistance - RELAY_CAPTURE_RADIUS + 10));
+          const spacedX = this.getAISpacedDestinationX(
+            shooter,
+            relayTarget.x,
+            desired,
+            52,
+          );
+          const destinationX = Phaser.Math.Clamp(
+            spacedX,
+            relayTarget.x - RELAY_CAPTURE_RADIUS + 8,
+            relayTarget.x + RELAY_CAPTURE_RADIUS - 8,
+          );
+          this.aiNavigateTowardX(token, shooter, relayTarget.x, destinationX, () => {
+            if (token !== this.aiTurnToken || this.currentSoldier !== shooter || this.isTurnEnding) return;
+            const nowNear = Phaser.Math.Distance.Between(shooter.x, shooter.y, relayTarget.x, relayTarget.y) <= RELAY_CAPTURE_RADIUS;
+            if (nowNear) {
+              shooter.sayQuip('objective');
+              this.time.delayedCall(350, () => {
+                if (token === this.aiTurnToken && !this.isTurnEnding) this.endTurn();
+              });
+            } else {
+              attack();
+            }
+          });
+          return;
+        }
+      }
+    }
 
     // Medic behavior: heal a nearby ally if possible; otherwise try to move toward the nearest wounded ally once.
     if (shooter.getWeaponType() === WeaponType.PISTOL) {
@@ -4384,7 +5732,13 @@ private startParatrooperDrop(): void {
         const remaining = this.getMovementRemaining(shooter);
         if (remaining > 12) {
           const desired = Math.min(remaining, Math.max(40, d - (healRange - 10)));
-          this.aiMoveTowardX(token, shooter, healTarget.x, desired, () => {
+          const destinationX = this.getAISpacedDestinationX(
+            shooter,
+            healTarget.x,
+            desired,
+            58,
+          );
+          this.aiNavigateTowardX(token, shooter, healTarget.x, destinationX, () => {
             if (token !== this.aiTurnToken) return;
             if (!this.currentSoldier || this.currentSoldier !== shooter || !shooter.isAlive()) return;
             if (this.hasFired || this.isTurnEnding) return;
@@ -4424,7 +5778,12 @@ private startParatrooperDrop(): void {
     return best;
   }
 
-  private chooseAIShotPlan(shooter: Soldier, enemies: Soldier[], preferredTarget?: Soldier): AIShotPlan | null {
+  private chooseAIShotPlan(
+    shooter: Soldier,
+    enemies: Soldier[],
+    preferredTarget?: Soldier,
+    weapon: WeaponConfig = shooter.weapon,
+  ): AIShotPlan | null {
     if (enemies.length === 0) return null;
 
     const candidates = [...enemies].sort((a, b) => {
@@ -4440,7 +5799,7 @@ private startParatrooperDrop(): void {
 
     let best: AIShotPlan | null = null;
     for (const target of candidates) {
-      const shot = this.computeBestShot(shooter, target);
+      const shot = this.computeBestShot(shooter, target, weapon);
       const preferredBias = target === preferredTarget ? -6 : 0;
       const plan: AIShotPlan = {
         target,
@@ -4454,7 +5813,7 @@ private startParatrooperDrop(): void {
       }
     }
 
-    return best;
+    return best && best.score <= AI_MAX_ACCEPTABLE_SHOT_SCORE ? best : null;
   }
 
   private isBulletWeapon(type: WeaponType): boolean {
@@ -4482,12 +5841,16 @@ private startParatrooperDrop(): void {
     return false;
   }
 
-  private computeBestShot(shooter: Soldier, target: Soldier): { angle: number; power: number; score: number } {
-    const weapon = shooter.weapon;
+  private computeBestShot(
+    shooter: Soldier,
+    target: Soldier,
+    weapon: WeaponConfig = shooter.weapon,
+  ): { angle: number; power: number; score: number } {
     const startX = shooter.x;
     const startY = shooter.y - 10;
     const targetX = target.x;
     const targetY = target.y - 10;
+    const shotUnits = this.getLiveShotUnits();
 
     const dx = targetX - startX;
     const dy = targetY - startY;
@@ -4498,7 +5861,31 @@ private startParatrooperDrop(): void {
     if (weapon.type === WeaponType.FLAMER) {
       const clampedDist = Phaser.Math.Clamp(dist, 80, 200);
       const power = Phaser.Math.Clamp((clampedDist - 100), 10, 100);
-      return { angle: directAngle, power, score: Math.max(0, dist - 190) };
+      const flameRange = 100 + power;
+      const directAngleRad = Phaser.Math.DegToRad(directAngle);
+      const launchX = startX + Math.cos(directAngleRad) * 20;
+      const launchY = startY + Math.sin(directAngleRad) * 10;
+      const endX = launchX + Math.cos(directAngleRad) * flameRange;
+      const endY = launchY + Math.sin(directAngleRad) * flameRange;
+      const targetIntercept = findFirstUnitIntercept(
+        launchX,
+        launchY,
+        endX,
+        endY,
+        shotUnits.filter(unit => unit.value === target),
+        shooter,
+        25,
+      );
+      const friendlyInCorridor = shotUnits.some(unit =>
+        unit.team === shooter.team &&
+        unit.value !== shooter &&
+        findFirstUnitIntercept(launchX, launchY, endX, endY, [unit], shooter, 25) !== null
+      );
+
+      let score = targetIntercept ? -60 : 1200 + Math.max(0, dist - flameRange) * 8;
+      if (this.isLineBlockedByTerrain(launchX, launchY, endX, endY, 4)) score += 2200;
+      if (friendlyInCorridor) score += AI_FRIENDLY_FIRE_PENALTY;
+      return { angle: directAngle, power, score };
     }
 
     const isBullet = this.isBulletWeapon(weapon.type);
@@ -4546,8 +5933,30 @@ private startParatrooperDrop(): void {
       if (weapon.type !== WeaponType.MORTAR && Math.abs(dir) < 0.12) continue;
 
       for (let power = minPower; power <= maxPower; power += powerStep) {
-        const evalRes = this.evaluateShot(startX, startY, angle, power, weapon, targetX, targetY);
-        const tacticalScore = this.scoreAIShotResult(shooter, target, weapon, evalRes);
+        const evalRes = this.evaluateShot(
+          shooter,
+          startX,
+          startY,
+          angle,
+          power,
+          weapon,
+          targetX,
+          targetY,
+          shotUnits,
+        );
+        let tacticalScore = this.scoreAIShotResult(shooter, target, weapon, evalRes);
+        if (
+          isBullet &&
+          this.hasFriendlyInSpreadCorridor(
+            shooter,
+            angle,
+            dist + 100,
+            weapon.spreadAngle,
+            shotUnits,
+          )
+        ) {
+          tacticalScore += AI_FRIENDLY_FIRE_PENALTY;
+        }
         if (tacticalScore < bestScore) {
           bestScore = tacticalScore;
           bestAngle = angle;
@@ -4559,64 +5968,131 @@ private startParatrooperDrop(): void {
       if (bestScore <= 14) break;
     }
 
-    // If search failed badly, fall back to a direct-ish shot.
-    if (!Number.isFinite(bestScore) || bestScore > 220) {
-      const fallbackPower = Phaser.Math.Clamp(85, minPower, maxPower);
-      return { angle: directAngle, power: fallbackPower, score: bestScore + 80 };
+    if (!Number.isFinite(bestScore)) {
+      return { angle: bestAngle, power: bestPower, score: Number.POSITIVE_INFINITY };
     }
 
-    // Add a little imperfection so it doesn't feel like an aimbot.
+    // Keep a small human-looking variance only when the perturbed shot remains safe.
     const jitterAngle = Phaser.Math.FloatBetween(-2.5, 2.5);
     const jitterPower = Phaser.Math.FloatBetween(-4, 4);
+    const candidateAngle = Phaser.Math.Clamp(bestAngle + jitterAngle, -180, 180);
+    const candidatePower = Phaser.Math.Clamp(bestPower + jitterPower, minPower, maxPower);
+    const jitterEval = this.evaluateShot(
+      shooter,
+      startX,
+      startY,
+      candidateAngle,
+      candidatePower,
+      weapon,
+      targetX,
+      targetY,
+      shotUnits,
+    );
+    let jitterScore = this.scoreAIShotResult(shooter, target, weapon, jitterEval);
+    if (
+      isBullet &&
+      this.hasFriendlyInSpreadCorridor(
+        shooter,
+        candidateAngle,
+        dist + 100,
+        weapon.spreadAngle,
+        shotUnits,
+      )
+    ) {
+      jitterScore += AI_FRIENDLY_FIRE_PENALTY;
+    }
 
-    return {
-      angle: Phaser.Math.Clamp(bestAngle + jitterAngle, -180, 180),
-      power: Phaser.Math.Clamp(bestPower + jitterPower, minPower, maxPower),
-      score: bestScore,
-    };
+    if (
+      jitterScore <= AI_MAX_ACCEPTABLE_SHOT_SCORE &&
+      jitterScore <= bestScore + 24
+    ) {
+      return {
+        angle: candidateAngle,
+        power: candidatePower,
+        score: jitterScore,
+      };
+    }
+
+    return { angle: bestAngle, power: bestPower, score: bestScore };
+  }
+
+  private getLiveShotUnits(): ShotUnit<Soldier, Team>[] {
+    return this.soldiers
+      .filter(soldier => soldier.isAlive())
+      .map(soldier => ({
+        value: soldier,
+        x: soldier.x,
+        y: soldier.y,
+        team: soldier.team,
+      }));
+  }
+
+  private hasFriendlyInSpreadCorridor(
+    shooter: Soldier,
+    angleDeg: number,
+    maxDistance: number,
+    spreadAngleDeg: number,
+    shotUnits: readonly ShotUnit<Soldier, Team>[],
+  ): boolean {
+    if (spreadAngleDeg <= 0) return false;
+
+    const angleRad = Phaser.Math.DegToRad(angleDeg);
+    const launchX = shooter.x + Math.cos(angleRad) * 20;
+    const launchY = shooter.y - 10 + Math.sin(angleRad) * 10;
+    const dirX = Math.cos(angleRad);
+    const dirY = Math.sin(angleRad);
+    const spreadSlope = Math.tan(Phaser.Math.DegToRad(spreadAngleDeg));
+
+    return shotUnits.some(unit => {
+      if (unit.value === shooter || unit.team !== shooter.team) return false;
+      const dx = unit.x - launchX;
+      const dy = unit.y - launchY;
+      const along = dx * dirX + dy * dirY;
+      if (along <= 0 || along > maxDistance) return false;
+
+      const perpendicular = Math.abs(dx * dirY - dy * dirX);
+      return perpendicular <= 18 + along * spreadSlope;
+    });
   }
 
   private evaluateShot(
-    startX: number,
-    startY: number,
-    angleDeg: number,
-    power: number,
-    weapon: WeaponConfig,
-    targetX: number,
-    targetY: number
-  ): { score: number; minDist: number; impactX: number | null; impactY: number | null } {
-    const angleRad = Phaser.Math.DegToRad(angleDeg);
-    const speed = (power / 100) * weapon.projectileSpeed;
-
-    const vx = Math.cos(angleRad) * speed;
-    const vy = Math.sin(angleRad) * speed;
-    const effectiveGravity = 500 * weapon.gravity;
-    // The AI reads the wind well, but not perfectly.
-    const windAccel = getWindAccel(this.wind, weapon.type) * 0.85;
-
+    shooter: Soldier, startX: number, startY: number, angleDeg: number, power: number,
+    weapon: WeaponConfig, targetX: number, targetY: number, shotUnits: readonly ShotUnit<Soldier, Team>[],
+  ): AIShotEvaluation {
+    const cannonY = weapon === HOWITZER_CONFIG
+      ? (this.terrain.findSurfaceYAtOrBelow(shooter.x, shooter.y + 8, 320) ?? this.terrain.getSurfaceY(shooter.x)) - 12
+      : startY;
+    const muzzle = weapon === HOWITZER_CONFIG ? getMuzzle(startX, cannonY, angleDeg, 34, 34) : getMuzzle(startX, startY, angleDeg);
+    const launchX = muzzle.x;
+    let flight = createFlight(muzzle.x, muzzle.y, angleDeg, power, weapon.projectileSpeed);
     const isBullet = this.isBulletWeapon(weapon.type);
-    // Smaller timestep for fast weapons so the score matches the actual 60fps-ish simulation more closely.
-    const dt = isBullet ? 0.012 : 0.02;
-    const maxTime = 6.0;
-
+    const solid = (x: number, y: number): boolean => this.terrain.isPointSolid(x, y);
     let minDist = Number.POSITIVE_INFINITY;
     let impactX: number | null = null;
     let impactY: number | null = null;
-
-    for (let t = 0; t < maxTime; t += dt) {
-      const x = startX + vx * t + 0.5 * windAccel * t * t;
-      const y = startY + vy * t + 0.5 * effectiveGravity * t * t;
-
-      // Out of bounds
-      if (x < 0 || x > this.worldWidth || y > this.worldHeight + 80) break;
-
-      const d = Phaser.Math.Distance.Between(x, y, targetX, targetY);
-      if (d < minDist) minDist = d;
-
-      // Terrain hit
-      if (y > 0 && this.terrain.isPointSolid(x, y)) {
-        impactX = x;
-        impactY = y;
+    let interceptedSoldier: Soldier | null = null;
+    let terrainProgress: number | null = null;
+    // The AI reads the wind well, but not perfectly.
+    const windAccel = getWindAccel(this.wind, weapon.type) * 0.85;
+    for (let i = 0; i < 10 / BALLISTIC_STEP; i++) {
+      const previous = flight;
+      const result = advanceFlight(flight, weapon, solid, BALLISTIC_STEP, isBullet ? 0 : weapon.projectileSize / 2, windAccel);
+      flight = result.state;
+      if (flight.x < 0 || flight.x > this.worldWidth || flight.y > this.worldHeight) break;
+      minDist = Math.min(minDist, Math.hypot(flight.x - targetX, flight.y - targetY));
+      const unitHit = findFirstUnitIntercept(previous.x, previous.y, flight.x, flight.y, shotUnits,
+        isBullet || previous.age < 0.4 ? shooter : null, 18);
+      if (unitHit) {
+        impactX = unitHit.x;
+        impactY = unitHit.y;
+        interceptedSoldier = unitHit.unit.value;
+        minDist = Math.min(minDist, Math.hypot(unitHit.x - targetX, unitHit.y - targetY));
+        break;
+      }
+      if (result.ended) {
+        impactX = flight.x;
+        impactY = flight.y;
+        terrainProgress = getHorizontalShotProgress(launchX, targetX, flight.x);
         break;
       }
     }
@@ -4644,16 +6120,38 @@ private startParatrooperDrop(): void {
       }
     }
 
-    return { score, minDist, impactX, impactY };
+    return {
+      score,
+      minDist,
+      impactX,
+      impactY,
+      interceptedSoldier,
+      terrainProgress,
+    };
   }
 
   private scoreAIShotResult(
     shooter: Soldier,
     target: Soldier,
     weapon: WeaponConfig,
-    evalRes: { score: number; minDist: number; impactX: number | null; impactY: number | null }
+    evalRes: AIShotEvaluation
   ): number {
     let score = evalRes.score;
+
+    if (evalRes.interceptedSoldier) {
+      if (evalRes.interceptedSoldier.team === shooter.team) {
+        score += AI_FRIENDLY_FIRE_PENALTY;
+      } else {
+        score -= evalRes.interceptedSoldier === target ? 170 : 75;
+      }
+    }
+
+    if (evalRes.terrainProgress !== null) {
+      score += getTerrainObstructionPenalty(evalRes.terrainProgress, evalRes.score);
+      if (this.isBulletWeapon(weapon.type) && evalRes.score > 22) {
+        score += 900 + evalRes.score * 2;
+      }
+    }
 
     if (weapon.explosionRadius > 12 && evalRes.impactX !== null && evalRes.impactY !== null) {
       let expectedEnemyDamage = 0;
@@ -4679,7 +6177,9 @@ private startParatrooperDrop(): void {
       }
 
       score -= expectedEnemyDamage * 1.25;
-      score += expectedFriendlyDamage * 1.75;
+      if (expectedFriendlyDamage > 0) {
+        score += 1500 + expectedFriendlyDamage * 7;
+      }
     } else if (this.isBulletWeapon(weapon.type)) {
       const healthPressure = Math.max(0, 100 - target.getHealth()) * 0.08;
       score -= healthPressure;
@@ -4688,6 +6188,14 @@ private startParatrooperDrop(): void {
         score -= Math.min(50, weapon.damage * Math.max(1, Math.min(weapon.pelletCount, 12)) * 0.18);
         if (weapon.damage >= target.getHealth()) score -= 35;
       }
+    }
+
+    if (
+      evalRes.impactX === null &&
+      evalRes.interceptedSoldier === null &&
+      evalRes.minDist > Math.max(24, weapon.explosionRadius * 0.8)
+    ) {
+      score += 400;
     }
 
     return score;
@@ -4705,6 +6213,22 @@ private startParatrooperDrop(): void {
     };
   }
 
+  private handleBulletNearMiss(x0: number, y0: number, x1: number, y1: number, shooter: Soldier): void {
+    if (this.gameMode !== 'expanded') return;
+    const dx = x1 - x0, dy = y1 - y0;
+    const lengthSq = dx * dx + dy * dy;
+    if (lengthSq < 0.01) return;
+    for (const soldier of this.soldiers) {
+      if (!soldier.isAlive() || soldier.team === shooter.team) continue;
+      const t = Phaser.Math.Clamp(((soldier.x - x0) * dx + (soldier.y - y0) * dy) / lengthSq, 0, 1);
+      const x = x0 + dx * t, y = y0 + dy * t;
+      const distance = Math.hypot(soldier.x - x, soldier.y - y);
+      if (distance > 18 && distance < 48 && !sweepTerrain(x, y, soldier.x, soldier.y - 6, (px, py) => this.terrain.isPointSolid(px, py))) {
+        soldier.applySuppression();
+      }
+    }
+  }
+
   private checkSoldierHit(
     lastX: number,
     lastY: number,
@@ -4715,94 +6239,36 @@ private startParatrooperDrop(): void {
     excludedSoldier: Soldier | null,
     onHit: (hitX: number, hitY: number) => void
   ): void {
-    // Check if projectile path intersects with any soldier
-    // Use line-circle intersection for accurate hit detection
-
-    for (const soldier of this.soldiers) {
-      if (!soldier.isAlive()) continue;
-      // Skip the shooter (bullets always; explosives during their spawn grace window).
-      if (soldier === excludedSoldier) continue;
-      
-      // Soldier hitbox - slightly larger than visual for better gameplay
-      const soldierX = soldier.x;
-      const soldierY = soldier.y;
-      const hitRadius = 18; // Radius around soldier center for hit detection
-      
-      // Check if the line from lastPos to currentPos passes through soldier hitbox
-      // Using closest point on line segment to circle center
-      const dx = currentX - lastX;
-      const dy = currentY - lastY;
-      const fx = lastX - soldierX;
-      const fy = lastY - soldierY;
-      
-      const a = dx * dx + dy * dy;
-      
-      // Handle zero-length line (projectile hasn't moved) - check point-in-circle
-      if (a < 0.0001) {
-        const distSq = fx * fx + fy * fy;
-        if (distSq <= hitRadius * hitRadius) {
-          // Point is inside circle - hit!
-          if (isBullet) {
-            this.damageSoldier(soldier, damage);
-            const angle = Math.atan2(dy || 0.001, dx || 0.001);
-            soldier.applyKnockback(
-              Math.cos(angle) * 24,
-              Math.sin(angle) * 18 - 14
-            );
-            this.createBulletHitEffect(lastX, lastY);
-          }
-          onHit(lastX, lastY);
-          return;
-        }
-        continue;
-      }
-      
-      const b = 2 * (fx * dx + fy * dy);
-      const c = fx * fx + fy * fy - hitRadius * hitRadius;
-      
-      let discriminant = b * b - 4 * a * c;
-      
-      if (discriminant >= 0) {
-        discriminant = Math.sqrt(discriminant);
-        
-        // Check both intersection points
-        const t1 = (-b - discriminant) / (2 * a);
-        const t2 = (-b + discriminant) / (2 * a);
-        
-        // t must be between 0 and 1 for intersection to be on the line segment
-        if ((t1 >= 0 && t1 <= 1) || (t2 >= 0 && t2 <= 1)) {
-          // Hit! Calculate hit point
-          const t = Math.max(0, Math.min(1, t1 >= 0 ? t1 : t2));
-          const hitX = lastX + t * dx;
-          const hitY = lastY + t * dy;
-          
-          // Apply damage directly for bullets (not through explosion system)
-          if (isBullet) {
-            this.damageSoldier(soldier, damage);
-            
-            // Small knockback for bullets
-            const angle = Math.atan2(dy, dx);
-            soldier.applyKnockback(
-              Math.cos(angle) * 24,
-              Math.sin(angle) * 18 - 14
-            );
-            
-            // Create hit effect on soldier
-            this.createBulletHitEffect(hitX, hitY);
-          }
-          
-          // Trigger the callback to stop the projectile
-          onHit(hitX, hitY);
-          return; // Only hit one soldier per frame
-        }
-      }
+    const hit = findFirstUnitIntercept(
+      lastX,
+      lastY,
+      currentX,
+      currentY,
+      this.getLiveShotUnits(),
+      excludedSoldier,
+      18,
+    );
+    if (!hit) {
+      // No soldier in the way - did it hit an explosive barrel?
+      const barrelHit = this.hazards.findBarrelHit(lastX, lastY, currentX, currentY);
+      if (barrelHit) onHit(barrelHit.x, barrelHit.y);
+      return;
     }
 
-    // No soldier in the way - did it hit an explosive barrel?
-    const barrelHit = this.hazards.findBarrelHit(lastX, lastY, currentX, currentY);
-    if (barrelHit) {
-      onHit(barrelHit.x, barrelHit.y);
+    const soldier = hit.unit.value;
+    const dx = currentX - lastX;
+    const dy = currentY - lastY;
+    if (isBullet) {
+      this.damageSoldier(soldier, damage);
+      const angle = Math.atan2(dy || 0.001, dx || 0.001);
+      soldier.applyKnockback(
+        Math.cos(angle) * 24,
+        Math.sin(angle) * 18 - 14
+      );
+      this.createBulletHitEffect(hit.x, hit.y);
     }
+
+    onHit(hit.x, hit.y);
   }
 
   private createBulletHitEffect(x: number, y: number): void {

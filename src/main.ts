@@ -1,21 +1,9 @@
 import Phaser from 'phaser';
-import { Soldier } from './entities/Soldier';
 import { BootScene } from './scenes/BootScene';
 import { MenuScene } from './scenes/MenuScene';
 import { GameScene } from './scenes/GameScene';
 import { UIScene } from './scenes/UIScene';
-import { installEpicMusic } from './utils/EpicMusicManager';
-import { SoundManager } from './utils/SoundManager';
-import { installVisualEnhancements } from './utils/VisualEnhancementManager';
-
-// Preserve the existing scene and sound-effect API while replacing the simple
-// oscillator soundtrack with the layered cinematic playlist.
-installEpicMusic(SoundManager);
-
-// Add secondary motion, recoil, hit and landing reactions, shadows, class gear
-// detail, atmospheric depth and richer battlefield effects without changing
-// the core game rules.
-installVisualEnhancements(Soldier, GameScene);
+import { VisualTestScene } from './scenes/VisualTestScene';
 
 const config: Phaser.Types.Core.GameConfig = {
   type: Phaser.AUTO,
@@ -34,7 +22,7 @@ const config: Phaser.Types.Core.GameConfig = {
       debug: false, // Set to true for debugging
     },
   },
-  scene: [BootScene, MenuScene, GameScene, UIScene],
+  scene: [BootScene, MenuScene, GameScene, UIScene, VisualTestScene],
   pixelArt: false,
   roundPixels: true,
 };

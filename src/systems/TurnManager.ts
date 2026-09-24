@@ -5,19 +5,7 @@ export enum Team {
   BLUE = 'blue',
 }
 
-/**
- * Minimal contract required by the turn system.
- *
- * Keeping the turn manager dependent on this interface instead of Phaser-backed
- * Soldier objects makes the core game rules deterministic and easy to test.
- */
-export interface TurnParticipant {
-  team: Team;
-  name: string;
-  isAlive(): boolean;
-}
-
-export interface TurnInfo {
+interface TurnInfo {
   currentTeam: Team;
   currentSoldierName: string;
   turnNumber: number;
@@ -28,66 +16,56 @@ export interface TurnInfo {
   blueActedThisRound: number;
 }
 
-export interface GameOverState {
+interface GameOverState {
   isOver: boolean;
   winner: Team | null;
 }
 
-export class TurnManager<TSoldier extends TurnParticipant = Soldier> {
-  private soldiers: TSoldier[];
+export class TurnManager {
+  private soldiers: Soldier[];
   private currentTeam: Team = Team.RED;
   private turnNumber: number = 1;
   private roundNumber: number = 1;
-  private currentSoldier: TSoldier | null = null;
+  private currentSoldier: Soldier | null = null;
+  
+  // Track which soldiers have acted this round
+  private actedThisRound: Set<Soldier> = new Set();
 
-  // Track which soldiers have acted this round.
-  private actedThisRound: Set<TSoldier> = new Set();
-
-  constructor(soldiers: TSoldier[]) {
+  constructor(soldiers: Soldier[]) {
     this.soldiers = soldiers;
   }
 
-  public setSoldiers(soldiers: TSoldier[]): void {
+  public setSoldiers(soldiers: Soldier[]): void {
     this.soldiers = soldiers;
-
-    // Avoid retaining stale object references when a game is rebuilt in place.
-    for (const soldier of this.actedThisRound) {
-      if (!soldiers.includes(soldier)) {
-        this.actedThisRound.delete(soldier);
-      }
-    }
-
-    if (this.currentSoldier && !soldiers.includes(this.currentSoldier)) {
-      this.currentSoldier = null;
-    }
   }
 
   public getCurrentTeam(): Team {
     return this.currentTeam;
   }
 
-  public setCurrentSoldier(soldier: TSoldier): void {
+  public setCurrentSoldier(soldier: Soldier): void {
     this.currentSoldier = soldier;
   }
 
-  public getCurrentSoldier(): TSoldier | null {
+  public getCurrentSoldier(): Soldier | null {
     return this.currentSoldier;
   }
-
-  // Get soldiers that can still act this round (alive and not already used).
-  public getAvailableSoldiers(team: Team): TSoldier[] {
-    return this.soldiers.filter(
-      soldier =>
-        soldier.team === team &&
-        soldier.isAlive() &&
-        !this.actedThisRound.has(soldier),
+  
+  // Get soldiers that can still act this round (alive and haven't acted)
+  public getAvailableSoldiers(team: Team): Soldier[] {
+    return this.soldiers.filter(s => 
+      s.team === team && 
+      s.isAlive() && 
+      !this.actedThisRound.has(s)
     );
   }
-
-  public hasActedThisRound(soldier: TSoldier): boolean {
+  
+  // Check if a soldier has acted this round
+  public hasActedThisRound(soldier: Soldier): boolean {
     return this.actedThisRound.has(soldier);
   }
-
+  
+  // Mark the current soldier as having acted
   public markSoldierActed(): void {
     if (this.currentSoldier) {
       this.actedThisRound.add(this.currentSoldier);
@@ -95,47 +73,56 @@ export class TurnManager<TSoldier extends TurnParticipant = Soldier> {
   }
 
   public nextTurn(): void {
+    // Mark current soldier as having acted
     this.markSoldierActed();
+    
+    // Clear current soldier selection
     this.currentSoldier = null;
+    
+    // Increment turn number
     this.turnNumber++;
 
-    // Prefer alternating teams. If that team is exhausted, let the other team
-    // finish its remaining soldiers before beginning a new round.
+    // Switch teams
     this.currentTeam = this.currentTeam === Team.RED ? Team.BLUE : Team.RED;
+    
+    // Check if new team has any available soldiers (alive and haven't acted)
     let availableSoldiers = this.getAvailableSoldiers(this.currentTeam);
-
+    
     if (availableSoldiers.length === 0) {
+      // No available soldiers on this team, try the other team
       this.currentTeam = this.currentTeam === Team.RED ? Team.BLUE : Team.RED;
       availableSoldiers = this.getAvailableSoldiers(this.currentTeam);
-
+      
       if (availableSoldiers.length === 0) {
+        // No available soldiers on either team - start new round
         this.startNewRound();
       }
     }
   }
-
+  
   private startNewRound(): void {
     this.roundNumber++;
     this.actedThisRound.clear();
-
-    // Red normally opens a round; blue starts only if red has no survivors.
-    this.currentTeam = Team.RED;
-    const redAlive = this.getTeamSoldiers(Team.RED).filter(soldier => soldier.isAlive());
-    if (redAlive.length === 0) {
-      this.currentTeam = Team.BLUE;
+    
+    this.currentTeam = this.roundNumber % 2 === 1 ? Team.RED : Team.BLUE;
+    
+    // Check if red team has alive soldiers, if not switch to blue
+    const startersAlive = this.getTeamSoldiers(this.currentTeam).filter(s => s.isAlive());
+    if (startersAlive.length === 0) {
+      this.currentTeam = this.currentTeam === Team.RED ? Team.BLUE : Team.RED;
     }
   }
 
   public getTurnInfo(): TurnInfo {
     const currentSoldier = this.getCurrentSoldier();
-    const redAlive = this.getTeamSoldiers(Team.RED).filter(soldier => soldier.isAlive());
-    const blueAlive = this.getTeamSoldiers(Team.BLUE).filter(soldier => soldier.isAlive());
-    const redActed = redAlive.filter(soldier => this.actedThisRound.has(soldier)).length;
-    const blueActed = blueAlive.filter(soldier => this.actedThisRound.has(soldier)).length;
-
+    const redAlive = this.getTeamSoldiers(Team.RED).filter(s => s.isAlive());
+    const blueAlive = this.getTeamSoldiers(Team.BLUE).filter(s => s.isAlive());
+    const redActed = redAlive.filter(s => this.actedThisRound.has(s)).length;
+    const blueActed = blueAlive.filter(s => this.actedThisRound.has(s)).length;
+    
     return {
       currentTeam: this.currentTeam,
-      currentSoldierName: currentSoldier?.name ?? 'None',
+      currentSoldierName: currentSoldier?.name || 'None',
       turnNumber: this.turnNumber,
       redTeamAlive: redAlive.length,
       blueTeamAlive: blueAlive.length,
@@ -146,11 +133,11 @@ export class TurnManager<TSoldier extends TurnParticipant = Soldier> {
   }
 
   public checkGameOver(): GameOverState {
-    const redAlive = this.getTeamSoldiers(Team.RED).filter(soldier => soldier.isAlive()).length;
-    const blueAlive = this.getTeamSoldiers(Team.BLUE).filter(soldier => soldier.isAlive()).length;
+    const redAlive = this.getTeamSoldiers(Team.RED).filter(s => s.isAlive()).length;
+    const blueAlive = this.getTeamSoldiers(Team.BLUE).filter(s => s.isAlive()).length;
 
     if (redAlive === 0 && blueAlive === 0) {
-      return { isOver: true, winner: null };
+      return { isOver: true, winner: null }; // Draw
     }
 
     if (redAlive === 0) {
@@ -164,10 +151,11 @@ export class TurnManager<TSoldier extends TurnParticipant = Soldier> {
     return { isOver: false, winner: null };
   }
 
-  private getTeamSoldiers(team: Team): TSoldier[] {
-    return this.soldiers.filter(soldier => soldier.team === team);
+  private getTeamSoldiers(team: Team): Soldier[] {
+    return this.soldiers.filter(s => s.team === team);
   }
-
+  
+  // Reset for new game
   public reset(): void {
     this.currentTeam = Team.RED;
     this.turnNumber = 1;

@@ -1,4 +1,5 @@
 import Phaser from 'phaser';
+import { advanceFlight, BALLISTIC_STEP, GRENADE_FUSE, sweepTerrain, type FlightState } from '../systems/Ballistics';
 import { WeaponConfig, WeaponType } from '../systems/WeaponTypes';
 import { Terrain } from '../systems/Terrain';
 import { SoundManager } from '../utils/SoundManager';
@@ -9,7 +10,6 @@ import {
   CLUSTER_BOMBLET_COUNT,
   GOAT_MAX_WALK_MS,
   GOAT_WALK_SPEED,
-  HOLY_FUSE_MS,
   type SpecialBehavior,
 } from '../systems/SpecialWeapons';
 
@@ -72,8 +72,10 @@ export class Projectile {
   public static wind = 0;
 
   private scene: Phaser.Scene;
+  private windAccel = 0;
   private behavior: SpecialBehavior | null;
   private goatWalking = false;
+  private goatFalling = false;
   private goatDirection: -1 | 1 = 1;
   private goatWalkStartedAt = 0;
   private goatBleatAt = 0;
@@ -84,16 +86,14 @@ export class Projectile {
   private trailGraphics: Phaser.GameObjects.Graphics;
   private trailPoints: { x: number; y: number }[] = [];
   private terrain: Terrain;
-  private bounceCount: number = 0;
-  private maxBounces: number = 3;
-  private hasHitGround: boolean = false;
-  private fuseTimer: Phaser.Time.TimerEvent | null = null;
+  private flight: FlightState;
+  private accumulator = 0;
+  private fuseText: Phaser.GameObjects.Text | null = null;
   private isBullet: boolean = false;
   private lastX: number;
   private lastY: number;
   private flightSound: { update: (vx: number, vy: number) => void; stop: () => void } | null = null;
   private shooter: Soldier | null;
-  private spawnedAt: number;
 
   constructor(
     scene: Phaser.Scene,
@@ -108,14 +108,13 @@ export class Projectile {
   ) {
     this.scene = scene;
     this.behavior = options.behavior ?? null;
-    // The holy grenade keeps bouncing until its fuse runs out.
-    if (this.behavior === 'holy') this.maxBounces = 12;
     this.config = config;
     this.terrain = terrain;
     this.shooter = shooter;
-    this.spawnedAt = scene.time.now;
     this.isBullet = BULLET_WEAPONS.includes(config.type);
 
+    this.flight = { x, y, vx: velocityX, vy: velocityY, age: 0 };
+    this.windAccel = getWindAccel(Projectile.wind, config.type);
     // Create projectile sprite
     const isGoat = this.behavior === 'goat';
     if (isGoat) ensureGoatTexture(scene);
@@ -124,29 +123,27 @@ export class Projectile {
     // Bullets are smaller and elongated
     if (isGoat) {
       this.sprite.setDisplaySize(26, 22);
+      this.goatDirection = velocityX < 0 ? -1 : 1;
+      this.sprite.setFlipX(this.goatDirection < 0);
+      scene.events.on('special-detonate', this.explode, this);
     } else if (this.isBullet) {
       this.sprite.setDisplaySize(config.projectileSize * 2, config.projectileSize);
     } else {
       this.sprite.setDisplaySize(config.projectileSize, config.projectileSize);
     }
     
-    this.sprite.setVelocity(velocityX, velocityY);
-    this.sprite.setBounce(config.bounce);
-    this.sprite.setDrag(config.drag * 100, config.drag * 100);
-    
-    // Set custom gravity for this projectile
-    (this.sprite.body as Phaser.Physics.Arcade.Body).setGravityY(500 * config.gravity - 500);
+    const body = this.sprite.body as Phaser.Physics.Arcade.Body;
+    body.moves = false;
+    body.setAllowGravity(false);
+    body.setVelocity(velocityX, velocityY);
+    if (config.bounce > 0) {
+      this.fuseText = scene.add.text(x, y - 15, (config.fuse ?? GRENADE_FUSE).toFixed(1), {
+        font: 'bold 12px Arial', color: '#ffe296', stroke: '#172125', strokeThickness: 3,
+      }).setOrigin(0.5).setDepth(210);
+    }
 
-    // Wind pushes slower ordnance sideways (bullets are unaffected).
-    this.sprite.setAccelerationX(getWindAccel(Projectile.wind, config.type));
-    
     // Tint based on weapon
     if (!isGoat) this.sprite.setTint(config.trailColor);
-    if (isGoat) {
-      this.goatDirection = velocityX < 0 ? -1 : 1;
-      this.sprite.setFlipX(this.goatDirection < 0);
-      scene.events.on('special-detonate', this.explode, this);
-    }
 
     // Create trail graphics
     this.trailGraphics = scene.add.graphics();
@@ -178,81 +175,55 @@ export class Projectile {
     });
   }
 
-  private update(): void {
-    if (this.hasExploded || !this.sprite.active) return;
-
-    // Check for soldier hits along the path (raycast-style for fast bullets)
-    this.checkSoldierCollision();
-    
-    // If we hit a soldier, stop processing (projectile was destroyed in callback)
-    if (this.hasExploded || !this.sprite.active) return;
-
-    // Update in-flight audio based on current velocity (best-effort).
-    if (this.flightSound && this.sprite.body) {
-      const body = this.sprite.body as Phaser.Physics.Arcade.Body;
-      this.flightSound.update(body.velocity.x, body.velocity.y);
-    }
-
+  private update(_time: number, delta: number): void {
+    if (this.hasEnded || !this.sprite.active) return;
     if (this.goatWalking) {
-      this.updateGoatWalk();
-      this.lastX = this.sprite.x;
-      this.lastY = this.sprite.y;
+      this.updateGoatWalk(Math.max(0, Math.min(delta, 50)) / 1000);
       return;
     }
-
-    // Add current position to trail
-    this.trailPoints.push({ x: this.sprite.x, y: this.sprite.y });
-    
-    // Bullets have shorter trails
-    const maxTrailLength = this.isBullet ? 15 : (this.config.type === WeaponType.SNIPER ? 50 : 30);
-    if (this.trailPoints.length > maxTrailLength) {
-      this.trailPoints.shift();
-    }
-
-    // Draw trail
-    this.drawTrail();
-
-    // Rotate sprite based on velocity
-    const angle = Math.atan2(
-      this.sprite.body!.velocity.y,
-      this.sprite.body!.velocity.x
-    );
-    if (this.behavior !== 'goat') this.sprite.setRotation(angle);
-
-    // Check terrain collision
-    this.checkTerrainCollision();
-
-    // Update last position for next frame's raycast
-    this.lastX = this.sprite.x;
-    this.lastY = this.sprite.y;
-
-    // Check if out of bounds (fell off map)
-    const bounds = this.scene.physics.world.bounds;
-    const left = bounds.x;
-    const right = bounds.x + bounds.width;
-    const bottom = bounds.y + bounds.height;
-
-    // If the terrain is completely destroyed, explosives can fall forever. Treat the bottom world boundary
-    // like "ground" so shots still resolve with an impact + detonation instead of silently disappearing.
-    if (this.sprite.y >= bottom - 2) {
-      this.sprite.setY(bottom - 2);
-      if (this.isBullet) {
-        this.bulletImpact();
-      } else {
-        this.explode();
+    this.accumulator += Math.max(0, Math.min(delta, 250)) / 1000;
+    const solid = (x: number, y: number): boolean => this.terrain.isPointSolid(x, y);
+    while (this.accumulator + 1e-9 >= BALLISTIC_STEP && !this.hasEnded) {
+      this.accumulator -= BALLISTIC_STEP;
+      this.lastX = this.flight.x;
+      this.lastY = this.flight.y;
+      const result = advanceFlight(this.flight, this.config, solid, BALLISTIC_STEP, this.isBullet ? 0 : this.config.projectileSize / 2, this.windAccel);
+      this.flight = result.state;
+      this.sprite.setPosition(this.flight.x, this.flight.y);
+      (this.sprite.body as Phaser.Physics.Arcade.Body).setVelocity(this.flight.vx, this.flight.vy);
+      // Test units only on the unobstructed part of this movement segment.
+      this.checkSoldierCollision();
+      if (this.hasEnded) return;
+      if (this.isBullet && this.shooter) {
+        this.scene.events.emit('bullet-near-miss', this.lastX, this.lastY, this.flight.x, this.flight.y, this.shooter);
       }
-      return;
+      if (this.behavior === 'goat' && result.hit) {
+        this.startGoatWalk();
+        return;
+      }
+      if (result.ended) {
+        if (this.isBullet) this.bulletImpact(); else this.explode();
+        return;
+      }
+      const bounds = this.scene.physics.world.bounds;
+      if (this.flight.y >= bounds.bottom - 2) {
+        if (this.config.bounce > 0) { this.flight.y = bounds.bottom - 2; this.flight.vx = 0; this.flight.vy = 0; }
+        else { if (this.isBullet) this.bulletImpact(); else this.explode(); return; }
+      }
+      if (this.flight.x < bounds.left - 50 || this.flight.x > bounds.right + 50) { this.destroy(); return; }
     }
-
-    if (this.sprite.y > bottom + 50 || this.sprite.x < left - 50 || this.sprite.x > right + 50) {
-      this.destroy();
-    }
+    this.flightSound?.update(this.flight.vx, this.flight.vy);
+    this.fuseText?.setPosition(this.flight.x, this.flight.y - 15).setText(Math.max(0, (this.config.fuse ?? GRENADE_FUSE) - this.flight.age).toFixed(1));
+    this.trailPoints.push({ x: this.flight.x, y: this.flight.y });
+    if (this.trailPoints.length > (this.isBullet ? 15 : 30)) this.trailPoints.shift();
+    this.drawTrail();
+    if (this.behavior !== 'goat') this.sprite.setRotation(Math.atan2(this.flight.vy, this.flight.vx));
   }
 
   private checkSoldierCollision(): void {
     // Bullets can never hit their own shooter (they outrun the soldier instantly).
     // Explosives only ignore the shooter during a short spawn grace window.
-    const withinGrace = this.scene.time.now - this.spawnedAt < SHOOTER_GRACE_MS;
+    const withinGrace = this.flight.age < SHOOTER_GRACE_MS / 1000;
     const excludedSoldier = this.isBullet ? this.shooter : (withinGrace ? this.shooter : null);
 
     // Emit event for GameScene to check if projectile hit any soldiers
@@ -298,55 +269,6 @@ export class Projectile {
         );
       }
     }
-  }
-
-  private checkTerrainCollision(): void {
-    const x = Math.floor(this.sprite.x);
-    const y = Math.floor(this.sprite.y);
-
-    // Check if projectile hit terrain
-    if (this.terrain.isPointSolid(x, y)) {
-      if (this.behavior === 'goat') {
-        this.startGoatWalk();
-      } else if (this.isBullet) {
-        // Bullets do direct damage on hit - no explosion, just impact
-        this.bulletImpact();
-      } else if (this.config.bounce > 0 && this.bounceCount < this.maxBounces) {
-        // Bounce off terrain (for grenades)
-        this.bounceCount++;
-        
-        // First ground contact - start fuse timer for grenades
-        if (!this.hasHitGround && this.config.type === WeaponType.GRENADE) {
-          this.hasHitGround = true;
-          this.startFuseTimer();
-        }
-        
-        // Reflect velocity
-        const velX = this.sprite.body!.velocity.x;
-        const velY = this.sprite.body!.velocity.y;
-        
-        // Simple bounce - reverse and reduce velocity
-        this.sprite.setVelocity(
-          velX * this.config.bounce * 0.5,
-          velY * -this.config.bounce
-        );
-        
-        // Move projectile out of terrain
-        this.sprite.y -= 5;
-      } else {
-        // Explode on impact for explosive weapons
-        this.explode();
-      }
-    }
-  }
-
-  private startFuseTimer(): void {
-    // Start 2 second fuse when grenade first hits ground (holy grenades take longer - build the suspense)
-    this.fuseTimer = this.scene.time.delayedCall(this.behavior === 'holy' ? HOLY_FUSE_MS : 2000, () => {
-      if (!this.hasExploded) {
-        this.explode();
-      }
-    });
   }
 
   private bulletImpact(): void {
@@ -447,68 +369,69 @@ export class Projectile {
   }
 
   private startGoatWalk(): void {
-    if (this.goatWalking) return;
     this.goatWalking = true;
+    this.goatFalling = false;
     this.goatWalkStartedAt = this.scene.time.now;
     this.goatBleatAt = this.scene.time.now + 400;
-    const body = this.sprite.body as Phaser.Physics.Arcade.Body;
-    body.setAllowGravity(false);
-    body.setVelocity(0, 0);
-    body.setAcceleration(0, 0);
     this.sprite.setRotation(0);
     this.trailGraphics.clear();
-    // Stand on the surface we just hit.
-    const surface = this.terrain.findSurfaceYAtOrBelow(this.sprite.x, this.sprite.y - 30, 60);
-    if (surface !== null) this.sprite.y = surface - 10;
+    this.fuseText?.setVisible(false);
+    this.snapGoatToGround();
   }
 
-  private updateGoatWalk(): void {
+  private snapGoatToGround(): boolean {
+    const surface = this.terrain.findSurfaceYAtOrBelow(this.flight.x, this.flight.y - 24, 48);
+    if (surface === null) return false;
+    this.flight.y = surface - 10;
+    this.sprite.setPosition(this.flight.x, this.flight.y);
+    return true;
+  }
+
+  private updateGoatWalk(dt: number): void {
     const now = this.scene.time.now;
     if (now - this.goatWalkStartedAt > GOAT_MAX_WALK_MS) {
       this.explode();
       return;
     }
+    this.lastX = this.flight.x;
+    this.lastY = this.flight.y;
 
-    const dt = Math.min(0.05, this.scene.game.loop.delta / 1000);
-    const body = this.sprite.body as Phaser.Physics.Arcade.Body;
-
-    // Falling off a ledge: let gravity take it until it lands again.
-    const footY = this.sprite.y + 10;
-    if (!this.terrain.isPointSolid(this.sprite.x, footY + 2) && body.allowGravity === false) {
-      const below = this.terrain.findSurfaceYAtOrBelow(this.sprite.x, footY, 8);
-      if (below === null) {
-        body.setAllowGravity(true);
-        body.setVelocity(this.goatDirection * GOAT_WALK_SPEED * 0.5, 0);
-        return;
+    const footY = this.flight.y + 10;
+    if (this.goatFalling) {
+      // Off a ledge: drop until it lands again.
+      this.flight.vy = Math.min(600, this.flight.vy + 900 * dt);
+      this.flight.y += this.flight.vy * dt;
+      if (this.terrain.isPointSolid(this.flight.x, this.flight.y + 10)) {
+        this.goatFalling = false;
+        this.flight.vy = 0;
+        this.snapGoatToGround();
       }
-    }
-    if (body.allowGravity) {
-      if (this.terrain.isPointSolid(this.sprite.x, footY)) {
-        body.setAllowGravity(false);
-        body.setVelocity(0, 0);
-        const surface = this.terrain.findSurfaceYAtOrBelow(this.sprite.x, footY - 30, 60);
-        if (surface !== null) this.sprite.y = surface - 10;
-      }
-      if (this.sprite.y > this.scene.physics.world.bounds.bottom) this.destroy();
-      return;
-    }
-
-    const nextX = this.sprite.x + this.goatDirection * GOAT_WALK_SPEED * dt;
-    const surface = this.terrain.findSurfaceYAtOrBelow(nextX, footY - 24, 40);
-    if (surface !== null && footY - surface > 22) {
-      // Wall too tall to climb: turn around.
-      this.goatDirection = this.goatDirection > 0 ? -1 : 1;
-      this.sprite.setFlipX(this.goatDirection < 0);
+      if (this.flight.y > this.scene.physics.world.bounds.bottom) { this.destroy(); return; }
     } else {
-      this.sprite.x = nextX;
-      if (surface !== null) this.sprite.y = surface - 10;
+      const nextX = this.flight.x + this.goatDirection * GOAT_WALK_SPEED * dt;
+      const surface = this.terrain.findSurfaceYAtOrBelow(nextX, footY - 24, 40);
+      if (surface !== null && footY - surface > 22) {
+        // Wall too tall to climb: turn around.
+        this.goatDirection = this.goatDirection > 0 ? -1 : 1;
+        this.sprite.setFlipX(this.goatDirection < 0);
+      } else if (surface === null) {
+        this.flight.x = nextX;
+        this.flight.vy = 0;
+        this.goatFalling = true;
+      } else {
+        this.flight.x = nextX;
+        this.flight.y = surface - 10;
+      }
     }
+    this.sprite.setPosition(this.flight.x, this.flight.y);
+    this.checkSoldierCollision();
+    if (this.hasEnded) return;
 
     // Little hop animation + the occasional bleat.
     this.sprite.setAngle(Math.sin(now / 70) * 6);
     if (now > this.goatBleatAt) {
       this.goatBleatAt = now + 1400 + Math.random() * 800;
-      const bleat = this.scene.add.text(this.sprite.x, this.sprite.y - 22, 'Baaa!', {
+      const bleat = this.scene.add.text(this.flight.x, this.flight.y - 22, 'Baaa!', {
         font: 'bold 11px Arial', color: '#ffffff', stroke: '#000000', strokeThickness: 3,
       }).setOrigin(0.5).setDepth(200);
       this.scene.tweens.add({ targets: bleat, y: bleat.y - 18, alpha: 0, duration: 800, onComplete: () => bleat.destroy() });
@@ -539,9 +462,7 @@ export class Projectile {
       this.flightSound.stop();
       this.flightSound = null;
     }
-    if (this.fuseTimer) {
-      this.fuseTimer.destroy();
-    }
+    this.fuseText?.destroy();
     this.scene.events.off('update', this.update, this);
     this.scene.events.off('special-detonate', this.explode, this);
     this.trailGraphics.destroy();
@@ -587,7 +508,8 @@ export class FlameJet {
   private maxRange: number = 150;
   private damagePerTick: number;
   private tickCount: number = 0;
-  private maxTicks: number = 30; // About 1 second of flame
+  private maxTicks: number = 30;
+  private elapsed = 0;
   private shooter: Soldier | null;
 
   constructor(
@@ -619,23 +541,16 @@ export class FlameJet {
     scene.events.emit('flame-jet-created', this);
   }
 
-  private update(): void {
+  private update(_time: number, delta: number): void {
     if (!this.isActive) return;
-
-    this.tickCount++;
-
-    // Create flame particles
-    this.createFlameParticle();
-
-    // Deal damage along the flame path every few ticks
-    if (this.tickCount % 5 === 0) {
-      this.dealDamageAlongPath();
+    this.elapsed += Math.max(0, delta) / 1000;
+    const dueTicks = Math.min(this.maxTicks, Math.floor((this.elapsed + 1e-9) * 60));
+    while (this.tickCount < dueTicks) {
+      this.tickCount++;
+      this.createFlameParticle();
+      if (this.tickCount % 5 === 0) this.dealDamageAlongPath();
     }
-
-    // End after max ticks
-    if (this.tickCount >= this.maxTicks) {
-      this.destroy();
-    }
+    if (this.tickCount >= this.maxTicks) this.destroy();
   }
 
   private createFlameParticle(): void {
@@ -648,7 +563,7 @@ export class FlameJet {
     const y = this.startY + Math.sin(this.angle + spread) * distance;
 
     // Check if blocked by terrain
-    if (this.terrain.isPointSolid(x, y)) {
+    if (sweepTerrain(this.startX, this.startY, x, y, (px, py) => this.terrain.isPointSolid(px, py))) {
       flame.destroy();
       return;
     }
@@ -684,18 +599,11 @@ export class FlameJet {
   }
 
   private dealDamageAlongPath(): void {
-    // Find how far the flame reaches before terrain blocks it.
-    let effectiveRange = this.maxRange;
-    const steps = 10;
-    for (let i = 1; i <= steps; i++) {
-      const distance = (i / steps) * this.maxRange;
-      const x = this.startX + Math.cos(this.angle) * distance;
-      const y = this.startY + Math.sin(this.angle) * distance;
-      if (this.terrain.isPointSolid(x, y)) {
-        effectiveRange = distance;
-        break;
-      }
-    }
+    const hit = sweepTerrain(this.startX, this.startY,
+      this.startX + Math.cos(this.angle) * this.maxRange,
+      this.startY + Math.sin(this.angle) * this.maxRange,
+      (x, y) => this.terrain.isPointSolid(x, y));
+    const effectiveRange = hit ? Math.max(0, Math.hypot(hit.x - this.startX, hit.y - this.startY) - 1) : this.maxRange;
 
     // One wave = one damage application per soldier caught in the cone.
     // (Per-point events used to stack 2-4x on the same soldier, one-shotting anyone touched.)
