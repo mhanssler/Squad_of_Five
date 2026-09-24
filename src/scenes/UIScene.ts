@@ -3,6 +3,7 @@ import { Team } from '../systems/TurnManager';
 import { GameMode, RelayControl } from '../systems/GameRules';
 import type { AbilityStatus } from '../systems/Abilities';
 import { isWindCalm } from '../systems/Wind';
+import { isTouchUI } from '../utils/TouchSupport';
 import {
   FactionId,
   FactionMatchup,
@@ -200,6 +201,8 @@ export class UIScene extends Phaser.Scene {
       strokeThickness: 2,
     });
     this.controlsText.setOrigin(0.5, 0);
+    // Keyboard shortcuts mean nothing on a phone - the on-screen buttons replace them.
+    this.controlsText.setVisible(!isTouchUI());
 
     // Listen for game events
     this.gameScene.events.on('turn-started', this.updateTurnDisplay, this);
@@ -216,6 +219,7 @@ export class UIScene extends Phaser.Scene {
       stroke: '#000000',
       strokeThickness: 3,
     }).setOrigin(0.5, 0);
+    if (isTouchUI()) this.enlargeForTouch();
     this.gameScene.events.on('character-selection', this.showTacReadout, this);
     this.gameScene.events.on('new-game', this.resetUI, this);
     this.gameScene.events.on('objectives-update', this.updateObjectives, this);
@@ -510,16 +514,28 @@ export class UIScene extends Phaser.Scene {
     this.windText.setText(dir > 0 ? `${label} ${arrows}` : `${arrows} ${label}`);
   }
 
+  // Phones show the 1280x720 HUD at roughly half size, so the small print needs to grow.
+  private enlargeForTouch(): void {
+    this.objectiveText.setFontSize(14);
+    this.movementText.setFontSize(17);
+    this.powerupText.setFontSize(15);
+    this.contextText.setFontSize(14);
+    this.windText.setFontSize(16);
+    this.windText.setY(82);
+  }
+
   // One line above the movement bar: what B / Shift+B / H will do right now, or why they can't.
   private updateAbilityStatus(list: { label: string; status: AbilityStatus }[] | null): void {
     this.abilityTexts.forEach(t => t.destroy());
     this.abilityTexts = [];
     if (!list || list.length === 0) return;
 
-    const gap = 22;
+    const touch = isTouchUI();
+    const gap = touch ? 26 : 22;
     const texts = list.map(({ label, status }) =>
-      this.add.text(0, 643, `${label}: ${status.reason}`, {
-        font: 'bold 11px Arial',
+      // On phones the buttons say what they do, so drop the keyboard hint ("[B] ").
+      this.add.text(0, touch ? 638 : 643, `${touch ? label.replace(/^\[[^\]]+\]\s*/, '') : label}: ${status.reason}`, {
+        font: `bold ${touch ? 16 : 11}px Arial`,
         color: status.ready ? '#7dffa0' : '#9a9a9a',
         stroke: '#000000',
         strokeThickness: 3,
@@ -831,7 +847,7 @@ export class UIScene extends Phaser.Scene {
     });
     winText.setOrigin(0.5);
 
-    const restartText = this.add.text(640, 400, 'Press N for New Game', {
+    const restartText = this.add.text(640, 400, isTouchUI() ? '' : 'Press N for New Game', {
       font: '24px Arial',
       color: '#ffffff',
       stroke: '#000000',

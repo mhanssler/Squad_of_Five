@@ -22,6 +22,8 @@ import { adjustDropXsForTerrain, getDeploymentZone, planTeamDropXs } from '../sy
 import { COVER_MOVEMENT_COST } from '../systems/Cover';
 import { getWindAccel, isWindCalm, rollWind, WIND_PREVIEW_SECONDS } from '../systems/Wind';
 import { HazardField } from '../entities/Hazards';
+import type { TouchContext } from '../systems/TouchLayout';
+import { isTouchUI } from '../utils/TouchSupport';
 import { BanterCategory, emptyShotStats, pickLine, pickShotBanter, ShotStats } from '../systems/Banter';
 import {
   rollSpecialWeapon,
@@ -297,6 +299,21 @@ private gKey!: Phaser.Input.Keyboard.Key;
 
   // One-shot weapon from a supply crate, armed with Q for this turn.
   private isCrateWeaponArmed: boolean = false;
+  private isGameOver: boolean = false;
+
+  // Touch gestures on the battlefield (buttons live in TouchControlsScene).
+  private readonly touchUI = isTouchUI();
+  private touchIds = new Set<number>();
+  private touchGesture: {
+    mode: 'pending' | 'pan' | 'aim' | 'pinch';
+    pointerId: number;
+    startX: number;
+    startY: number;
+    camX: number;
+    camY: number;
+    startDist: number;
+    startZoom: number;
+  } | null = null;
 
   // Who is acting this turn (kill credit, veterancy, banter) and what their attack did.
   private turnActor: Soldier | null = null;
@@ -531,6 +548,8 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     // Listen for soldier hit checks (raycast collision for bullets)
     this.events.on('check-soldier-hit', this.checkSoldierHit, this);
 
+    this.events.on('game-over', () => { this.isGameOver = true; });
+
     // Crate weapon projectiles
     this.events.on('special-teleport', this.handleTeleportBeacon, this);
     this.events.on('special-exploded', this.handleCrateWeaponExploded, this);
@@ -554,6 +573,7 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
   private setupMouseControls(): void {
     // Right-click or middle-click drag to pan camera
     this.input.on('pointerdown', (pointer: Phaser.Input.Pointer) => {
+      if (this.touchUI && pointer.wasTouch) { this.onTouchDown(pointer); return; }
       if (this.specialTool) {
         if (pointer.rightButtonDown()) this.cancelSpecial();
         else if (pointer.leftButtonDown()) this.confirmSpecial();
@@ -610,6 +630,7 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     });
     
     this.input.on('pointermove', (pointer: Phaser.Input.Pointer) => {
+      if (this.touchUI && pointer.wasTouch) { this.onTouchMove(pointer); return; }
       if (this.specialTool && this.currentSoldier) {
         this.specialTarget = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
         this.aimAngle = Phaser.Math.RadToDeg(Math.atan2(this.specialTarget.y - this.currentSoldier.y, this.specialTarget.x - this.currentSoldier.x));
@@ -639,6 +660,7 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     });
     
     this.input.on('pointerup', (pointer: Phaser.Input.Pointer) => {
+      if (this.touchUI && pointer.wasTouch) { this.onTouchUp(pointer); return; }
       // Stop camera drag - camera stays where user left it
       if (!pointer.rightButtonDown() && !pointer.middleButtonDown()) {
         if (this.isDraggingCamera) {
@@ -670,6 +692,137 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     
     // Disable context menu on right click
     this.input.mouse!.disableContextMenu();
+  }
+
+  // ===== Touch gestures =====
+  // One finger: drag pans, a drag that starts on the active soldier aims, a tap aims at that spot
+  // (or calls in a targeted airstrike). Two fingers: pinch to zoom. Firing is only ever the FIRE
+  // button, so panning can never set off a shot.
+
+  private getTouchPointers(): Phaser.Input.Pointer[] {
+    return this.input.manager.pointers.filter(p => p.isDown && this.touchIds.has(p.id));
+  }
+
+  private onTouchDown(pointer: Phaser.Input.Pointer): void {
+    if (!this.introDone) {
+      this.skipIntro();
+      return;
+    }
+    this.touchIds.add(pointer.id);
+    const cam = this.cameras.main;
+
+    const touches = this.getTouchPointers();
+    if (touches.length >= 2) {
+      const [a, b] = touches;
+      this.touchGesture = {
+        mode: 'pinch', pointerId: pointer.id, startX: 0, startY: 0, camX: cam.scrollX, camY: cam.scrollY,
+        startDist: Math.max(20, Phaser.Math.Distance.Between(a.x, a.y, b.x, b.y)), startZoom: cam.zoom,
+      };
+      return;
+    }
+
+    const gesture = {
+      mode: 'pending' as const, pointerId: pointer.id, startX: pointer.x, startY: pointer.y,
+      camX: cam.scrollX, camY: cam.scrollY, startDist: 0, startZoom: cam.zoom,
+    };
+    this.touchGesture = gesture;
+
+    // Selecting a soldier: tap them directly.
+    if (this.isSelectingCharacter) {
+      const world = cam.getWorldPoint(pointer.x, pointer.y);
+      const hit = this.selectableSoldiers.find(s => Phaser.Math.Distance.Between(world.x, world.y, s.x, s.y) < 40);
+      if (hit && !this.isTeamAI(hit.team)) {
+        this.selectionText.setVisible(false);
+        this.selectSoldier(hit);
+        this.touchGesture = null;
+      }
+      return;
+    }
+
+    // Dragging from the active soldier aims (grapple/tunnel previews too).
+    if (this.canTouchAim()) {
+      const origin = this.getAimOrigin();
+      if (origin) {
+        const sx = cam.x + (origin.x - cam.worldView.x) * cam.zoom;
+        const sy = cam.y + (origin.y - cam.worldView.y) * cam.zoom;
+        if (Phaser.Math.Distance.Between(pointer.x, pointer.y, sx, sy) < 110) {
+          this.touchGesture = { ...gesture, mode: 'aim' };
+          this.touchAimAt(pointer.x, pointer.y);
+        }
+      }
+    }
+  }
+
+  private onTouchMove(pointer: Phaser.Input.Pointer): void {
+    const g = this.touchGesture;
+    if (!g || !this.touchIds.has(pointer.id)) return;
+    const cam = this.cameras.main;
+
+    if (g.mode === 'pinch') {
+      const touches = this.getTouchPointers();
+      if (touches.length < 2) return;
+      const [a, b] = touches;
+      const dist = Phaser.Math.Distance.Between(a.x, a.y, b.x, b.y);
+      cam.setZoom(Phaser.Math.Clamp(g.startZoom * dist / g.startDist, 0.3, 2.0));
+      return;
+    }
+    if (pointer.id !== g.pointerId) return;
+
+    if (g.mode === 'aim') {
+      this.touchAimAt(pointer.x, pointer.y);
+      return;
+    }
+
+    if (g.mode === 'pending' && Phaser.Math.Distance.Between(pointer.x, pointer.y, g.startX, g.startY) > 12) {
+      // Keep the camera on a shot that's still in the air.
+      if (this.isShotResolving()) return;
+      g.mode = 'pan';
+      g.camX = cam.scrollX;
+      g.camY = cam.scrollY;
+      g.startX = pointer.x;
+      g.startY = pointer.y;
+      cam.stopFollow();
+    }
+    if (g.mode === 'pan') {
+      cam.scrollX = Phaser.Math.Clamp(g.camX + (g.startX - pointer.x) / cam.zoom, 0, Math.max(0, this.worldWidth - cam.width / cam.zoom));
+      cam.scrollY = Phaser.Math.Clamp(g.camY + (g.startY - pointer.y) / cam.zoom, -cam.height, Math.max(0, this.worldHeight - cam.height / cam.zoom));
+    }
+  }
+
+  private onTouchUp(pointer: Phaser.Input.Pointer): void {
+    if (!this.touchIds.delete(pointer.id)) return;
+    const g = this.touchGesture;
+    if (!g) return;
+
+    if (g.mode === 'pinch') {
+      if (this.getTouchPointers().length === 0) this.touchGesture = null;
+      return;
+    }
+    if (pointer.id !== g.pointerId) return;
+    this.touchGesture = null;
+
+    if (g.mode !== 'pending') return;
+    // A tap (no drag).
+    if (this.isAirstrikeTargeting && this.currentSoldier && !this.hasFired) {
+      this.confirmAirstrikeTarget(this.cameras.main.getWorldPoint(pointer.x, pointer.y).x);
+      return;
+    }
+    if (this.canTouchAim()) this.touchAimAt(pointer.x, pointer.y);
+  }
+
+  private canTouchAim(): boolean {
+    const soldier = this.currentSoldier;
+    return !!soldier && !this.isSelectingCharacter && !this.hasFired && !this.isAirstrikeTargeting &&
+      !this.isTeamAI(soldier.team) && !soldier.isCurrentlyGrappling();
+  }
+
+  private touchAimAt(screenX: number, screenY: number): void {
+    if (this.specialTool && this.currentSoldier) {
+      this.specialTarget = this.cameras.main.getWorldPoint(screenX, screenY);
+      this.aimAngle = Phaser.Math.RadToDeg(Math.atan2(this.specialTarget.y - this.currentSoldier.y, this.specialTarget.x - this.currentSoldier.x));
+      return;
+    }
+    this.updateMouseAimTarget(screenX, screenY);
   }
 
   private updateMouseAimTarget(screenX: number, screenY: number): void {
@@ -705,6 +858,7 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     // Prevent multiple calls
     if (this.isResetting) return;
     this.isResetting = true;
+    this.isGameOver = false;
     
     // Cancel any pending timers
     this.time.removeAllEvents();
@@ -2107,10 +2261,10 @@ private startParatrooperDrop(): void {
       this.lastMovementX = this.currentSoldier.x;
       this.currentSoldier.setMoveSpeed(this.getSoldierMoveSpeed(this.currentSoldier.getWeaponType()));
       
-      // Zoom in and pan to current soldier
+      // Zoom in and pan to current soldier (a little closer on phones so units and speech stay legible)
       this.tweens.add({
         targets: this.cameras.main,
-        zoom: 1,
+        zoom: this.touchUI ? 1.35 : 1,
         duration: 800,
         ease: 'Power2',
       });
@@ -6208,6 +6362,35 @@ private startParatrooperDrop(): void {
   }
 
   // Getters for UI
+  /** What the on-screen touch controls should offer right now. */
+  public getTouchContext(): TouchContext {
+    const soldier = this.currentSoldier;
+    const phase: TouchContext['phase'] = (() => {
+      if (this.isGameOver) return 'gameover';
+      if (!this.introDone) return 'intro';
+      if (this.isSelectingCharacter) {
+        return this.isTeamAI(this.turnManager.getCurrentTeam()) ? 'waiting' : 'selecting';
+      }
+      if (!soldier || !soldier.isAlive() || this.isTurnEnding || this.isTeamAI(soldier.team)) return 'waiting';
+      if (this.hasFired) return this.events.listenerCount('special-detonate') > 0 ? 'afterShot' : 'waiting';
+      if (this.specialTool) return 'preview';
+      if (this.isAirstrikeTargeting) return 'airstrike';
+      if (this.isHowitzerMode) return 'howitzer';
+      if (soldier.isCurrentlyGrappling() || this.isTunnelActionInProgress || this.isCoverActionInProgress) return 'waiting';
+      return 'turn';
+    })();
+    return {
+      phase,
+      isOperations: this.gameMode === 'expanded',
+      isMedic: soldier?.getWeaponType() === WeaponType.PISTOL,
+      hasCrateWeapon: !!soldier?.getSpecialWeapon(),
+      crateWeaponArmed: this.isCrateWeaponArmed,
+      airstrikeCharges: soldier?.getAirstrikeCharges() ?? 0,
+      artilleryCharges: soldier?.getArtilleryCharges() ?? 0,
+      canDetonate: this.hasFired && this.events.listenerCount('special-detonate') > 0,
+    };
+  }
+
   public getTurnInfo() {
     return this.turnManager.getTurnInfo();
   }

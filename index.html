@@ -2,30 +2,77 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
     <title>Squad of 5</title>
+    <!-- Installable on phones: "Add to Home screen" launches it full-screen in landscape. -->
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <meta name="theme-color" content="#071019" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <link rel="icon" type="image/png" href="./icons/icon-192.png" />
+    <link rel="apple-touch-icon" href="./icons/icon-192.png" />
     <style>
       * {
         margin: 0;
         padding: 0;
         box-sizing: border-box;
       }
-      body {
+      html, body {
         background-color: #071019;
-        min-height: 100vh;
         overflow: hidden;
+        /* No page scrolling, pinch-zooming, text selection or long-press menus while playing. */
+        touch-action: none;
+        overscroll-behavior: none;
+        user-select: none;
+        -webkit-user-select: none;
+        -webkit-touch-callout: none;
+        -webkit-tap-highlight-color: transparent;
+      }
+      body {
+        min-height: 100vh;
+        min-height: 100dvh;
       }
       #game-container {
         width: 100vw;
         height: 100vh;
+        height: 100dvh;
       }
       canvas {
         display: block;
+      }
+      #rotate-hint {
+        display: none;
+      }
+      /* Phones held upright: the battlefield needs landscape. */
+      @media (orientation: portrait) and (pointer: coarse) {
+        #rotate-hint {
+          display: flex;
+          position: fixed;
+          inset: 0;
+          z-index: 10;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          gap: 16px;
+          background: #071019;
+          color: #dfe8ec;
+          font: bold 20px Arial, sans-serif;
+          text-align: center;
+          padding: 24px;
+        }
+        #rotate-hint .icon {
+          font-size: 56px;
+          animation: tilt 1.6s ease-in-out infinite;
+        }
+        @keyframes tilt {
+          0%, 20% { transform: rotate(0deg); }
+          60%, 100% { transform: rotate(-90deg); }
+        }
       }
     </style>
   </head>
   <body>
     <div id="game-container"></div>
+    <div id="rotate-hint"><div class="icon">📱</div>Turn your phone sideways to play</div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
