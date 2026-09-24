@@ -21,6 +21,13 @@ import {
 import { adjustDropXsForTerrain, getDeploymentZone, planTeamDropXs } from '../systems/Deployment';
 import { COVER_MOVEMENT_COST } from '../systems/Cover';
 import {
+  AbilityStatus,
+  TurnActionState,
+  getCoverStatus,
+  getHealStatus,
+  getTunnelStatus,
+} from '../systems/Abilities';
+import {
   advanceChargePower,
   getAimAssistProfile,
   getAimReadout,
@@ -259,6 +266,7 @@ private gKey!: Phaser.Input.Keyboard.Key;
   private isTunnelActionInProgress: boolean = false;
   private isCoverActionInProgress: boolean = false;
   private coverUsedThisTurn: boolean = false;
+  private lastAbilityStatusKey = '';
 
   // Character selection
   private isSelectingCharacter: boolean = false;
@@ -2120,6 +2128,7 @@ private startParatrooperDrop(): void {
       this.hasFired ||
       this.isShotResolving()
     ) {
+      this.emitAbilityStatus(null);
       return;
     }
 
@@ -2131,8 +2140,12 @@ private startParatrooperDrop(): void {
 
     // During AI turns, player input is ignored. The AI runs via timers.
     if (this.isTeamAI(this.currentSoldier.team)) {
+      this.emitAbilityStatus(null);
       return;
     }
+
+    // Keep the tunnel / cover / heal availability line current.
+    this.emitAbilityStatus(this.getAbilityStatuses());
 
     if (this.specialTool) {
       this.currentSoldier.stopMoving();
@@ -2320,13 +2333,14 @@ private startParatrooperDrop(): void {
       } else if (Phaser.Input.Keyboard.JustDown(this.cKey)) {
         this.enterHowitzerMode();
       } else if (Phaser.Input.Keyboard.JustDown(this.bKey)) {
-        if (this.gameMode === 'expanded' && !this.shiftKey.isDown) {
-          this.beginSpecial('dig');
-        } else {
-          this.beginSpecial('cover');
-        }
+        const tool: SpecialTool = this.gameMode === 'expanded' && !this.shiftKey.isDown ? 'dig' : 'cover';
+        const status = tool === 'dig' ? this.getTunnelStatusNow() : this.getCoverStatusNow();
+        if (status.ready) this.beginSpecial(tool);
+        else this.showAbilityBlocked(`Can't ${tool === 'dig' ? 'dig' : 'build cover'}: ${status.reason}`);
       } else if (Phaser.Input.Keyboard.JustDown(this.hKey)) {
-        this.tryMedicHeal();
+        const status = this.getHealStatusNow();
+        if (status.ready) this.tryMedicHeal();
+        else this.showAbilityBlocked(`Can't heal: ${status.reason}`);
       }
     }
 
@@ -3228,6 +3242,7 @@ private startParatrooperDrop(): void {
     this.aimPowerText.setVisible(false);
     let end = this.specialTarget;
     let ready = true;
+    let reason = '';
     if (this.specialTool === 'grapple' || this.specialTool === 'jetpack') {
       const hit = sweepTerrain(soldier.x, soldier.y - 16, end.x, end.y, (x, y) => this.terrain.isPointSolid(x, y));
       ready = Math.hypot(end.x - soldier.x, end.y - soldier.y) <= 400 && soldier.getRemainingGrapples() > 0 && (this.specialTool === 'jetpack' || !!hit);
@@ -3235,20 +3250,26 @@ private startParatrooperDrop(): void {
     } else if (this.specialTool === 'dig') {
       const plan = getTunnelPlan(soldier.x, soldier.y, this.aimAngle, this.worldWidth);
       end = { x: plan.endX, y: plan.endY };
-      ready = this.tunnelsUsedThisTurn < MAX_TUNNELS_PER_TURN && this.getMovementRemaining(soldier) >= TUNNEL_MOVEMENT_COST;
+      const status = this.getTunnelStatusNow();
+      ready = status.ready;
+      reason = status.reason;
       this.aimLine.lineStyle(plan.radius * 2, ready ? 0x80cdb2 : 0xe77664, 0.2);
       this.aimLine.lineBetween(plan.startX, plan.startY, end.x, end.y);
     } else {
       const facing = end.x >= soldier.x ? 1 : -1;
       end = { x: soldier.x + facing * 40, y: soldier.y + 5 };
-      ready = !this.coverUsedThisTurn && this.getMovementRemaining(soldier) >= COVER_MOVEMENT_COST;
+      const status = this.getCoverStatusNow();
+      ready = status.ready;
+      reason = status.reason;
       this.aimLine.lineStyle(3, 0xd6c59d, 0.8);
       this.aimLine.strokeRoundedRect(end.x - 29, end.y - 18, 58, 36, 4);
     }
     this.aimLine.lineStyle(2, ready ? 0x8de2cc : 0xef796d, 0.9);
     this.aimLine.lineBetween(soldier.x, soldier.y - 12, end.x, end.y);
     this.aimLine.strokeCircle(end.x, end.y, 8);
-    this.specialLabel?.setText(`${this.specialTool.toUpperCase()} / ${ready ? 'READY' : 'UNAVAILABLE'}`);
+    const toolName = this.specialTool === 'dig' ? 'TUNNEL' : this.specialTool.toUpperCase();
+    const confirmHint = ready ? '  -  ENTER/B to confirm, W/S to angle, ESC to cancel' : '';
+    this.specialLabel?.setText(`${toolName} / ${ready ? (reason || 'READY') : `UNAVAILABLE - ${reason || 'out of range'}`}${confirmHint}`);
   }
 
   private confirmSpecial(): void {
@@ -3282,7 +3303,11 @@ private startParatrooperDrop(): void {
       const y = plan.startY + (plan.endY - plan.startY) * t;
       return [-12, 0, 12].some(offset => this.terrain.isPointSolid(x, y + offset));
     }).filter(Boolean).length >= 2;
-    if (!hasGround) { soldier.sayQuip('blocked'); return false; }
+    if (!hasGround) {
+      soldier.sayQuip('blocked');
+      this.showAbilityBlocked("Can't dig: no ground there - aim into the dirt");
+      return false;
+    }
     const turn = this.turnId;
     for (let stroke = 0; stroke < 3; stroke++) {
       this.time.delayedCall(stroke * 240, () => {
@@ -3344,25 +3369,114 @@ private startParatrooperDrop(): void {
     return true;
   }
 
+  // ===== Ability availability (HUD + blocked-press feedback) =====
+
+  private getTurnActionState(): TurnActionState {
+    return {
+      hasFired: this.hasFired,
+      isCharging: this.isCharging || this.isMouseCharging,
+      isHowitzerMode: this.isHowitzerMode,
+      isAirstrikeTargeting: this.isAirstrikeTargeting,
+      isGrappling: !!this.currentSoldier?.isCurrentlyGrappling(),
+      isBusy: this.isTunnelActionInProgress || this.isCoverActionInProgress,
+    };
+  }
+
+  private getTunnelStatusNow(): AbilityStatus {
+    return getTunnelStatus({
+      ...this.getTurnActionState(),
+      isOperations: this.gameMode === 'expanded',
+      tunnelsUsed: this.tunnelsUsedThisTurn,
+      maxTunnels: MAX_TUNNELS_PER_TURN,
+      movementRemaining: this.currentSoldier ? this.getMovementRemaining(this.currentSoldier) : 0,
+      movementCost: TUNNEL_MOVEMENT_COST,
+    });
+  }
+
+  private getCoverStatusNow(): AbilityStatus {
+    return getCoverStatus({
+      ...this.getTurnActionState(),
+      coverUsed: this.coverUsedThisTurn,
+      movementRemaining: this.currentSoldier ? this.getMovementRemaining(this.currentSoldier) : 0,
+      movementCost: COVER_MOVEMENT_COST,
+    });
+  }
+
+  private getWoundedAlliesInRange(): Soldier[] {
+    const medic = this.currentSoldier;
+    if (!medic) return [];
+    const range = 150;
+    return this.soldiers
+      .filter(s =>
+        s.isAlive() &&
+        s.team === medic.team &&
+        s !== medic &&
+        s.getHealth() < 100 &&
+        Phaser.Math.Distance.Between(medic.x, medic.y, s.x, s.y) <= range
+      )
+      .sort((a, b) =>
+        Phaser.Math.Distance.Between(medic.x, medic.y, a.x, a.y) -
+        Phaser.Math.Distance.Between(medic.x, medic.y, b.x, b.y)
+      );
+  }
+
+  private getHealStatusNow(): AbilityStatus {
+    return getHealStatus({
+      ...this.getTurnActionState(),
+      isMedic: this.currentSoldier?.getWeaponType() === WeaponType.PISTOL,
+      woundedAlliesInRange: this.getWoundedAlliesInRange().length,
+    });
+  }
+
+  private getAbilityStatuses(): { label: string; status: AbilityStatus }[] {
+    const list: { label: string; status: AbilityStatus }[] = [];
+    if (this.gameMode === 'expanded') {
+      list.push({ label: '[B] Tunnel', status: this.getTunnelStatusNow() });
+      list.push({ label: '[Shift+B] Cover', status: this.getCoverStatusNow() });
+    } else {
+      list.push({ label: '[B] Cover', status: this.getCoverStatusNow() });
+    }
+    // Only medics can heal - don't clutter everyone else's HUD with it.
+    if (this.currentSoldier?.getWeaponType() === WeaponType.PISTOL) {
+      list.push({ label: '[H] Heal', status: this.getHealStatusNow() });
+    }
+    return list;
+  }
+
+  private emitAbilityStatus(list: { label: string; status: AbilityStatus }[] | null): void {
+    const key = list ? list.map(a => a.label + a.status.reason).join('|') : 'hidden';
+    if (key === this.lastAbilityStatusKey) return;
+    this.lastAbilityStatusKey = key;
+    this.events.emit('ability-status', list);
+  }
+
+  private showAbilityBlocked(message: string): void {
+    const soldier = this.currentSoldier;
+    if (!soldier) return;
+    const text = this.add.text(soldier.x, soldier.y - 78, message, {
+      font: 'bold 13px Arial',
+      color: '#ff9a7a',
+      stroke: '#000000',
+      strokeThickness: 3,
+    });
+    text.setOrigin(0.5);
+    text.setDepth(260);
+    this.tweens.add({
+      targets: text,
+      y: text.y - 18,
+      alpha: 0,
+      delay: 700,
+      duration: 700,
+      onComplete: () => text.destroy(),
+    });
+  }
+
   private tryMedicHeal(): void {
     if (!this.currentSoldier || this.hasFired) return;
     if (this.currentSoldier.getWeaponType() !== WeaponType.PISTOL) return; // Medic class
     const turnId = this.turnId;
 
-    const range = 150;
-    const candidates = this.soldiers
-      .filter(s =>
-        s.isAlive() &&
-        s.team === this.currentSoldier!.team &&
-        s !== this.currentSoldier &&
-        s.getHealth() < 100 &&
-        Phaser.Math.Distance.Between(this.currentSoldier!.x, this.currentSoldier!.y, s.x, s.y) <= range
-      )
-      .sort((a, b) =>
-        Phaser.Math.Distance.Between(this.currentSoldier!.x, this.currentSoldier!.y, a.x, a.y) -
-        Phaser.Math.Distance.Between(this.currentSoldier!.x, this.currentSoldier!.y, b.x, b.y)
-      );
-
+    const candidates = this.getWoundedAlliesInRange();
     if (candidates.length === 0) return;
 
     this.hasFired = true;

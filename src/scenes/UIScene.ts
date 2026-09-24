@@ -1,6 +1,7 @@
 import Phaser from 'phaser';
 import { Team } from '../systems/TurnManager';
 import { GameMode, RelayControl } from '../systems/GameRules';
+import type { AbilityStatus } from '../systems/Abilities';
 import {
   FactionId,
   FactionMatchup,
@@ -71,6 +72,7 @@ export class UIScene extends Phaser.Scene {
   private controlsText!: Phaser.GameObjects.Text;
   private movementBar!: Phaser.GameObjects.Graphics;
   private movementText!: Phaser.GameObjects.Text;
+  private abilityTexts: Phaser.GameObjects.Text[] = [];
   private objectiveText!: Phaser.GameObjects.Text;
   private powerupText!: Phaser.GameObjects.Text;
   private contextText!: Phaser.GameObjects.Text;
@@ -198,6 +200,7 @@ export class UIScene extends Phaser.Scene {
     this.gameScene.events.on('turn-started', this.updateTurnDisplay, this);
     this.gameScene.events.on('game-over', this.showGameOver, this);
     this.gameScene.events.on('movement-update', this.updateMovementBar, this);
+    this.gameScene.events.on('ability-status', this.updateAbilityStatus, this);
     this.gameScene.events.on('character-selection', this.showTacReadout, this);
     this.gameScene.events.on('new-game', this.resetUI, this);
     this.gameScene.events.on('objectives-update', this.updateObjectives, this);
@@ -456,6 +459,29 @@ export class UIScene extends Phaser.Scene {
     }
   }
 
+  // One line above the movement bar: what B / Shift+B / H will do right now, or why they can't.
+  private updateAbilityStatus(list: { label: string; status: AbilityStatus }[] | null): void {
+    this.abilityTexts.forEach(t => t.destroy());
+    this.abilityTexts = [];
+    if (!list || list.length === 0) return;
+
+    const gap = 22;
+    const texts = list.map(({ label, status }) =>
+      this.add.text(0, 643, `${label}: ${status.reason}`, {
+        font: 'bold 11px Arial',
+        color: status.ready ? '#7dffa0' : '#9a9a9a',
+        stroke: '#000000',
+        strokeThickness: 3,
+      }).setOrigin(0, 0));
+    const total = texts.reduce((w, t) => w + t.width, 0) + gap * (texts.length - 1);
+    let x = 640 - total / 2;
+    for (const t of texts) {
+      t.setX(x);
+      x += t.width + gap;
+    }
+    this.abilityTexts = texts;
+  }
+
   private updateMovementBar(info: { movementUsed: number; maxMovement: number }): void {
     this.movementBar.clear();
     
@@ -709,6 +735,7 @@ export class UIScene extends Phaser.Scene {
     this.teamText.setText('');
     this.tacReadoutPanel.setVisible(false);
     this.updatePowerups(null);
+    this.updateAbilityStatus(null);
     this.updateContext('');
     this.hideOperationsBriefing();
     this.updateFactionLabels();
@@ -718,6 +745,7 @@ export class UIScene extends Phaser.Scene {
     // Hide tactical readout
     this.tacReadoutPanel.setVisible(false);
     this.hideOperationsBriefing();
+    this.updateAbilityStatus(null);
     
     // Darken background
     this.add.rectangle(640, 360, 1280, 720, 0x000000, 0.7);
