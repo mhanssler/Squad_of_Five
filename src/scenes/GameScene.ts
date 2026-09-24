@@ -23,6 +23,15 @@ import { COVER_MOVEMENT_COST } from '../systems/Cover';
 import { getWindAccel, isWindCalm, rollWind, WIND_PREVIEW_SECONDS } from '../systems/Wind';
 import { HazardField } from '../entities/Hazards';
 import {
+  rollSpecialWeapon,
+  SLEDGE_DAMAGE,
+  SLEDGE_KNOCKBACK,
+  SLEDGE_RANGE,
+  SPECIAL_WEAPONS,
+  type SpecialBehavior,
+  type SpecialWeaponDef,
+} from '../systems/SpecialWeapons';
+import {
   AbilityStatus,
   TurnActionState,
   getCoverStatus,
@@ -82,7 +91,16 @@ function wrapDeg(angle: number): number {
 }
 const DEFAULT_MOVE_SPEED = 180;
 
-type SupplyDropType = 'medkit' | 'airstrike' | 'artillery' | 'armor' | 'munitions';
+type SupplyDropType = 'medkit' | 'airstrike' | 'artillery' | 'armor' | 'munitions' | 'weapon';
+
+// What a soldier shouts when firing a crate weapon.
+const CRATE_WEAPON_FIRE_LINES: Record<string, string> = {
+  cluster: 'Rain check!',
+  holy: 'Hallelujah!',
+  teleport: 'Beam me up!',
+  goat: "Go get 'em, Bessie!",
+  sledge: 'HAMMER TIME!',
+};
 
 const SUPPLY_DROP_HP = 50;
 const SUPPLY_DROP_RADIUS = 26; // Approx collision radius for damage checks
@@ -275,6 +293,9 @@ private gKey!: Phaser.Input.Keyboard.Key;
 
   // Battlefield hazards (explosive barrels, landmines)
   private hazards!: HazardField;
+
+  // One-shot weapon from a supply crate, armed with Q for this turn.
+  private isCrateWeaponArmed: boolean = false;
 
   // Character selection
   private isSelectingCharacter: boolean = false;
@@ -501,6 +522,10 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     
     // Listen for soldier hit checks (raycast collision for bullets)
     this.events.on('check-soldier-hit', this.checkSoldierHit, this);
+
+    // Crate weapon projectiles
+    this.events.on('special-teleport', this.handleTeleportBeacon, this);
+    this.events.on('special-exploded', this.handleCrateWeaponExploded, this);
     this.events.on('soldier-died', this.handleSoldierDeath, this);
     
     // Setup mouse controls
@@ -748,6 +773,7 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     this.isTunnelActionInProgress = false;
     this.isCoverActionInProgress = false;
     this.coverUsedThisTurn = false;
+    this.isCrateWeaponArmed = false;
 
     // New wind every turn.
     this.wind = rollWind();
@@ -2153,6 +2179,12 @@ private startParatrooperDrop(): void {
       return;
     }
 
+    // SPACE after firing detonates a walking Kamikaze Goat early.
+    if (this.hasFired && this.currentSoldier && !this.isTeamAI(this.currentSoldier.team) &&
+        Phaser.Input.Keyboard.JustDown(this.spaceKey)) {
+      this.events.emit('special-detonate');
+    }
+
     if (
       !this.currentSoldier ||
       !this.currentSoldier.isAlive() ||
@@ -2213,8 +2245,18 @@ private startParatrooperDrop(): void {
         this.exitHowitzerMode();
         return;
       }
+      if (this.isCrateWeaponArmed) {
+        this.isCrateWeaponArmed = false;
+        this.emitPowerupStatus();
+        return;
+      }
       this.deselectSoldier();
       return;
+    }
+
+    // Q arms / puts away the crate weapon.
+    if (Phaser.Input.Keyboard.JustDown(this.qKey)) {
+      this.toggleCrateWeapon();
     }
 
     // A/D to pan camera for scouting (releases follow)
@@ -2528,6 +2570,8 @@ private startParatrooperDrop(): void {
   private getActiveWeaponConfig(): WeaponConfig | null {
     if (!this.currentSoldier) return null;
     if (this.isHowitzerMode) return HOWITZER_CONFIG;
+    const crateWeapon = this.getArmedCrateWeapon();
+    if (crateWeapon?.config) return crateWeapon.config;
     return this.currentSoldier.weapon;
   }
 
@@ -2562,6 +2606,20 @@ private startParatrooperDrop(): void {
     const startX = origin.x;
     const startY = origin.y;
     const angleRad = Phaser.Math.DegToRad(this.aimAngle);
+
+    // Sledgehammer: melee, so just show the swing reach.
+    const crateWeapon = this.getArmedCrateWeapon();
+    if (crateWeapon && !crateWeapon.config) {
+      this.aimLine.lineStyle(3, crateWeapon.color, 0.8);
+      this.aimLine.beginPath();
+      this.aimLine.arc(startX, startY, SLEDGE_RANGE, angleRad - 1.2, angleRad + 1.2);
+      this.aimLine.strokePath();
+      this.aimLine.fillStyle(crateWeapon.color, 0.15);
+      this.aimLine.slice(startX, startY, SLEDGE_RANGE, angleRad - 1.2, angleRad + 1.2);
+      this.aimLine.fillPath();
+      this.aimPowerText.setVisible(false);
+      return;
+    }
     
     const muzzle = this.isHowitzerMode ? getMuzzle(startX, startY, this.aimAngle, 34, 34) : getMuzzle(startX, startY, this.aimAngle);
     let flight = createFlight(muzzle.x, muzzle.y, this.aimAngle, this.power, weaponConfig.projectileSpeed);
@@ -2765,6 +2823,10 @@ private startParatrooperDrop(): void {
 
     if (this.isHowitzerMode) {
       this.fireHowitzerShot();
+      return;
+    }
+    if (this.getArmedCrateWeapon()) {
+      this.fireCrateWeapon();
       return;
     }
     this.hasFired = true;
@@ -3410,6 +3472,154 @@ private startParatrooperDrop(): void {
     return true;
   }
 
+  // ===== Crate weapons (one-shot specials from supply drops) =====
+
+  private getArmedCrateWeapon(): SpecialWeaponDef | null {
+    if (!this.isCrateWeaponArmed || !this.currentSoldier) return null;
+    const id = this.currentSoldier.getSpecialWeapon();
+    return id ? SPECIAL_WEAPONS[id] : null;
+  }
+
+  private toggleCrateWeapon(): void {
+    const soldier = this.currentSoldier;
+    if (!soldier) return;
+    const id = soldier.getSpecialWeapon();
+    if (!id) {
+      this.showAbilityBlocked('No special weapon - grab a supply crate!');
+      return;
+    }
+    if (this.hasFired || this.isCharging || this.isMouseCharging || this.isHowitzerMode || this.isAirstrikeTargeting) return;
+    this.isCrateWeaponArmed = !this.isCrateWeaponArmed;
+    if (this.isCrateWeaponArmed) {
+      const def = SPECIAL_WEAPONS[id];
+      this.showPowerupText(soldier.x, soldier.y - 50, `${def.name.toUpperCase()} ARMED`, def.color, def.hint.toUpperCase());
+      SoundManager.playSelect();
+    }
+    this.emitPowerupStatus();
+  }
+
+  private fireCrateWeapon(): void {
+    const soldier = this.currentSoldier;
+    const def = this.getArmedCrateWeapon();
+    if (!soldier || !def) return;
+
+    this.hasFired = true;
+    this.isCrateWeaponArmed = false;
+    soldier.setSpecialWeapon(null);
+    this.clearChargeState();
+    this.emitPowerupStatus();
+    soldier.say(CRATE_WEAPON_FIRE_LINES[def.id] ?? 'Special delivery!');
+    this.onCrateWeaponFired(def);
+
+    if (!def.config) {
+      this.swingSledgehammer(soldier);
+      return;
+    }
+
+    this.cameras.main.stopFollow();
+    const muzzle = getMuzzle(soldier.x, soldier.y - 10, this.aimAngle);
+    const flight = createFlight(muzzle.x, muzzle.y, this.aimAngle, this.power, def.config.projectileSpeed);
+    this.beginShotResolution(soldier, def.config);
+    const projectile = new Projectile(
+      this, flight.x, flight.y, flight.vx, flight.vy, def.config, this.terrain, soldier,
+      { behavior: def.behavior ?? undefined },
+    );
+    this.events.emit('projectile-spawned', projectile);
+    this.events.emit('projectile-created', projectile);
+    soldier.playActionAnimation('fire', Math.cos(Phaser.Math.DegToRad(this.aimAngle)) < 0 ? -1 : 1);
+    this.cameras.main.shake(100, 0.004);
+  }
+
+  // Hook for veterancy/banter bookkeeping (a teleport isn't an attack).
+  private onCrateWeaponFired(_def: SpecialWeaponDef): void {}
+
+  private swingSledgehammer(soldier: Soldier): void {
+    const turnId = this.turnId;
+    const angleRad = Phaser.Math.DegToRad(this.aimAngle);
+    const facing: -1 | 1 = Math.cos(angleRad) < 0 ? -1 : 1;
+    soldier.playActionAnimation('fire', facing);
+
+    // Swing arc visual
+    const arc = this.add.graphics().setDepth(190);
+    arc.lineStyle(6, 0xcc8844, 0.9);
+    arc.beginPath();
+    arc.arc(soldier.x, soldier.y - 6, 34, angleRad - 1.1, angleRad + 0.4);
+    arc.strokePath();
+    this.tweens.add({ targets: arc, alpha: 0, duration: 300, onComplete: () => arc.destroy() });
+
+    // Hit the closest soldier in front of us (within reach and roughly in the aim direction).
+    const target = this.soldiers
+      .filter(s => {
+        if (!s.isAlive() || s === soldier) return false;
+        if (Phaser.Math.Distance.Between(soldier.x, soldier.y, s.x, s.y) > SLEDGE_RANGE) return false;
+        const toTarget = Math.atan2(s.y - soldier.y, s.x - soldier.x);
+        return Math.abs(Phaser.Math.Angle.Wrap(toTarget - angleRad)) < 1.2;
+      })
+      .sort((a, b) => Phaser.Math.Distance.Between(soldier.x, soldier.y, a.x, a.y) - Phaser.Math.Distance.Between(soldier.x, soldier.y, b.x, b.y))[0];
+
+    if (!target) {
+      this.showPowerupText(soldier.x + facing * 30, soldier.y - 30, 'WHIFF!', 0xaaaaaa);
+      this.time.delayedCall(1100, () => {
+        if (turnId === this.turnId && !this.isTurnEnding) this.endTurn();
+      });
+      return;
+    }
+
+    this.damageSoldier(target, SLEDGE_DAMAGE);
+    // Launch in the swing direction, always with some lift so they fly (aiming higher = more lift).
+    const lift = Phaser.Math.Clamp(-Math.sin(angleRad), 0.3, 0.9);
+    target.launch(facing * SLEDGE_KNOCKBACK * (1 - lift * 0.5), -SLEDGE_KNOCKBACK * 0.7 * lift - 120);
+    this.showPowerupText(target.x, target.y - 30, 'BONK!', 0xffaa33);
+    SoundManager.playExplosion('small');
+    this.cameras.main.shake(180, 0.01);
+    this.cameras.main.startFollow(target.sprite, true, 0.1, 0.1);
+
+    // Give the victim time to fly (and maybe off a cliff) before the turn ends.
+    this.time.delayedCall(2600, () => {
+      if (turnId === this.turnId && !this.isTurnEnding) this.endTurn();
+    });
+  }
+
+  private handleTeleportBeacon(x: number, y: number, shooter: Soldier | null): void {
+    if (!shooter || !shooter.isAlive() || shooter !== this.currentSoldier) return;
+
+    const surface = this.terrain.findSurfaceYAtOrBelow(x, y - 30, 90);
+    if (surface === null || surface > this.worldHeight - 20) {
+      this.showPowerupText(x, y - 20, 'TELEPORT FAILED', 0x66ffff);
+      return;
+    }
+
+    const flash = (fx: number, fy: number): void => {
+      const ring = this.add.circle(fx, fy, 22, 0x66ffff, 0.5).setDepth(190);
+      this.tweens.add({ targets: ring, scale: 2.2, alpha: 0, duration: 450, onComplete: () => ring.destroy() });
+    };
+    flash(shooter.x, shooter.y);
+    const body = shooter.sprite.body as Phaser.Physics.Arcade.Body;
+    body.setVelocity(0, 0);
+    shooter.sprite.setPosition(x, surface - 17);
+    // Terrain collision tracks each body's last position; start it fresh at the destination.
+    this.terrain.resetCollisionState(shooter.sprite);
+    flash(shooter.x, shooter.y);
+    SoundManager.playSelect();
+    this.cameras.main.startFollow(shooter.sprite, true, 0.1, 0.1);
+  }
+
+  private handleCrateWeaponExploded(behavior: SpecialBehavior): void {
+    if (behavior === 'holy') {
+      this.showWorldBanner('HALLELUJAH!', 'Holy Grenade');
+      this.cameras.main.shake(500, 0.02);
+      this.cameras.main.flash(250, 255, 250, 200);
+    } else if (behavior === 'goat') {
+      this.cameras.main.shake(260, 0.012);
+    }
+  }
+
+  /** All soldier damage goes through here (kill credit, veterancy and banter hook in). */
+  private damageSoldier(soldier: Soldier, amount: number): void {
+    if (!soldier.isAlive() || amount <= 0) return;
+    soldier.takeDamage(amount);
+  }
+
   // ===== Ability availability (HUD + blocked-press feedback) =====
 
   private getTurnActionState(): TurnActionState {
@@ -3965,6 +4175,7 @@ private startParatrooperDrop(): void {
     if (this.currentSoldier) {
       this.currentSoldier.setActive(false);
     }
+    this.isCrateWeaponArmed = false;
 
     // Prevent any pending "release-to-fire" from firing after the turn changes.
     this.clearChargeState();
@@ -4086,7 +4297,8 @@ private startParatrooperDrop(): void {
       return 'munitions';
     }
 
-    // Otherwise, a more even spread.
+    // Otherwise, a more even spread (a quarter are special weapon crates).
+    if (Math.random() < 0.25) return 'weapon';
     if (r < 0.28) return 'medkit';
     if (r < 0.48) return 'armor';
     if (r < 0.68) return 'artillery';
@@ -4227,6 +4439,7 @@ private startParatrooperDrop(): void {
     if (type === 'artillery') return 'HOWITZER';
     if (type === 'armor') return 'ARMOR';
     if (type === 'munitions') return 'MUNITIONS';
+    if (type === 'weapon') return 'SPECIAL WEAPON';
     return 'AIRSTRIKE';
   }
 
@@ -4235,6 +4448,7 @@ private startParatrooperDrop(): void {
     if (type === 'artillery') return 'PRESS C TO USE';
     if (type === 'armor') return 'PASSIVE DEFENSE';
     if (type === 'munitions') return 'X + C CALL-INS';
+    if (type === 'weapon') return 'PRESS Q TO ARM';
     return 'PRESS X TO USE';
   }
 
@@ -4255,6 +4469,7 @@ private startParatrooperDrop(): void {
       type === 'armor' ? 0x66ccff :
       type === 'munitions' ? 0xff66cc :
       type === 'artillery' ? 0xffaa00 :
+      type === 'weapon' ? 0xffdd33 :
       0x66ffff;
     const glow = this.add.rectangle(0, 0, 52, 38, glowColor, 0.10);
     glow.setOrigin(0.5);
@@ -4496,6 +4711,12 @@ private startParatrooperDrop(): void {
       title = 'ARMOR +40';
       subtitle = 'PASSIVE: ABSORBS 65% OF DAMAGE';
       color = 0x66ccff;
+    } else if (type === 'weapon') {
+      const def = SPECIAL_WEAPONS[rollSpecialWeapon()];
+      soldier.setSpecialWeapon(def.id);
+      title = def.name.toUpperCase();
+      subtitle = `PRESS Q TO ARM - ${def.hint.toUpperCase()}`;
+      color = def.color;
     } else if (type === 'munitions') {
       soldier.addAirstrikeCharges(1);
       soldier.addArtilleryCharges(1);
@@ -4559,6 +4780,8 @@ private startParatrooperDrop(): void {
       armor: soldier.getArmor(),
       airstrikeCharges: soldier.getAirstrikeCharges(),
       artilleryCharges: soldier.getArtilleryCharges(),
+      crateWeapon: soldier.getSpecialWeapon() ? SPECIAL_WEAPONS[soldier.getSpecialWeapon()!].name : null,
+      crateWeaponArmed: soldier === this.currentSoldier && this.isCrateWeaponArmed,
     } : null);
   }
 

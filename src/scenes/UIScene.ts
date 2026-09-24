@@ -65,6 +65,8 @@ interface PowerupInfo {
   armor: number;
   airstrikeCharges: number;
   artilleryCharges: number;
+  crateWeapon?: string | null;
+  crateWeaponArmed?: boolean;
 }
 
 export class UIScene extends Phaser.Scene {
@@ -191,7 +193,7 @@ export class UIScene extends Phaser.Scene {
     // Controls help - keyboard and mouse
     const terrainControl = this.gameMode === 'expanded' ? 'B Tunnel | Shift+B Cover 90' : 'B Cover 90';
     this.controlsText = this.add.text(640, 700,
-      `ARROWS Move | W/S Aim | SHIFT Fine | RMB Pan | HOLD SPACE/LMB Fire | G Grapple | ${terrainControl} | H Heal`, {
+      `ARROWS Move | W/S Aim | SHIFT Fine | RMB Pan | HOLD SPACE/LMB Fire | G Grapple | ${terrainControl} | H Heal | Q Crate Weapon`, {
       font: '11px Arial',
       color: '#ffffff',
       stroke: '#000000',
@@ -285,6 +287,11 @@ export class UIScene extends Phaser.Scene {
     if (info.armor > 0) supplies.push(`ARMOR ${info.armor} PASSIVE`);
     if (info.airstrikeCharges > 0) supplies.push(`X AIRSTRIKE x${info.airstrikeCharges}`);
     if (info.artilleryCharges > 0) supplies.push(`C HOWITZER x${info.artilleryCharges}`);
+    if (info.crateWeapon) {
+      supplies.push(info.crateWeaponArmed
+        ? `* ${info.crateWeapon.toUpperCase()} ARMED (Q/ESC PUT AWAY)`
+        : `Q ${info.crateWeapon.toUpperCase()}`);
+    }
 
     this.powerupText.setText(`SUPPLIES  ${supplies.length > 0 ? supplies.join('  |  ') : 'NONE'}`);
     this.powerupText.setColor(supplies.length > 0 ? '#9eeaff' : '#aab7c0');

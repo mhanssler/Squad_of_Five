@@ -1083,6 +1083,11 @@ export class Terrain {
     return this.collisionData[(py * this.width + px) * 4 + 3] > 128;
   }
 
+  /** Forget a body's tracked position (after teleporting it), so collision doesn't sweep from the old spot. */
+  public resetCollisionState(sprite: Phaser.Physics.Arcade.Sprite): void {
+    this.collisionState.delete(sprite);
+  }
+
   public checkCollision(sprite: Phaser.Physics.Arcade.Sprite): boolean {
     const body = sprite.body as Phaser.Physics.Arcade.Body;
     const prior = this.collisionState.get(sprite) ?? { x: sprite.x, y: sprite.y, grounded: false };
