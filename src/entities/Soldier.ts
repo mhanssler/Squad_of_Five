@@ -55,6 +55,7 @@ export class Soldier {
   private moveInput: -1 | 0 | 1 = 0;
   private grounded: boolean = true;
   private peakFallSpeed: number = 0;
+  private lastGroundedAt: number = 0;
   private static readonly WALK_ACCEL = 900; // px/s^2 while there is input
   private static readonly WALK_DECEL = 1500; // px/s^2 braking to a stop
   private static readonly AIR_CONTROL = 0.45; // fraction of ground accel while airborne
@@ -994,6 +995,12 @@ export class Soldier {
     }
 
     this.grounded = isGrounded;
+    if (isGrounded) this.lastGroundedAt = this.scene.time.now;
+  }
+
+  // True while standing on terrain; tolerates the one-frame contact flicker of walking over bumps.
+  public isSteadyOnGround(): boolean {
+    return this.grounded || this.scene.time.now - this.lastGroundedAt < 120;
   }
 
   private playLandingEffect(): void {

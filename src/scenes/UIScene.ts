@@ -1,5 +1,6 @@
 import Phaser from 'phaser';
 import { Team } from '../systems/TurnManager';
+import type { AbilityStatus } from '../systems/Abilities';
 
 interface TurnInfo {
   currentTeam: Team;
@@ -12,6 +13,11 @@ interface TurnInfo {
   roundNumber?: number;
   redActedThisRound?: number;
   blueActedThisRound?: number;
+}
+
+interface AbilityStatusInfo {
+  dig: AbilityStatus;
+  heal: AbilityStatus;
 }
 
 interface WeaponInfo {
@@ -47,6 +53,8 @@ export class UIScene extends Phaser.Scene {
   private controlsText!: Phaser.GameObjects.Text;
   private movementBar!: Phaser.GameObjects.Graphics;
   private movementText!: Phaser.GameObjects.Text;
+  private digStatusText!: Phaser.GameObjects.Text;
+  private healStatusText!: Phaser.GameObjects.Text;
   private tacReadoutPanel!: Phaser.GameObjects.Container;
   private gameScene!: Phaser.Scene;
   private maxMovement: number = 200;
@@ -103,6 +111,11 @@ export class UIScene extends Phaser.Scene {
     });
     this.movementText.setOrigin(0.5, 0);
 
+    // Ability availability (B Dig In / H Heal), shown just above the movement bar during the player's turn
+    const abilityStyle = { font: 'bold 13px Arial', color: '#ffffff', stroke: '#000000', strokeThickness: 3 };
+    this.digStatusText = this.add.text(630, 602, '', abilityStyle).setOrigin(1, 0).setVisible(false);
+    this.healStatusText = this.add.text(650, 602, '', abilityStyle).setOrigin(0, 0).setVisible(false);
+
     // Tactical Readout Panel (top left, below team indicator) - military style
     this.tacReadoutPanel = this.add.container(10, 40);
     this.tacReadoutPanel.setVisible(false);
@@ -121,6 +134,7 @@ export class UIScene extends Phaser.Scene {
     this.gameScene.events.on('turn-started', this.updateTurnDisplay, this);
     this.gameScene.events.on('game-over', this.showGameOver, this);
     this.gameScene.events.on('movement-update', this.updateMovementBar, this);
+    this.gameScene.events.on('ability-status', this.updateAbilityStatus, this);
     this.gameScene.events.on('character-selection', this.showTacReadout, this);
     this.gameScene.events.on('new-game', this.resetUI, this);
   }
@@ -152,6 +166,19 @@ export class UIScene extends Phaser.Scene {
     
     // Reset movement display
     this.updateMovementBar({ movementUsed: 0, maxMovement: this.maxMovement });
+  }
+
+  private updateAbilityStatus(info: AbilityStatusInfo | null): void {
+    this.digStatusText.setVisible(!!info);
+    this.healStatusText.setVisible(!!info);
+    if (!info) return;
+    this.setAbilityText(this.digStatusText, '[B] Dig In', info.dig);
+    this.setAbilityText(this.healStatusText, '[H] Heal', info.heal);
+  }
+
+  private setAbilityText(text: Phaser.GameObjects.Text, label: string, status: AbilityStatus): void {
+    text.setText(`${label}: ${status.ready ? 'READY' : status.reason}`);
+    text.setColor(status.ready ? '#66ff88' : '#888888');
   }
 
   private updateMovementBar(info: { movementUsed: number; maxMovement: number }): void {
@@ -393,11 +420,13 @@ export class UIScene extends Phaser.Scene {
     this.turnText.setText('Turn 1');
     this.teamText.setText('');
     this.tacReadoutPanel.setVisible(false);
+    this.updateAbilityStatus(null);
   }
 
   private showGameOver(winner: Team | null): void {
     // Hide tactical readout
     this.tacReadoutPanel.setVisible(false);
+    this.updateAbilityStatus(null);
     
     // Darken background
     this.add.rectangle(640, 360, 1280, 720, 0x000000, 0.7);

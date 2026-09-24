@@ -679,6 +679,7 @@ export class Terrain {
     const maxStepUp = 18;
     const maxStepDown = 32;
     const maxContactSpread = 24;
+    const maxSweep = 160;
 
     let footY = Math.floor(sprite.y + footOffsetY);
 
@@ -710,11 +711,18 @@ export class Terrain {
       return false;
     };
 
+    // Physics can move a falling body many pixels between checks (fixed-step catch-up on slow frames),
+    // enough to pass straight through a thin ledge. Sweep from last check's foot position so a surface
+    // crossed in between still catches the soldier.
+    const lastFootY = sprite.getData('terrainLastFootY') as number | undefined;
+    const fallSweep = lastFootY !== undefined && body.velocity.y > 0 ? footY - Math.floor(lastFootY) : 0;
+    const maxRise = fallSweep > maxStepUp && fallSweep <= maxSweep ? fallSweep : maxStepUp;
+
     const findLocalSurface = (sampleX: number): number | null => {
       return this.findSurfaceYAtOrBelow(
         sampleX,
-        footY - maxStepUp,
-        maxStepUp + maxStepDown
+        footY - maxRise,
+        maxRise + maxStepDown
       );
     };
 
@@ -736,7 +744,7 @@ export class Terrain {
       const targetY = highestSurface - footOffsetY;
       const snapDelta = targetY - sprite.y;
 
-      if (contactSpread <= maxContactSpread && snapDelta >= -maxStepUp && snapDelta <= maxStepDown) {
+      if (contactSpread <= maxContactSpread && snapDelta >= -maxRise && snapDelta <= maxStepDown) {
         sprite.y = targetY;
         body.setVelocityY(0);
         body.setAllowGravity(false);
@@ -768,6 +776,7 @@ export class Terrain {
       if (body.velocity.y > 0) body.setVelocityY(0);
     }
 
+    sprite.setData('terrainLastFootY', sprite.y + footOffsetY);
     return onGround;
   }
 

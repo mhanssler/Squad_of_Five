@@ -5,6 +5,7 @@ import { TurnManager, Team } from '../systems/TurnManager';
 import { Projectile, createProjectile } from '../entities/Projectile';
 import { WeaponConfig, WeaponType, WEAPONS } from '../systems/WeaponTypes';
 import { SoundManager } from '../utils/SoundManager';
+import { AbilityStatus, TurnActionState, getDigInStatus, getHealStatus } from '../systems/Abilities';
 
 // Base movement distance (modified by weapon weight)
 const BASE_MOVEMENT_DISTANCE = 320;
@@ -167,6 +168,7 @@ private gKey!: Phaser.Input.Keyboard.Key;
   private aimLine!: Phaser.GameObjects.Graphics;
   private aimPowerText!: Phaser.GameObjects.Text;
   private hasFired: boolean = false;
+  private lastAbilityStatusKey = '';
   private isTurnEnding: boolean = false; // Prevent double endTurn calls
 
   // Shot resolution tracking (prevents turns advancing while projectiles are still in flight).
@@ -1524,6 +1526,7 @@ private startParatrooperDrop(): void {
     // Handle character selection mode
     if (this.isSelectingCharacter) {
       this.handleCharacterSelection();
+      this.emitAbilityStatus(null, null);
       return;
     }
 
@@ -1533,6 +1536,7 @@ private startParatrooperDrop(): void {
 
     // During AI turns, player input is ignored. The AI runs via timers.
     if (this.isTeamAI(this.currentSoldier.team)) {
+      this.emitAbilityStatus(null, null);
       return;
     }
 
@@ -1588,6 +1592,7 @@ private startParatrooperDrop(): void {
 
       this.currentSoldier.stopMoving();
       this.updateAirstrikeMarker();
+      this.emitAbilityStatus(this.getCurrentDigInStatus(), this.getCurrentHealStatus());
 
       // Keep UI updated.
       this.events.emit('movement-update', {
@@ -1761,12 +1766,20 @@ private startParatrooperDrop(): void {
         this.enterAirstrikeTargeting();
       } else if (Phaser.Input.Keyboard.JustDown(this.cKey)) {
         this.enterHowitzerMode();
-      } else if (Phaser.Input.Keyboard.JustDown(this.bKey)) {
-        this.tryDigIn();
-      } else if (Phaser.Input.Keyboard.JustDown(this.hKey)) {
-        this.tryMedicHeal();
       }
     }
+
+    // Dig In / Heal: always check the key so a blocked press explains why instead of silently doing nothing.
+    const digStatus = this.getCurrentDigInStatus();
+    const healStatus = this.getCurrentHealStatus();
+    if (Phaser.Input.Keyboard.JustDown(this.bKey)) {
+      if (digStatus.ready) this.tryDigIn();
+      else this.showAbilityBlocked(`Can't dig in: ${digStatus.reason}`);
+    } else if (Phaser.Input.Keyboard.JustDown(this.hKey)) {
+      if (healStatus.ready) this.tryMedicHeal();
+      else this.showAbilityBlocked(`Can't heal: ${healStatus.reason}`);
+    }
+    this.emitAbilityStatus(digStatus, healStatus);
 
     // Update aim line
     this.drawAimLine();
@@ -2597,13 +2610,10 @@ private startParatrooperDrop(): void {
     });
   }
 
-  private tryMedicHeal(): void {
-    if (!this.currentSoldier || this.hasFired) return;
-    if (this.currentSoldier.getWeaponType() !== WeaponType.PISTOL) return; // Medic class
-    const turnId = this.turnId;
-
+  private getWoundedAlliesInRange(): Soldier[] {
+    if (!this.currentSoldier) return [];
     const range = 150;
-    const candidates = this.soldiers
+    return this.soldiers
       .filter(s =>
         s.isAlive() &&
         s.team === this.currentSoldier!.team &&
@@ -2615,6 +2625,66 @@ private startParatrooperDrop(): void {
         Phaser.Math.Distance.Between(this.currentSoldier!.x, this.currentSoldier!.y, a.x, a.y) -
         Phaser.Math.Distance.Between(this.currentSoldier!.x, this.currentSoldier!.y, b.x, b.y)
       );
+  }
+
+  private getTurnActionState(): TurnActionState {
+    return {
+      hasFired: this.hasFired,
+      isCharging: this.isCharging || this.isMouseCharging,
+      isHowitzerMode: this.isHowitzerMode,
+      isAirstrikeTargeting: this.isAirstrikeTargeting,
+      isGrappling: !!this.currentSoldier?.isCurrentlyGrappling(),
+    };
+  }
+
+  private getCurrentDigInStatus(): AbilityStatus {
+    return getDigInStatus({
+      ...this.getTurnActionState(),
+      isOnGround: !!this.currentSoldier?.isSteadyOnGround(),
+    });
+  }
+
+  private getCurrentHealStatus(): AbilityStatus {
+    return getHealStatus({
+      ...this.getTurnActionState(),
+      isMedic: this.currentSoldier?.getWeaponType() === WeaponType.PISTOL,
+      woundedAlliesInRange: this.getWoundedAlliesInRange().length,
+    });
+  }
+
+  private emitAbilityStatus(dig: AbilityStatus | null, heal: AbilityStatus | null): void {
+    const key = dig && heal ? `${dig.reason}|${heal.reason}` : 'hidden';
+    if (key === this.lastAbilityStatusKey) return;
+    this.lastAbilityStatusKey = key;
+    this.events.emit('ability-status', dig && heal ? { dig, heal } : null);
+  }
+
+  private showAbilityBlocked(message: string): void {
+    if (!this.currentSoldier) return;
+    const text = this.add.text(this.currentSoldier.x, this.currentSoldier.y - 70, message, {
+      font: 'bold 13px Arial',
+      color: '#ff9a7a',
+      stroke: '#000000',
+      strokeThickness: 3,
+    });
+    text.setOrigin(0.5);
+    text.setDepth(200);
+    this.tweens.add({
+      targets: text,
+      y: text.y - 18,
+      alpha: 0,
+      delay: 500,
+      duration: 700,
+      onComplete: () => text.destroy(),
+    });
+  }
+
+  private tryMedicHeal(): void {
+    if (!this.currentSoldier || this.hasFired) return;
+    if (this.currentSoldier.getWeaponType() !== WeaponType.PISTOL) return; // Medic class
+    const turnId = this.turnId;
+
+    const candidates = this.getWoundedAlliesInRange();
 
     if (candidates.length === 0) return;
 
