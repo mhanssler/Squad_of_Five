@@ -1,207 +1,167 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { Team } from '../src/systems/TurnManager';
+import { beforeEach, describe, expect, it } from 'vitest';
+import {
+  Team,
+  TurnManager,
+  type TurnParticipant,
+} from '../src/systems/TurnManager';
 
-// Mock Soldier class for testing TurnManager
-class MockSoldier {
-  public team: Team;
-  public name: string;
-  private alive: boolean = true;
-  private health: number = 100;
+class MockSoldier implements TurnParticipant {
+  constructor(
+    public team: Team,
+    public name: string,
+    private alive: boolean = true,
+  ) {}
 
-  constructor(team: Team, name: string, alive: boolean = true) {
-    this.team = team;
-    this.name = name;
-    this.alive = alive;
+  public isAlive(): boolean {
+    return this.alive;
   }
 
-  isAlive(): boolean {
-    return this.alive && this.health > 0;
-  }
-
-  setAlive(alive: boolean): void {
-    this.alive = alive;
-    if (!alive) this.health = 0;
-  }
-
-  takeDamage(amount: number): void {
-    this.health = Math.max(0, this.health - amount);
-    if (this.health <= 0) {
-      this.alive = false;
-    }
+  public kill(): void {
+    this.alive = false;
   }
 }
 
-// Import TurnManager after mocking
-// We'll test the logic directly since we can't easily mock Phaser
-describe('TurnManager Logic', () => {
-  describe('Team enum', () => {
-    it('should have RED and BLUE teams', () => {
-      expect(Team.RED).toBe('red');
-      expect(Team.BLUE).toBe('blue');
+describe('TurnManager', () => {
+  let redOne: MockSoldier;
+  let redTwo: MockSoldier;
+  let blueOne: MockSoldier;
+  let blueTwo: MockSoldier;
+  let manager: TurnManager<MockSoldier>;
+
+  beforeEach(() => {
+    redOne = new MockSoldier(Team.RED, 'Red One');
+    redTwo = new MockSoldier(Team.RED, 'Red Two');
+    blueOne = new MockSoldier(Team.BLUE, 'Blue One');
+    blueTwo = new MockSoldier(Team.BLUE, 'Blue Two');
+    manager = new TurnManager([redOne, redTwo, blueOne, blueTwo]);
+  });
+
+  it('starts on red team with the expected initial state', () => {
+    expect(manager.getCurrentTeam()).toBe(Team.RED);
+    expect(manager.getCurrentSoldier()).toBeNull();
+    expect(manager.getTurnInfo()).toEqual({
+      currentTeam: Team.RED,
+      currentSoldierName: 'None',
+      turnNumber: 1,
+      redTeamAlive: 2,
+      blueTeamAlive: 2,
+      roundNumber: 1,
+      redActedThisRound: 0,
+      blueActedThisRound: 0,
     });
   });
 
-  describe('Game state tracking', () => {
-    it('should track alive soldiers per team', () => {
-      const redSoldiers = [
-        new MockSoldier(Team.RED, 'Red1'),
-        new MockSoldier(Team.RED, 'Red2'),
-        new MockSoldier(Team.RED, 'Red3'),
-      ];
-      const blueSoldiers = [
-        new MockSoldier(Team.BLUE, 'Blue1'),
-        new MockSoldier(Team.BLUE, 'Blue2'),
-      ];
-      const allSoldiers = [...redSoldiers, ...blueSoldiers];
+  it('tracks the selected soldier', () => {
+    manager.setCurrentSoldier(redOne);
 
-      const redAlive = allSoldiers.filter(s => s.team === Team.RED && s.isAlive()).length;
-      const blueAlive = allSoldiers.filter(s => s.team === Team.BLUE && s.isAlive()).length;
-
-      expect(redAlive).toBe(3);
-      expect(blueAlive).toBe(2);
-    });
-
-    it('should update alive count when soldier dies', () => {
-      const soldiers = [
-        new MockSoldier(Team.RED, 'Red1'),
-        new MockSoldier(Team.RED, 'Red2'),
-        new MockSoldier(Team.BLUE, 'Blue1'),
-      ];
-
-      soldiers[0].setAlive(false);
-
-      const redAlive = soldiers.filter(s => s.team === Team.RED && s.isAlive()).length;
-      expect(redAlive).toBe(1);
-    });
+    expect(manager.getCurrentSoldier()).toBe(redOne);
+    expect(manager.getTurnInfo().currentSoldierName).toBe('Red One');
   });
 
-  describe('Game over conditions', () => {
-    it('should detect RED team win when all BLUE soldiers dead', () => {
-      const soldiers = [
-        new MockSoldier(Team.RED, 'Red1'),
-        new MockSoldier(Team.BLUE, 'Blue1', false),
-        new MockSoldier(Team.BLUE, 'Blue2', false),
-      ];
+  it('marks a soldier as acted and alternates teams', () => {
+    manager.setCurrentSoldier(redOne);
+    manager.nextTurn();
 
-      const redAlive = soldiers.filter(s => s.team === Team.RED && s.isAlive()).length;
-      const blueAlive = soldiers.filter(s => s.team === Team.BLUE && s.isAlive()).length;
-
-      expect(redAlive).toBeGreaterThan(0);
-      expect(blueAlive).toBe(0);
-      // This means RED wins
-    });
-
-    it('should detect BLUE team win when all RED soldiers dead', () => {
-      const soldiers = [
-        new MockSoldier(Team.RED, 'Red1', false),
-        new MockSoldier(Team.RED, 'Red2', false),
-        new MockSoldier(Team.BLUE, 'Blue1'),
-      ];
-
-      const redAlive = soldiers.filter(s => s.team === Team.RED && s.isAlive()).length;
-      const blueAlive = soldiers.filter(s => s.team === Team.BLUE && s.isAlive()).length;
-
-      expect(redAlive).toBe(0);
-      expect(blueAlive).toBeGreaterThan(0);
-      // This means BLUE wins
-    });
-
-    it('should detect draw when all soldiers dead', () => {
-      const soldiers = [
-        new MockSoldier(Team.RED, 'Red1', false),
-        new MockSoldier(Team.BLUE, 'Blue1', false),
-      ];
-
-      const redAlive = soldiers.filter(s => s.team === Team.RED && s.isAlive()).length;
-      const blueAlive = soldiers.filter(s => s.team === Team.BLUE && s.isAlive()).length;
-
-      expect(redAlive).toBe(0);
-      expect(blueAlive).toBe(0);
-      // This is a draw
-    });
-
-    it('should not be game over when both teams have alive soldiers', () => {
-      const soldiers = [
-        new MockSoldier(Team.RED, 'Red1'),
-        new MockSoldier(Team.BLUE, 'Blue1'),
-      ];
-
-      const redAlive = soldiers.filter(s => s.team === Team.RED && s.isAlive()).length;
-      const blueAlive = soldiers.filter(s => s.team === Team.BLUE && s.isAlive()).length;
-
-      expect(redAlive).toBeGreaterThan(0);
-      expect(blueAlive).toBeGreaterThan(0);
-      // Game continues
-    });
+    expect(manager.hasActedThisRound(redOne)).toBe(true);
+    expect(manager.getCurrentSoldier()).toBeNull();
+    expect(manager.getCurrentTeam()).toBe(Team.BLUE);
+    expect(manager.getTurnInfo().turnNumber).toBe(2);
+    expect(manager.getAvailableSoldiers(Team.RED)).toEqual([redTwo]);
   });
 
-  describe('Turn switching', () => {
-    it('should alternate between RED and BLUE teams', () => {
-      let currentTeam = Team.RED;
-      
-      // Switch turn
-      currentTeam = currentTeam === Team.RED ? Team.BLUE : Team.RED;
-      expect(currentTeam).toBe(Team.BLUE);
-      
-      // Switch again
-      currentTeam = currentTeam === Team.RED ? Team.BLUE : Team.RED;
-      expect(currentTeam).toBe(Team.RED);
-    });
+  it('excludes dead and already-acted soldiers from availability', () => {
+    redTwo.kill();
+    manager.setCurrentSoldier(redOne);
+    manager.markSoldierActed();
 
-    it('should skip team if no alive soldiers', () => {
-      const soldiers = [
-        new MockSoldier(Team.RED, 'Red1'),
-        new MockSoldier(Team.BLUE, 'Blue1', false), // Dead
-      ];
-
-      let currentTeam = Team.RED;
-      
-      // Try to switch to BLUE
-      const nextTeam = currentTeam === Team.RED ? Team.BLUE : Team.RED;
-      const nextTeamAlive = soldiers.filter(s => s.team === nextTeam && s.isAlive()).length;
-      
-      // If next team has no alive soldiers, stay with current or switch back
-      if (nextTeamAlive === 0) {
-        currentTeam = currentTeam; // Stay or determine game over
-      } else {
-        currentTeam = nextTeam;
-      }
-      
-      expect(currentTeam).toBe(Team.RED); // Should stay RED since BLUE has no alive
-    });
+    expect(manager.getAvailableSoldiers(Team.RED)).toEqual([]);
+    expect(manager.getAvailableSoldiers(Team.BLUE)).toEqual([blueOne, blueTwo]);
   });
 
-  describe('Soldier selection within team', () => {
-    it('should cycle through alive soldiers', () => {
-      const soldiers = [
-        new MockSoldier(Team.RED, 'Red1'),
-        new MockSoldier(Team.RED, 'Red2'),
-        new MockSoldier(Team.RED, 'Red3'),
-      ];
+  it('lets a team finish its remaining soldiers when the other team is exhausted', () => {
+    const unevenManager = new TurnManager([redOne, blueOne, blueTwo]);
 
-      let index = 0;
-      const aliveSoldiers = soldiers.filter(s => s.isAlive());
-      
-      expect(aliveSoldiers[index % aliveSoldiers.length].name).toBe('Red1');
-      index++;
-      expect(aliveSoldiers[index % aliveSoldiers.length].name).toBe('Red2');
-      index++;
-      expect(aliveSoldiers[index % aliveSoldiers.length].name).toBe('Red3');
-      index++;
-      expect(aliveSoldiers[index % aliveSoldiers.length].name).toBe('Red1'); // Cycles back
+    unevenManager.setCurrentSoldier(redOne);
+    unevenManager.nextTurn();
+    unevenManager.setCurrentSoldier(blueOne);
+    unevenManager.nextTurn();
+
+    expect(unevenManager.getCurrentTeam()).toBe(Team.BLUE);
+    expect(unevenManager.getAvailableSoldiers(Team.BLUE)).toEqual([blueTwo]);
+  });
+
+  it('starts a new round after every living soldier has acted', () => {
+    manager.setCurrentSoldier(redOne);
+    manager.nextTurn();
+    manager.setCurrentSoldier(blueOne);
+    manager.nextTurn();
+    manager.setCurrentSoldier(redTwo);
+    manager.nextTurn();
+    manager.setCurrentSoldier(blueTwo);
+    manager.nextTurn();
+
+    const info = manager.getTurnInfo();
+    expect(info.roundNumber).toBe(2);
+    expect(info.turnNumber).toBe(5);
+    expect(info.currentTeam).toBe(Team.RED);
+    expect(info.redActedThisRound).toBe(0);
+    expect(info.blueActedThisRound).toBe(0);
+    expect(manager.getAvailableSoldiers(Team.RED)).toEqual([redOne, redTwo]);
+    expect(manager.getAvailableSoldiers(Team.BLUE)).toEqual([blueOne, blueTwo]);
+  });
+
+  it('removes stale state when the soldier roster is replaced', () => {
+    manager.setCurrentSoldier(redOne);
+    manager.markSoldierActed();
+    manager.setSoldiers([redTwo, blueOne, blueTwo]);
+
+    expect(manager.getCurrentSoldier()).toBeNull();
+    expect(manager.hasActedThisRound(redOne)).toBe(false);
+    expect(manager.getAvailableSoldiers(Team.RED)).toEqual([redTwo]);
+  });
+
+  it('reports an active game while both teams have survivors', () => {
+    expect(manager.checkGameOver()).toEqual({ isOver: false, winner: null });
+  });
+
+  it('reports a red victory when blue has no survivors', () => {
+    blueOne.kill();
+    blueTwo.kill();
+
+    expect(manager.checkGameOver()).toEqual({ isOver: true, winner: Team.RED });
+  });
+
+  it('reports a blue victory when red has no survivors', () => {
+    redOne.kill();
+    redTwo.kill();
+
+    expect(manager.checkGameOver()).toEqual({ isOver: true, winner: Team.BLUE });
+  });
+
+  it('reports a draw when no soldiers survive', () => {
+    redOne.kill();
+    redTwo.kill();
+    blueOne.kill();
+    blueTwo.kill();
+
+    expect(manager.checkGameOver()).toEqual({ isOver: true, winner: null });
+  });
+
+  it('resets turn, round, selection, and acted state', () => {
+    manager.setCurrentSoldier(redOne);
+    manager.nextTurn();
+    manager.reset();
+
+    expect(manager.getTurnInfo()).toEqual({
+      currentTeam: Team.RED,
+      currentSoldierName: 'None',
+      turnNumber: 1,
+      redTeamAlive: 2,
+      blueTeamAlive: 2,
+      roundNumber: 1,
+      redActedThisRound: 0,
+      blueActedThisRound: 0,
     });
-
-    it('should skip dead soldiers in rotation', () => {
-      const soldiers = [
-        new MockSoldier(Team.RED, 'Red1'),
-        new MockSoldier(Team.RED, 'Red2', false), // Dead
-        new MockSoldier(Team.RED, 'Red3'),
-      ];
-
-      const aliveSoldiers = soldiers.filter(s => s.isAlive());
-      expect(aliveSoldiers.length).toBe(2);
-      expect(aliveSoldiers[0].name).toBe('Red1');
-      expect(aliveSoldiers[1].name).toBe('Red3');
-    });
+    expect(manager.getAvailableSoldiers(Team.RED)).toEqual([redOne, redTwo]);
   });
 });

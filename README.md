@@ -11,52 +11,81 @@ Turn-based artillery tactics game built with Phaser 3, TypeScript, and Vite.
 
 ## Requirements
 
-- Node.js 18+ (tested with Node v18.x)
+- Node.js 22.12 or newer
+- npm
+
+The supported Node.js version is pinned in `.nvmrc`. With `nvm` installed, run:
+
+```bash
+nvm use
+```
 
 ## Setup
 
-```powershell
+```bash
 npm ci
 ```
 
-## Run (dev)
+## Run (development)
 
-```powershell
+```bash
 npm run dev
 ```
 
-Vite will start a dev server (see the terminal output for the local URL; default is `http://localhost:3000`).
+Vite starts the development server at `http://localhost:3000` and opens it in the default browser.
 
 ## Build (production)
 
-```powershell
+```bash
 npm run build
 ```
 
-Outputs static files to `dist/`.
+The production build is written to `dist/`.
 
-## Preview (production build locally)
+## Preview the production build
 
-```powershell
+```bash
 npm run preview
 ```
 
 ## Tests
 
-```powershell
+Run the test suite once:
+
+```bash
 npm test
 ```
 
+Run tests in watch mode while developing:
+
+```bash
+npm run test:watch
+```
+
+Generate a coverage report:
+
+```bash
+npm run test:coverage
+```
+
+## Type checking
+
+```bash
+npm run typecheck
+```
+
+Pull requests and pushes to `main` run install, type-check, test, and production-build checks through GitHub Actions.
+
 ## Controls
 
-Menu:
+### Menu
 
 - Left/Right: navigate soldiers
 - Space: select/deselect
 - R: random squad
 - Enter: confirm team / start battle
 
-In-game (high level):
+### In game
 
 - Space/Enter/Esc or click: skip the intro sequence
 - Left/Right: move
@@ -72,4 +101,3 @@ In-game (high level):
 ## Notes
 
 - Development notes live in `DEVLOG.md`.
-
