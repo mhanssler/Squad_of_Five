@@ -20,6 +20,7 @@ import {
 } from '../systems/GameRules';
 import { adjustDropXsForTerrain, getDeploymentZone, planTeamDropXs } from '../systems/Deployment';
 import { COVER_MOVEMENT_COST } from '../systems/Cover';
+import { getWindAccel, isWindCalm, rollWind, WIND_PREVIEW_SECONDS } from '../systems/Wind';
 import {
   AbilityStatus,
   TurnActionState,
@@ -267,6 +268,9 @@ private gKey!: Phaser.Input.Keyboard.Key;
   private isCoverActionInProgress: boolean = false;
   private coverUsedThisTurn: boolean = false;
   private lastAbilityStatusKey = '';
+
+  // Wind for the current turn (-1..1)
+  private wind: number = 0;
 
   // Character selection
   private isSelectingCharacter: boolean = false;
@@ -736,6 +740,11 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     this.isTunnelActionInProgress = false;
     this.isCoverActionInProgress = false;
     this.coverUsedThisTurn = false;
+
+    // New wind every turn.
+    this.wind = rollWind();
+    Projectile.wind = this.wind;
+    this.events.emit('wind-changed', this.wind);
     this.emitOperationStatus();
     
     // Allow new game again
@@ -2539,6 +2548,12 @@ private startParatrooperDrop(): void {
     const radius = this.isBulletWeapon(weaponConfig.type) ? 0 : weaponConfig.projectileSize / 2;
     const units = this.getLiveShotUnits();
     const isFlame = weaponConfig.type === WeaponType.FLAMER;
+    // Wind bends slow ordnance. Basic keeps its full, wind-accurate solution; in Operations a windy
+    // preview only shows the start of the arc and the rest is the player's judgement.
+    const windAccel = getWindAccel(this.wind, weaponConfig.type);
+    const windLimited = this.gameMode === 'expanded' && windAccel !== 0 && !isWindCalm(this.wind);
+    const previewSteps = windLimited ? WIND_PREVIEW_SECONDS / BALLISTIC_STEP : 10 / BALLISTIC_STEP;
+    let reachedImpact = isFlame;
     if (isFlame) {
       const range = 100 + this.power;
       const endX = muzzle.x + Math.cos(angleRad) * range;
@@ -2546,14 +2561,17 @@ private startParatrooperDrop(): void {
       const hit = sweepTerrain(muzzle.x, muzzle.y, endX, endY, solid);
       trajectoryPoints.push(hit ? { x: hit.x, y: hit.y } : { x: endX, y: endY });
     }
-    for (let i = 0; !isFlame && i < 10 / BALLISTIC_STEP; i++) {
+    for (let i = 0; !isFlame && i < previewSteps; i++) {
       const previous = flight;
-      const result = advanceFlight(flight, weaponConfig, solid, BALLISTIC_STEP, radius);
+      const result = advanceFlight(flight, weaponConfig, solid, BALLISTIC_STEP, radius, windAccel);
       flight = result.state;
       const hit = findFirstUnitIntercept(previous.x, previous.y, flight.x, flight.y, units,
         this.isBulletWeapon(weaponConfig.type) || previous.age < 0.4 ? this.currentSoldier : null, 18);
       trajectoryPoints.push(hit ? { x: hit.x, y: hit.y } : { x: flight.x, y: flight.y });
-      if (hit || result.ended || flight.x < 0 || flight.x > this.worldWidth || flight.y > this.worldHeight - 2) break;
+      if (hit || result.ended || flight.x < 0 || flight.x > this.worldWidth || flight.y > this.worldHeight - 2) {
+        reachedImpact = true;
+        break;
+      }
     }
 
     const lastTrajectoryPoint = trajectoryPoints.length > 0
@@ -2606,7 +2624,8 @@ private startParatrooperDrop(): void {
       }
       
       // Distant Operations shots show a landing bracket rather than an exact center.
-      if (trajectoryPoints.length > 2) {
+      // (No marker at all when wind cut the preview short.)
+      if (trajectoryPoints.length > 2 && (reachedImpact || !windLimited)) {
         const lastPoint = lastTrajectoryPoint;
 
         if (aimAssist.exactImpact) {
@@ -5681,9 +5700,11 @@ private startParatrooperDrop(): void {
     let impactY: number | null = null;
     let interceptedSoldier: Soldier | null = null;
     let terrainProgress: number | null = null;
+    // The AI reads the wind well, but not perfectly.
+    const windAccel = getWindAccel(this.wind, weapon.type) * 0.85;
     for (let i = 0; i < 10 / BALLISTIC_STEP; i++) {
       const previous = flight;
-      const result = advanceFlight(flight, weapon, solid, BALLISTIC_STEP, isBullet ? 0 : weapon.projectileSize / 2);
+      const result = advanceFlight(flight, weapon, solid, BALLISTIC_STEP, isBullet ? 0 : weapon.projectileSize / 2, windAccel);
       flight = result.state;
       if (flight.x < 0 || flight.x > this.worldWidth || flight.y > this.worldHeight) break;
       minDist = Math.min(minDist, Math.hypot(flight.x - targetX, flight.y - targetY));

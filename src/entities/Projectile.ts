@@ -4,6 +4,7 @@ import { WeaponConfig, WeaponType } from '../systems/WeaponTypes';
 import { Terrain } from '../systems/Terrain';
 import { SoundManager } from '../utils/SoundManager';
 import type { Soldier } from './Soldier';
+import { getWindAccel } from '../systems/Wind';
 
 // How long a newly fired explosive ignores its own shooter. Prevents point-blank self-detonation
 // at spawn (the muzzle sits inside the shooter's hit circle for downward aims) while still letting
@@ -55,7 +56,11 @@ function playWeaponSound(type: WeaponType): void {
 }
 
 export class Projectile {
+  /** Current wind (-1..1), set by GameScene at the start of every turn. Applies to newly fired projectiles. */
+  public static wind = 0;
+
   private scene: Phaser.Scene;
+  private windAccel = 0;
   private sprite: Phaser.Physics.Arcade.Sprite;
   private config: WeaponConfig;
   private hasExploded: boolean = false;
@@ -89,6 +94,7 @@ export class Projectile {
     this.isBullet = BULLET_WEAPONS.includes(config.type);
 
     this.flight = { x, y, vx: velocityX, vy: velocityY, age: 0 };
+    this.windAccel = getWindAccel(Projectile.wind, config.type);
     // Create projectile sprite
     this.sprite = scene.physics.add.sprite(x, y, 'projectile');
     
@@ -104,7 +110,7 @@ export class Projectile {
     body.setAllowGravity(false);
     body.setVelocity(velocityX, velocityY);
     if (config.bounce > 0) {
-      this.fuseText = scene.add.text(x, y - 15, GRENADE_FUSE.toFixed(1), {
+      this.fuseText = scene.add.text(x, y - 15, (config.fuse ?? GRENADE_FUSE).toFixed(1), {
         font: 'bold 12px Arial', color: '#ffe296', stroke: '#172125', strokeThickness: 3,
       }).setOrigin(0.5).setDepth(210);
     }
@@ -150,7 +156,7 @@ export class Projectile {
       this.accumulator -= BALLISTIC_STEP;
       this.lastX = this.flight.x;
       this.lastY = this.flight.y;
-      const result = advanceFlight(this.flight, this.config, solid, BALLISTIC_STEP, this.isBullet ? 0 : this.config.projectileSize / 2);
+      const result = advanceFlight(this.flight, this.config, solid, BALLISTIC_STEP, this.isBullet ? 0 : this.config.projectileSize / 2, this.windAccel);
       this.flight = result.state;
       this.sprite.setPosition(this.flight.x, this.flight.y);
       (this.sprite.body as Phaser.Physics.Arcade.Body).setVelocity(this.flight.vx, this.flight.vy);
@@ -172,7 +178,7 @@ export class Projectile {
       if (this.flight.x < bounds.left - 50 || this.flight.x > bounds.right + 50) { this.destroy(); return; }
     }
     this.flightSound?.update(this.flight.vx, this.flight.vy);
-    this.fuseText?.setPosition(this.flight.x, this.flight.y - 15).setText(Math.max(0, GRENADE_FUSE - this.flight.age).toFixed(1));
+    this.fuseText?.setPosition(this.flight.x, this.flight.y - 15).setText(Math.max(0, (this.config.fuse ?? GRENADE_FUSE) - this.flight.age).toFixed(1));
     this.trailPoints.push({ x: this.flight.x, y: this.flight.y });
     if (this.trailPoints.length > (this.isBullet ? 15 : 30)) this.trailPoints.shift();
     this.drawTrail();

@@ -2,6 +2,7 @@ import Phaser from 'phaser';
 import { Team } from '../systems/TurnManager';
 import { GameMode, RelayControl } from '../systems/GameRules';
 import type { AbilityStatus } from '../systems/Abilities';
+import { isWindCalm } from '../systems/Wind';
 import {
   FactionId,
   FactionMatchup,
@@ -73,6 +74,8 @@ export class UIScene extends Phaser.Scene {
   private movementBar!: Phaser.GameObjects.Graphics;
   private movementText!: Phaser.GameObjects.Text;
   private abilityTexts: Phaser.GameObjects.Text[] = [];
+  private windGraphics!: Phaser.GameObjects.Graphics;
+  private windText!: Phaser.GameObjects.Text;
   private objectiveText!: Phaser.GameObjects.Text;
   private powerupText!: Phaser.GameObjects.Text;
   private contextText!: Phaser.GameObjects.Text;
@@ -201,6 +204,16 @@ export class UIScene extends Phaser.Scene {
     this.gameScene.events.on('game-over', this.showGameOver, this);
     this.gameScene.events.on('movement-update', this.updateMovementBar, this);
     this.gameScene.events.on('ability-status', this.updateAbilityStatus, this);
+    this.gameScene.events.on('wind-changed', this.updateWind, this);
+
+    // Wind gauge (top center, under the turn/objective lines)
+    this.windGraphics = this.add.graphics();
+    this.windText = this.add.text(640, 86, '', {
+      font: 'bold 11px Arial',
+      color: '#ffffff',
+      stroke: '#000000',
+      strokeThickness: 3,
+    }).setOrigin(0.5, 0);
     this.gameScene.events.on('character-selection', this.showTacReadout, this);
     this.gameScene.events.on('new-game', this.resetUI, this);
     this.gameScene.events.on('objectives-update', this.updateObjectives, this);
@@ -457,6 +470,37 @@ export class UIScene extends Phaser.Scene {
       this.briefingContainer.destroy(true);
       this.briefingContainer = null;
     }
+  }
+
+  private updateWind(wind: number): void {
+    const g = this.windGraphics;
+    g.clear();
+    const cx = 640;
+    const y = 102;
+    const halfWidth = 60;
+
+    g.fillStyle(0x000000, 0.45);
+    g.fillRoundedRect(cx - halfWidth - 4, y - 4, halfWidth * 2 + 8, 12, 3);
+    g.lineStyle(1, 0xffffff, 0.4);
+    g.lineBetween(cx, y - 4, cx, y + 8);
+
+    if (isWindCalm(wind)) {
+      this.windText.setText('WIND: CALM');
+      return;
+    }
+
+    const strength = Math.abs(wind);
+    const len = strength * halfWidth;
+    const dir = wind > 0 ? 1 : -1;
+    const color = strength >= 0.7 ? 0xff5544 : strength >= 0.4 ? 0xffcc33 : 0x66ddff;
+    g.fillStyle(color, 1);
+    g.fillRect(dir > 0 ? cx : cx - len, y, len, 4);
+    const tipX = cx + dir * len;
+    g.fillTriangle(tipX + dir * 7, y + 2, tipX, y - 3, tipX, y + 7);
+
+    const arrows = (dir > 0 ? '▶' : '◀').repeat(Math.ceil(strength * 3));
+    const label = `${strength >= 0.7 ? 'GALE' : 'WIND'} ${Math.round(strength * 100)}%`;
+    this.windText.setText(dir > 0 ? `${label} ${arrows}` : `${arrows} ${label}`);
   }
 
   // One line above the movement bar: what B / Shift+B / H will do right now, or why they can't.
@@ -736,6 +780,8 @@ export class UIScene extends Phaser.Scene {
     this.tacReadoutPanel.setVisible(false);
     this.updatePowerups(null);
     this.updateAbilityStatus(null);
+    this.windGraphics.clear();
+    this.windText.setText('');
     this.updateContext('');
     this.hideOperationsBriefing();
     this.updateFactionLabels();

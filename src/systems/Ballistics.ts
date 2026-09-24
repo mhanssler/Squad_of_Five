@@ -2,7 +2,14 @@ export const BALLISTIC_STEP = 1 / 120;
 export const GRENADE_FUSE = 2.5;
 export type SolidQuery = (x: number, y: number) => boolean;
 export interface FlightState { x: number; y: number; vx: number; vy: number; age: number }
-export interface FlightConfig { gravity: number; drag: number; bounce: number; projectileSize: number }
+export interface FlightConfig {
+  gravity: number;
+  drag: number;
+  bounce: number;
+  projectileSize: number;
+  /** Seconds before a bouncing projectile detonates (defaults to GRENADE_FUSE). */
+  fuse?: number;
+}
 export interface TerrainHit { x: number; y: number; t: number; nx: number; ny: number }
 
 export function sweepTerrain(x0: number, y0: number, x1: number, y1: number, solid: SolidQuery, radius = 0): TerrainHit | null {
@@ -28,10 +35,11 @@ export function sweepTerrain(x0: number, y0: number, x1: number, y1: number, sol
   return null;
 }
 
-export function advanceFlight(state: FlightState, config: FlightConfig, solid: SolidQuery, dt = BALLISTIC_STEP, radius = 0) {
+/** `windAccel` is horizontal acceleration in px/s^2 (see systems/Wind). */
+export function advanceFlight(state: FlightState, config: FlightConfig, solid: SolidQuery, dt = BALLISTIC_STEP, radius = 0, windAccel = 0) {
   const drag = config.drag * 100;
   const damp = (v: number): number => Math.sign(v) * Math.max(0, Math.abs(v) - drag * dt);
-  let vx = damp(state.vx), vy = damp(state.vy) + 500 * config.gravity * dt;
+  let vx = damp(state.vx) + windAccel * dt, vy = damp(state.vy) + 500 * config.gravity * dt;
   let x = state.x + vx * dt, y = state.y + vy * dt;
   const hit = sweepTerrain(state.x, state.y, x, y, solid, radius);
   if (hit) {
@@ -47,7 +55,7 @@ export function advanceFlight(state: FlightState, config: FlightConfig, solid: S
       vy = tangentY * 0.8 + rebound * hit.ny;
     }
   }
-  return { state: { x, y, vx, vy, age: state.age + dt }, hit, ended: (hit !== null && config.bounce <= 0) || (config.bounce > 0 && state.age + dt >= GRENADE_FUSE) };
+  return { state: { x, y, vx, vy, age: state.age + dt }, hit, ended: (hit !== null && config.bounce <= 0) || (config.bounce > 0 && state.age + dt >= (config.fuse ?? GRENADE_FUSE)) };
 }
 
 export function getMuzzle(x: number, y: number, angle: number, offsetX = 20, offsetY = 10) {
