@@ -8,6 +8,18 @@
 
 ## Changelog
 
+### [0.0.12] - 2026-09-24
+#### Added
+- **Wind**: rolled every turn (calm / breeze / gale) and shown under the turn banner. It pushes grenades, rockets, mortars and demo charges through the shared ballistics step, so shots, the aim preview and the AI all agree. Basic keeps its full, now wind-accurate guide. In Operations a windy preview only shows the first 0.9s of the arc.
+- **Explosive barrels and landmines** are scattered after the intro, clear of soldiers and relays. Barrels chain when blasted or shot. Mines give about a second of warning. Turns wait for chain reactions to finish.
+- **Special weapon crates** make up a quarter of supply drops: Cluster Bomb, Holy Grenade, Teleporter, Kamikaze Goat and Sledgehammer. Q arms one.
+- **Veterancy**: kills promote soldiers to Veteran ★ / Elite ★★ / Hero ★★★ for bonus damage, movement and armor.
+- **Reactive banter**: brags, miss excuses, enemy taunts, friendly-fire apologies. The teammate-down reaction now names who fell.
+
+#### Changed
+- Tunnel, cover and heal availability is always visible above the movement bar ("READY (2 left, 72 move)" or why not). Blocked presses and the dig preview explain the reason instead of failing silently.
+- Node 22 is pinned in `.nvmrc`, CI runs a typecheck, and `npm test` runs once instead of watching.
+
 ### [0.0.11] - 2026-07-26
 #### Added
 - Two-frame faction/class stride animations with planted feet and restrained cadence.

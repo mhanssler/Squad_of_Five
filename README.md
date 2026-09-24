@@ -11,7 +11,7 @@ Turn-based artillery tactics game built with Phaser 3, TypeScript, and Vite.
 
 ## Requirements
 
-- Node.js 18+ (tested with Node v18.x)
+- Node.js 22.12+ (see `.nvmrc`). Older versions such as Node 18 cannot run the current Vite and Vitest.
 
 ## Setup
 
@@ -71,7 +71,17 @@ In-game (high level):
 - H: heal
 - X: target an available airstrike
 - C: deploy an available howitzer
+- Q: arm / put away a special weapon from a crate (Esc also puts it away)
+- Space after firing: detonate the Kamikaze Goat early
 - N: new game
+
+## Battlefield
+
+- **Wind** changes every turn (gauge under the turn banner). It pushes grenades, rockets, mortars and demo charges, but not bullets.
+- **Explosive barrels** go off when caught in a blast or shot, and can chain. **Landmines** give you about a second to get clear.
+- **Special weapon crates** (a quarter of supply drops): Cluster Bomb, Holy Grenade, Teleporter, Kamikaze Goat, Sledgehammer. Each is single-use.
+- **Veterancy**: kills promote a soldier to Veteran ★ (1 kill), Elite ★★ (2), then Hero ★★★ (4), for more damage, more movement, and armor at Hero.
+- The line above the movement bar shows whether Tunnel / Cover / Heal are ready right now, or what's stopping them.
 
 ## Rulesets
 

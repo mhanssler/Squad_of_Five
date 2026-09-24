@@ -782,16 +782,7 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     this.isCoverActionInProgress = false;
     this.coverUsedThisTurn = false;
     this.isCrateWeaponArmed = false;
-    this.turnActor = this.currentSoldier;
-    this.turnStats = emptyShotStats();
-    this.turnActorAttacked = false;
-    this.lastImpact = null;
-    this.lastAllyHit = null;
-
-    // New wind every turn.
-    this.wind = rollWind();
-    Projectile.wind = this.wind;
-    this.events.emit('wind-changed', this.wind);
+    this.turnActor = null;
     this.emitOperationStatus();
     
     // Allow new game again
@@ -2084,6 +2075,17 @@ private startParatrooperDrop(): void {
     this.isTunnelActionInProgress = false;
     this.isCoverActionInProgress = false;
     this.coverUsedThisTurn = false;
+    this.isCrateWeaponArmed = false;
+    this.turnActor = this.currentSoldier;
+    this.turnStats = emptyShotStats();
+    this.turnActorAttacked = false;
+    this.lastImpact = null;
+    this.lastAllyHit = null;
+
+    // New wind every turn.
+    this.wind = rollWind();
+    Projectile.wind = this.wind;
+    this.events.emit('wind-changed', this.wind);
     
     if (this.currentSoldier) {
       this.currentSoldier.setActive(true);
