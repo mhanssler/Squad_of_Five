@@ -24,7 +24,9 @@ const config: Phaser.Types.Core.GameConfig = {
   },
   scene: [BootScene, MenuScene, GameScene, UIScene, VisualTestScene],
   pixelArt: false,
-  roundPixels: true,
+  // Off on purpose: soldiers are drawn as a sprite plus two slightly larger outline layers, and
+  // snapping each layer to whole pixels separately made the outlines jitter while standing still.
+  roundPixels: false,
 };
 
 const game = new Phaser.Game(config);

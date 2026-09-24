@@ -2118,7 +2118,7 @@ private startParatrooperDrop(): void {
       // Start following the soldier after zoom
       this.time.delayedCall(300, () => {
         if (this.currentSoldier) {
-          this.cameras.main.startFollow(this.currentSoldier.sprite, true, 0.08, 0.08);
+          this.cameras.main.startFollow(this.currentSoldier.sprite, false, 0.08, 0.08);
         }
       });
     }
@@ -2459,17 +2459,23 @@ private startParatrooperDrop(): void {
       // Create dramatic falling death effect
       this.createFallDeathEffect(x, Math.min(y, this.worldHeight));
       
-      // If this was the current soldier, end their turn
+      // If this was the current soldier, end their turn - but if they fired on the way down,
+      // let that shot land first (its resolution ends the turn), so it can't carry over into
+      // the next soldier's turn and hit/credit the wrong side.
       if (soldier === this.currentSoldier && !this.isTurnEnding) {
         const turnId = this.turnId;
         const soldierRef = soldier;
-        this.time.delayedCall(500, () => {
+        const tryEnd = (): void => {
           if (turnId !== this.turnId) return;
           if (this.currentSoldier !== soldierRef) return;
-          if (!this.isTurnEnding) {
-            this.endTurn();
+          if (this.isTurnEnding) return;
+          if (this.isShotResolving() || this.hazards.isBusy()) {
+            this.time.delayedCall(250, tryEnd);
+            return;
           }
-        });
+          this.endTurn();
+        };
+        this.time.delayedCall(500, tryEnd);
       }
     }
   }
@@ -3594,7 +3600,7 @@ private startParatrooperDrop(): void {
     this.showPowerupText(target.x, target.y - 30, 'BONK!', 0xffaa33);
     SoundManager.playExplosion('small');
     this.cameras.main.shake(180, 0.01);
-    this.cameras.main.startFollow(target.sprite, true, 0.1, 0.1);
+    this.cameras.main.startFollow(target.sprite, false, 0.1, 0.1);
 
     // Give the victim time to fly (and maybe off a cliff) before the turn ends.
     this.time.delayedCall(2600, () => {
@@ -3623,7 +3629,7 @@ private startParatrooperDrop(): void {
     this.terrain.resetCollisionState(shooter.sprite);
     flash(shooter.x, shooter.y);
     SoundManager.playSelect();
-    this.cameras.main.startFollow(shooter.sprite, true, 0.1, 0.1);
+    this.cameras.main.startFollow(shooter.sprite, false, 0.1, 0.1);
   }
 
   private handleCrateWeaponExploded(behavior: SpecialBehavior): void {
@@ -3976,7 +3982,7 @@ private startParatrooperDrop(): void {
     const lerpY = lerpX;
     
     // Always follow the projectile
-    this.cameras.main.startFollow(projectile.getSprite(), true, lerpX, lerpY);
+    this.cameras.main.startFollow(projectile.getSprite(), false, lerpX, lerpY);
     
     // For very fast projectiles, also do a slight zoom out to see more
     if (speed > 1000) {
@@ -3994,7 +4000,7 @@ private startParatrooperDrop(): void {
   private trackFlameJet(_flameJet: unknown): void {
     // For flamethrower, keep camera on the soldier since flames are short range
     if (this.currentSoldier) {
-      this.cameras.main.startFollow(this.currentSoldier.sprite, true, 0.1, 0.1);
+      this.cameras.main.startFollow(this.currentSoldier.sprite, false, 0.1, 0.1);
     }
   }
 
