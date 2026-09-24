@@ -21,6 +21,7 @@ import {
 import { adjustDropXsForTerrain, getDeploymentZone, planTeamDropXs } from '../systems/Deployment';
 import { COVER_MOVEMENT_COST } from '../systems/Cover';
 import { getWindAccel, isWindCalm, rollWind, WIND_PREVIEW_SECONDS } from '../systems/Wind';
+import { HazardField } from '../entities/Hazards';
 import {
   AbilityStatus,
   TurnActionState,
@@ -272,6 +273,9 @@ private gKey!: Phaser.Input.Keyboard.Key;
   // Wind for the current turn (-1..1)
   private wind: number = 0;
 
+  // Battlefield hazards (explosive barrels, landmines)
+  private hazards!: HazardField;
+
   // Character selection
   private isSelectingCharacter: boolean = false;
   private selectableSoldiers: Soldier[] = [];
@@ -382,6 +386,9 @@ private gKey!: Phaser.Input.Keyboard.Key;
     
     // Create terrain (wider battlefield) with random seed
     this.terrain = new Terrain(this, this.worldWidth, this.worldHeight, undefined, { preset: this.terrainPreset });
+    this.hazards = new HazardField(this, this.terrain, (x, y, radius, damage) => {
+      this.handleExplosion(x, y, radius, damage);
+    });
     this.battlefieldSky = new BattlefieldSky(
       this,
       this.worldWidth,
@@ -696,6 +703,7 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
       }
     });
     this.supplyDrops = [];
+    this.hazards.clear();
     this.nextBalanceEventTurn = 4;
 
     this.destroyRelayObjectives();
@@ -923,6 +931,17 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     if (this.introDone) return;
     this.introDone = true;
     this.stopIntroCameraMove();
+
+    // Scatter barrels and mines now that the bombardment has finished reshaping the ground,
+    // keeping clear of soldiers and (in Operations) the signal relays.
+    const relayXs = this.gameMode === 'expanded' ? [0.32, 0.5, 0.68].map(r => Math.round(this.worldWidth * r)) : [];
+    this.hazards.clear();
+    this.hazards.spawn(
+      this.worldWidth,
+      [...this.soldiers.map(s => s.x), ...relayXs],
+      Math.max(2, Math.round(this.worldWidth / 520)),
+      Math.max(2, Math.round(this.worldWidth / 640)),
+    );
 
     if (this.introHintText) {
       this.introHintText.destroy();
@@ -2122,6 +2141,9 @@ private startParatrooperDrop(): void {
 
     // Supply drops can be collected any time (even during selection between turns).
     this.checkSupplyDropPickups();
+
+    // Barrels settle/fall with the terrain; mines check for anyone stepping close.
+    this.hazards.update(dt, this.soldiers, this.worldHeight);
     this.updateRelayPositions();
     this.updateRelayAwareness();
 
@@ -3620,13 +3642,18 @@ private startParatrooperDrop(): void {
     this.shotEndScheduled = true;
     const turnId = this.turnId;
 
-    // Small delay so the player sees the impact/explosion.
-    this.time.delayedCall(650, () => {
+    // Small delay so the player sees the impact/explosion (and any barrel/mine chain finishes).
+    const tryEnd = (): void => {
       if (turnId !== this.turnId) return;
       if (this.isTurnEnding) return;
       if (!this.hasFired) return;
-      if (!this.isTurnEnding) this.endTurn();
-    });
+      if (this.hazards.isBusy()) {
+        this.time.delayedCall(250, tryEnd);
+        return;
+      }
+      this.endTurn();
+    };
+    this.time.delayedCall(650, tryEnd);
   }
 
   private trackProjectile(projectile: Projectile): void {
@@ -3716,6 +3743,9 @@ private startParatrooperDrop(): void {
       if (nearMiss && Math.random() < 0.72) nearMiss.soldier.sayQuip('nearMiss');
     }
 
+    // Barrels/mines caught in the blast go off too (chain reactions).
+    this.hazards.onExplosion(x, y, radius);
+
     // Supply crates should persist across turns, but they can be destroyed by enemy fire.
     // Apply explosion damage to any active crates inside the blast envelope.
     if (radius > 0 && this.supplyDrops.length > 0) {
@@ -3781,6 +3811,21 @@ private startParatrooperDrop(): void {
   private handleSoldierDeath(fallen: Soldier): void {
     this.updateBattleMusicPhase();
     SoundManager.pulseMusicIntensity(0.84, 1.6);
+
+    // Killed on their own turn before attacking (e.g. stepped on a mine): move on once any
+    // chain reaction has finished. (Shots and falls already end the turn themselves.)
+    if (fallen === this.currentSoldier && !this.hasFired && !this.isTurnEnding) {
+      const turnId = this.turnId;
+      const tryEnd = (): void => {
+        if (turnId !== this.turnId || this.isTurnEnding) return;
+        if (this.hazards.isBusy()) {
+          this.time.delayedCall(250, tryEnd);
+          return;
+        }
+        this.endTurn();
+      };
+      this.time.delayedCall(1300, tryEnd);
+    }
 
     const witness = this.soldiers
       .filter(soldier => soldier.isAlive() && soldier.team === fallen.team && soldier !== fallen)
@@ -5876,7 +5921,12 @@ private startParatrooperDrop(): void {
       excludedSoldier,
       18,
     );
-    if (!hit) return;
+    if (!hit) {
+      // No soldier in the way - did it hit an explosive barrel?
+      const barrelHit = this.hazards.findBarrelHit(lastX, lastY, currentX, currentY);
+      if (barrelHit) onHit(barrelHit.x, barrelHit.y);
+      return;
+    }
 
     const soldier = hit.unit.value;
     const dx = currentX - lastX;
