@@ -75,6 +75,17 @@ In-game (high level):
 - Space after firing: detonate the Kamikaze Goat early
 - N: new game
 
+## Play on a phone
+
+The game is published to **https://mhanssler.github.io/Squad_of_Five/** on every push to `main`
+(the "Deploy to GitHub Pages" workflow). Open it in Chrome on your phone, hold it sideways, and use
+**⋮ → Add to Home screen** to install it. It then launches full-screen like an app.
+
+On touch screens the game shows on-screen buttons (move, jump, aim, hold FIRE, and whichever
+abilities are available right now) instead of keyboard hints. On the battlefield, drag to pan,
+pinch to zoom, and drag from your soldier (or tap a spot) to aim. Add `?touch=1` to the URL to
+try the touch controls on a desktop.
+
 ## Battlefield
 
 - **Wind** changes every turn (gauge under the turn banner). It pushes grenades, rockets, mortars and demo charges, but not bullets.

@@ -20,6 +20,10 @@
 - Tunnel, cover and heal availability is always visible above the movement bar ("READY (2 left, 72 move)" or why not). Blocked presses and the dig preview explain the reason instead of failing silently.
 - Node 22 is pinned in `.nvmrc`, CI runs a typecheck, and `npm test` runs once instead of watching.
 
+#### Added (phones)
+- Touch controls: context-sensitive on-screen buttons that drive the existing keyboard actions, plus drag-to-pan, pinch-to-zoom and drag/tap-to-aim gestures.
+- Installable web app (manifest, icons, fullscreen landscape), bigger HUD text on touch, a rotate-to-landscape hint, and automatic GitHub Pages deploys from `main`.
+
 #### Fixed
 - Standing soldiers' outlines no longer flicker. Pixel rounding snapped the sprite and its two outline layers to whole pixels independently, so they jittered against each other during the idle breathing animation and camera moves.
 - A soldier who falls off the map after firing no longer ends the turn while their shot is still in the air. The shot lands first, so it can't hit or credit the wrong side on the next turn.
