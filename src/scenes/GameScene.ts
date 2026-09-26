@@ -52,6 +52,7 @@ import {
 } from '../systems/AimControls';
 import { BattlefieldSky } from '../systems/BattlefieldSky';
 import { clampCameraScroll, getBattlefieldRevealFrame } from '../systems/CameraFraming';
+import { LASER_CHANNEL_RADIUS, LASER_DAMAGE, LASER_RANGE, traceLaser, type LaserTrace } from '../systems/Laser';
 import {
   FactionId,
   FactionMatchup,
@@ -2795,7 +2796,40 @@ private startParatrooperDrop(): void {
       this.aimPowerText.setVisible(false);
       return;
     }
-    
+
+    // Laser: the beam is instant and straight, so show exactly where it goes, where it burns
+    // through cover, and who it would hit. Power doesn't matter.
+    if (weaponConfig.type === WeaponType.LASER && !this.isHowitzerMode) {
+      if (this.hasFired) {
+        this.aimPowerText.setVisible(false);
+        return;
+      }
+      const { trace, muzzle, victims } = this.traceLaserShot(this.currentSoldier, this.aimAngle);
+      const segments = 60;
+      for (let i = 0; i < segments; i += 2) {
+        const t0 = i / segments;
+        const t1 = (i + 1) / segments;
+        this.aimLine.lineStyle(2, 0xff2d55, 0.75 - t0 * 0.35);
+        this.aimLine.lineBetween(
+          muzzle.x + (trace.endX - muzzle.x) * t0, muzzle.y + (trace.endY - muzzle.y) * t0,
+          muzzle.x + (trace.endX - muzzle.x) * t1, muzzle.y + (trace.endY - muzzle.y) * t1,
+        );
+      }
+      for (const burn of trace.burns) {
+        this.aimLine.lineStyle(5, 0xffb347, 0.55);
+        this.aimLine.lineBetween(burn.x0, burn.y0, burn.x1, burn.y1);
+      }
+      this.aimLine.lineStyle(2, trace.stoppedInTerrain ? 0xffb347 : 0xff2d55, 0.9);
+      this.aimLine.strokeCircle(trace.endX, trace.endY, 5);
+      for (const victim of victims) {
+        const friendly = victim.team === this.currentSoldier.team;
+        this.aimLine.lineStyle(2, friendly ? 0x66ccff : 0xff2d55, 0.95);
+        this.aimLine.strokeCircle(victim.x, victim.y - 4, 16);
+      }
+      this.aimPowerText.setVisible(false);
+      return;
+    }
+
     const muzzle = this.isHowitzerMode ? getMuzzle(startX, startY, this.aimAngle, 34, 34) : getMuzzle(startX, startY, this.aimAngle);
     let flight = createFlight(muzzle.x, muzzle.y, this.aimAngle, this.power, weaponConfig.projectileSpeed);
     const trajectoryPoints: { x: number; y: number }[] = [{ x: flight.x, y: flight.y }];
@@ -3023,6 +3057,12 @@ private startParatrooperDrop(): void {
 
     const doFire = (): void => {
       if (!this.currentSoldier) return;
+
+      // The laser is an instant beam with its own effects, not a projectile.
+      if (this.currentSoldier.getWeaponType() === WeaponType.LASER) {
+        this.fireLaser(this.currentSoldier, shotAngle);
+        return;
+      }
 
       // === FIRING PIZZAZZ ===
       // Muzzle flash
@@ -3711,6 +3751,79 @@ private startParatrooperDrop(): void {
   // A teleport relocates rather than attacks - no "missed!" banter for it.
   private onCrateWeaponFired(def: SpecialWeaponDef): void {
     this.turnActorAttacked = def.behavior !== 'teleport';
+  }
+
+  /** Trace the laser for a shot from `shooter` at `angle` (shared by firing, the aim preview and the AI). */
+  private traceLaserShot(shooter: Soldier, angle: number): { trace: LaserTrace; muzzle: { x: number; y: number }; victims: Soldier[] } {
+    const muzzle = getMuzzle(shooter.x, shooter.y - 10, angle);
+    const others = this.soldiers.filter(s => s !== shooter && s.isAlive());
+    const trace = traceLaser({
+      x: muzzle.x,
+      y: muzzle.y,
+      angle,
+      isSolid: (x, y) => this.terrain.isPointSolid(x, y),
+      targets: others.map(s => ({ x: s.x, y: s.y - 4 })),
+      inBounds: (x, y) => x >= 0 && x <= this.worldWidth && y >= -400 && y <= this.worldHeight,
+    });
+    return { trace, muzzle, victims: trace.hits.map(i => others[i]) };
+  }
+
+  private fireLaser(shooter: Soldier, angle: number): void {
+    const turnId = this.turnId;
+    const { trace, muzzle, victims } = this.traceLaserShot(shooter, angle);
+    this.aimLine.clear();
+    const facing: -1 | 1 = Math.cos(Phaser.Math.DegToRad(angle)) < 0 ? -1 : 1;
+    shooter.playActionAnimation('fire', facing);
+    SoundManager.playLaser();
+
+    // Beam: a wide soft glow, a hot core and a white centre line, fading out together.
+    const beam = this.add.graphics().setDepth(195);
+    beam.lineStyle(12, 0xff2d55, 0.22);
+    beam.lineBetween(muzzle.x, muzzle.y, trace.endX, trace.endY);
+    beam.lineStyle(5, 0xff4d6d, 0.85);
+    beam.lineBetween(muzzle.x, muzzle.y, trace.endX, trace.endY);
+    beam.lineStyle(1.5, 0xffffff, 1);
+    beam.lineBetween(muzzle.x, muzzle.y, trace.endX, trace.endY);
+    // Hold at full strength for a beat so the shot reads, then fade.
+    this.tweens.add({ targets: beam, alpha: 0, delay: 250, duration: 450, ease: 'Quad.easeIn', onComplete: () => beam.destroy() });
+
+    const flare = (x: number, y: number, size: number): void => {
+      const glow = this.add.circle(x, y, size, 0xff6b86, 0.8).setDepth(196);
+      this.tweens.add({ targets: glow, scale: 2.2, alpha: 0, duration: 320, onComplete: () => glow.destroy() });
+    };
+    flare(muzzle.x, muzzle.y, 7);
+    flare(trace.endX, trace.endY, 9);
+
+    // Burn a narrow channel through the cover it passed.
+    for (const burn of trace.burns) {
+      this.terrain.digTunnel(burn.x0, burn.y0, burn.x1, burn.y1, LASER_CHANNEL_RADIUS);
+    }
+    if (trace.stoppedInTerrain) this.terrain.destroyCircle(trace.endX, trace.endY, LASER_CHANNEL_RADIUS + 3);
+
+    for (const victim of victims) {
+      this.damageSoldier(victim, LASER_DAMAGE);
+      flare(victim.x, victim.y - 4, 10);
+    }
+    if (victims.length > 1) {
+      this.showPowerupText(victims[victims.length - 1].x, victims[victims.length - 1].y - 34, `PIERCED x${victims.length}!`, 0xff6b86);
+    }
+
+    // Barrels on the beam's path go up.
+    const barrel = this.hazards.findBarrelHit(muzzle.x, muzzle.y, trace.endX, trace.endY);
+    if (barrel) this.hazards.onExplosion(barrel.x, barrel.y, 10);
+
+    this.cameras.main.shake(120, 0.004);
+
+    // Let the player see the result (and any barrel chain) before the turn moves on.
+    const tryEnd = (): void => {
+      if (turnId !== this.turnId || this.isTurnEnding) return;
+      if (this.hazards.isBusy()) {
+        this.time.delayedCall(250, tryEnd);
+        return;
+      }
+      this.endTurn();
+    };
+    this.time.delayedCall(1300, tryEnd);
   }
 
   private swingSledgehammer(soldier: Soldier): void {
@@ -5744,6 +5857,11 @@ private startParatrooperDrop(): void {
       ) {
         const desiredRange = 320;
         if (dist > desiredRange) desiredMove = dist - desiredRange;
+      } else if (weaponType === WeaponType.LASER) {
+        // Close in when the beam can't reach (out of range or too much hill in the way).
+        const direct = Phaser.Math.RadToDeg(Math.atan2(target.y - 10 - startY, target.x - startX));
+        const reaches = this.traceLaserShot(shooter, direct).victims.includes(target);
+        if (!reaches) desiredMove = Math.max(120, dist - LASER_RANGE * 0.8);
       } else if (isBullet) {
         const blocked = this.isLineBlockedByTerrain(startX, startY, target.x, target.y - 10, 5);
         if (blocked) desiredMove = 120;
@@ -6013,6 +6131,23 @@ private startParatrooperDrop(): void {
     const dy = targetY - startY;
     const directAngle = Phaser.Math.RadToDeg(Math.atan2(dy, dx));
     const dist = Phaser.Math.Distance.Between(startX, startY, targetX, targetY);
+
+    // Laser: instant straight beam. Try angles around the direct line and score what the traced
+    // beam actually hits (it pierces soldiers and burns through thin cover).
+    if (weapon.type === WeaponType.LASER) {
+      let best = { angle: directAngle, power: 100, score: Number.POSITIVE_INFINITY };
+      for (let offset = -12; offset <= 12; offset += 1.5) {
+        const angle = directAngle + offset;
+        const { victims } = this.traceLaserShot(shooter, angle);
+        let score = victims.includes(target) ? -80 - Math.abs(offset) : 1400 + Math.abs(offset) * 10;
+        for (const victim of victims) {
+          if (victim === target) continue;
+          score += victim.team === shooter.team ? AI_FRIENDLY_FIRE_PENALTY : -40;
+        }
+        if (score < best.score) best = { angle, power: 100, score };
+      }
+      return best;
+    }
 
     // Flamethrower: short range, mostly direct.
     if (weapon.type === WeaponType.FLAMER) {

@@ -120,7 +120,10 @@ describe('Menu layout', () => {
     expect(getMenuNeighbourIndex(at('shotgun'), 'down')).toBe(at('flamer'));
     expect(getMenuNeighbourIndex(at('flamer'), 'right')).toBe(at('smg'));
     expect(getMenuNeighbourIndex(at('smg'), 'right')).toBe(at('minigun'));
-    expect(getMenuNeighbourIndex(at('mortar'), 'right')).toBe(at('pistol'));
+    expect(getMenuNeighbourIndex(at('mortar'), 'right')).toBe(at('laser'));
+    expect(getMenuNeighbourIndex(at('sniper'), 'right')).toBe(at('pistol'));
+    expect(getMenuNeighbourIndex(at('pistol'), 'down')).toBe(at('laser'));
+    expect(getMenuNeighbourIndex(at('laser'), 'down')).toBe(at('laser'));
     expect(getMenuNeighbourIndex(at('pistol'), 'left')).toBe(at('sniper'));
     expect(getMenuNeighbourIndex(at('shotgun'), 'up')).toBe(at('shotgun'));
     expect(getMenuNeighbourIndex(at('pistol'), 'right')).toBe(at('pistol'));

@@ -51,6 +51,12 @@ const REACH_BY_RANGE: Record<'close' | 'mid' | 'long' | 'support', StatRating> =
   long: 5,
 };
 
+/** Classes whose reach isn't what their menu column suggests. */
+const REACH_OVERRIDES: Partial<Record<WeaponType, StatRating>> = {
+  // A specialist, but its beam crosses most of a map in a dead-straight line.
+  [WeaponType.LASER]: 4,
+};
+
 function rate(value: number, min: number, max: number): StatRating {
   if (max <= min) return 3;
   const t = (value - min) / (max - min);
@@ -64,7 +70,7 @@ const moves = ALL_TYPES.map(getMovementAllowance);
 export function getClassStats(type: WeaponType, range: 'close' | 'mid' | 'long' | 'support'): ClassStats {
   return {
     power: rate(getFirepower(type), Math.min(...firepowers), Math.max(...firepowers)),
-    reach: REACH_BY_RANGE[range],
+    reach: REACH_OVERRIDES[type] ?? REACH_BY_RANGE[range],
     mobility: rate(getMovementAllowance(type), Math.min(...moves), Math.max(...moves)),
     movePx: getMovementAllowance(type),
     blast: WEAPONS[type].explosionRadius,

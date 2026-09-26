@@ -19,9 +19,9 @@ describe('WeaponTypes', () => {
       expect(WeaponType.DEMO).toBe('demo');
     });
 
-    it('should have exactly 13 weapon types', () => {
+    it('should have exactly 14 weapon types', () => {
       const weaponTypes = Object.values(WeaponType);
-      expect(weaponTypes.length).toBe(13);
+      expect(weaponTypes.length).toBe(14);
     });
   });
 
@@ -105,11 +105,18 @@ describe('WeaponTypes', () => {
       }
     });
 
-    it('sniper should have lowest gravity for flat trajectory', () => {
+    it('sniper should have lowest gravity of the projectile weapons', () => {
       const sniperGravity = WEAPONS[WeaponType.SNIPER].gravity;
       for (const [type, config] of Object.entries(WEAPONS)) {
+        if (type === WeaponType.LASER) continue; // a beam, not a projectile
         expect(sniperGravity).toBeLessThanOrEqual(config.gravity);
       }
+    });
+
+    it('laser is a dead-straight beam', () => {
+      expect(WEAPONS[WeaponType.LASER].gravity).toBe(0);
+      expect(WEAPONS[WeaponType.LASER].drag).toBe(0);
+      expect(WEAPONS[WeaponType.LASER].pelletCount).toBe(1);
     });
 
     it('mortar should have highest gravity for arcing shots', () => {

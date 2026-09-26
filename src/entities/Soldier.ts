@@ -32,6 +32,7 @@ const WEAPON_SPRITES: Record<WeaponType, string> = {
   [WeaponType.CARBINE]: 'worm-rifle',
   [WeaponType.SLUG]: 'worm-shotgun',
   [WeaponType.DEMO]: 'worm-grenade',
+  [WeaponType.LASER]: 'worm-laser',
 };
 
 // Military quips for speech bubbles

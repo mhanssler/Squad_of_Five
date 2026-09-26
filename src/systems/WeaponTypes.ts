@@ -16,6 +16,7 @@ export enum WeaponType {
   CARBINE = 'carbine',
   SLUG = 'slug',
   DEMO = 'demo',
+  LASER = 'laser',
 }
 
 export interface WeaponConfig {
@@ -272,6 +273,26 @@ export const WEAPONS: Record<WeaponType, WeaponConfig> = {
     weight: 2.0,
     mobilityBonus: 0.4,
   },
+
+  // Beam weapon: fired as an instant hitscan trace (see systems/Laser.ts), not a Projectile.
+  // The ballistic fields describe it for shared code (aim preview, stats): dead straight, no drop.
+  [WeaponType.LASER]: {
+    name: 'Laser Rifle',
+    type: WeaponType.LASER,
+    damage: 45,
+    explosionRadius: 6,
+    projectileSpeed: 5000,
+    gravity: 0,
+    drag: 0,
+    bounce: 0,
+    spreadAngle: 0,
+    pelletCount: 1,
+    trailColor: 0xff2d55,
+    projectileSize: 3,
+    description: 'Instant straight beam, pierces soldiers, burns through thin cover',
+    weight: 1.4,
+    mobilityBonus: 0.2,
+  },
 };
 
 // All available weapon types for squad selection
@@ -289,6 +310,7 @@ export const ALL_WEAPON_TYPES: WeaponType[] = [
   WeaponType.CARBINE,
   WeaponType.SLUG,
   WeaponType.DEMO,
+  WeaponType.LASER,
 ];
 
 // Default squad weapons (fallback)

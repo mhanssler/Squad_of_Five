@@ -316,6 +316,42 @@ class SoundManagerClass {
     await this.playGunshot(0.15, 2000, 400, 0.8, 0.005);
   }
 
+  /** Descending sci-fi zap with a bright chirp on top. */
+  public async playLaser(): Promise<void> {
+    if (!await this.ensureContext() || !this.audioContext || !this.masterGain) return;
+    const ctx = this.audioContext;
+    const now = ctx.currentTime;
+
+    const zap = ctx.createOscillator();
+    zap.type = 'sawtooth';
+    zap.frequency.setValueAtTime(1900, now);
+    zap.frequency.exponentialRampToValueAtTime(160, now + 0.32);
+    const zapGain = ctx.createGain();
+    zapGain.gain.setValueAtTime(0.22, now);
+    zapGain.gain.exponentialRampToValueAtTime(0.001, now + 0.34);
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(5000, now);
+    filter.frequency.exponentialRampToValueAtTime(600, now + 0.32);
+    zap.connect(filter);
+    filter.connect(zapGain);
+    zapGain.connect(this.masterGain);
+    zap.start(now);
+    zap.stop(now + 0.36);
+
+    const chirp = ctx.createOscillator();
+    chirp.type = 'square';
+    chirp.frequency.setValueAtTime(3200, now);
+    chirp.frequency.exponentialRampToValueAtTime(1200, now + 0.08);
+    const chirpGain = ctx.createGain();
+    chirpGain.gain.setValueAtTime(0.06, now);
+    chirpGain.gain.exponentialRampToValueAtTime(0.001, now + 0.09);
+    chirp.connect(chirpGain);
+    chirpGain.connect(this.masterGain);
+    chirp.start(now);
+    chirp.stop(now + 0.1);
+  }
+
   public async playPistolShot(): Promise<void> {
     await this.playGunshot(0.1, 2500, 600, 0.6, 0.005);
   }

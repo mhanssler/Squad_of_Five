@@ -84,6 +84,7 @@ export class BootScene extends Phaser.Scene {
   private createPlaceholderAssets(): void {
     // Create unique toy soldier sprites for each weapon class (standing poses)
     this.createRiflemanSprite();
+    this.createLaserSprite();
     this.createGrenadierSprite();
     this.createRocketeerSprite();
     this.createShotgunnerSprite();
@@ -302,6 +303,174 @@ export class BootScene extends Phaser.Scene {
     g.fillRect(cx, 60, 8, 2);
     
     this.bakeSoldierTexture(g, 'worm-rifle');
+    g.destroy();
+  }
+
+  // Laser Trooper - rifleman kit with an experimental beam rifle
+  private createLaserSprite(): void {
+    const g = this.make.graphics({ x: 0, y: 0 });
+    const cx = HALF; // Center X = 32
+    
+    // === HELMET with shading ===
+    // Helmet shadow/outline
+    g.fillStyle(HELMET_DARK, 1);
+    g.beginPath();
+    g.arc(cx, 10, 11, Math.PI, 0, false);
+    g.fillPath();
+    
+    // Main helmet
+    g.fillStyle(HELMET_COLOR, 1);
+    g.beginPath();
+    g.arc(cx, 10, 10, Math.PI, 0, false);
+    g.fillPath();
+    
+    // Helmet highlight (top curve)
+    g.fillStyle(HELMET_HIGHLIGHT, 1);
+    g.beginPath();
+    g.arc(cx - 2, 8, 5, Math.PI, 0, false);
+    g.fillPath();
+    
+    // Helmet rim
+    g.fillStyle(HELMET_DARK, 1);
+    g.fillRect(cx - 11, 10, 22, 3);
+    
+    // === FACE with shading ===
+    g.fillStyle(SKIN_SHADOW, 1);
+    g.fillCircle(cx, 16, 8);
+    g.fillStyle(SKIN_COLOR, 1);
+    g.fillCircle(cx - 1, 15, 7);
+    g.fillStyle(SKIN_HIGHLIGHT, 1);
+    g.fillCircle(cx - 3, 13, 3);
+    
+    // Eyes
+    g.fillStyle(0x000000, 1);
+    g.fillCircle(cx - 3, 15, 1.5);
+    g.fillCircle(cx + 3, 15, 1.5);
+    
+    // === BODY / TORSO with tactical vest ===
+    // Body shadow
+    g.fillStyle(ARMY_GREEN_DARK, 1);
+    g.fillRect(cx - 8, 22, 16, 22);
+    
+    // Main torso
+    g.fillStyle(ARMY_GREEN, 1);
+    g.fillRect(cx - 7, 22, 14, 20);
+    
+    // Highlight edge
+    g.fillStyle(ARMY_GREEN_LIGHT, 1);
+    g.fillRect(cx - 7, 22, 3, 18);
+    
+    // Tactical vest
+    g.fillStyle(VEST_COLOR, 1);
+    g.fillRect(cx - 6, 24, 12, 14);
+    g.fillStyle(VEST_DARK, 1);
+    g.fillRect(cx - 6, 24, 12, 2);
+    g.fillRect(cx + 4, 24, 2, 14);
+    
+    // Vest pouches
+    g.fillStyle(POUCH_COLOR, 1);
+    g.fillRect(cx - 5, 30, 4, 5);
+    g.fillRect(cx + 1, 30, 4, 5);
+    g.lineStyle(1, ARMY_GREEN_DARK, 1);
+    g.strokeRect(cx - 5, 30, 4, 5);
+    g.strokeRect(cx + 1, 30, 4, 5);
+    
+    // === ARMS holding rifle diagonally ===
+    // Left arm (back arm on stock)
+    g.lineStyle(6, ARMY_GREEN_DARK, 1);
+    g.lineBetween(cx - 7, 28, cx - 16, 38);
+    g.lineStyle(5, ARMY_GREEN, 1);
+    g.lineBetween(cx - 7, 28, cx - 16, 38);
+    
+    // Left hand
+    g.fillStyle(SKIN_SHADOW, 1);
+    g.fillCircle(cx - 16, 38, 4);
+    g.fillStyle(SKIN_COLOR, 1);
+    g.fillCircle(cx - 16, 37, 3);
+    
+    // Right arm (forward on barrel)
+    g.lineStyle(6, ARMY_GREEN_DARK, 1);
+    g.lineBetween(cx + 7, 26, cx + 18, 16);
+    g.lineStyle(5, ARMY_GREEN, 1);
+    g.lineBetween(cx + 7, 26, cx + 18, 16);
+    
+    // Right hand
+    g.fillStyle(SKIN_SHADOW, 1);
+    g.fillCircle(cx + 18, 16, 4);
+    g.fillStyle(SKIN_COLOR, 1);
+    g.fillCircle(cx + 18, 15, 3);
+    
+    // === LASER RIFLE (diagonal across body) ===
+    // Power cell stock with a glowing charge window
+    g.lineStyle(7, 0x2b3138, 1);
+    g.lineBetween(cx - 21, 43, cx - 12, 34);
+    g.lineStyle(5, 0x4a535c, 1);
+    g.lineBetween(cx - 21, 43, cx - 12, 34);
+    g.lineStyle(2, 0xff2d55, 1);
+    g.lineBetween(cx - 19, 40, cx - 15, 36);
+
+    // Pale ceramic body
+    g.lineStyle(6, 0x8e979f, 1);
+    g.lineBetween(cx - 12, 34, cx + 18, 14);
+    g.lineStyle(4, 0xd8dde2, 1);
+    g.lineBetween(cx - 12, 34, cx + 18, 14);
+    g.lineStyle(1, 0xffffff, 1);
+    g.lineBetween(cx - 10, 31, cx + 16, 14);
+
+    // Focusing barrel
+    g.lineStyle(3, 0x3a4048, 1);
+    g.lineBetween(cx + 18, 14, cx + 26, 9);
+
+    // Emitter glow
+    g.fillStyle(0xff2d55, 0.35);
+    g.fillCircle(cx + 26, 9, 4);
+    g.fillStyle(0xff6b86, 1);
+    g.fillCircle(cx + 26, 9, 2);
+
+    // Cable to the power pack on the back
+    g.lineStyle(1.5, 0xff2d55, 0.9);
+    g.beginPath();
+    g.moveTo(cx - 18, 41);
+    g.lineTo(cx - 13, 45);
+    g.lineTo(cx - 9, 42);
+    g.strokePath();
+
+    // === LEGS - standing at attention ===
+    // Left leg shadow
+    g.fillStyle(ARMY_GREEN_DARK, 1);
+    g.fillRect(cx - 7, 42, 7, 16);
+    // Left leg
+    g.fillStyle(ARMY_GREEN, 1);
+    g.fillRect(cx - 6, 42, 5, 14);
+    g.fillStyle(ARMY_GREEN_LIGHT, 1);
+    g.fillRect(cx - 6, 42, 2, 12);
+    
+    // Right leg shadow
+    g.fillStyle(ARMY_GREEN_DARK, 1);
+    g.fillRect(cx, 42, 7, 16);
+    // Right leg
+    g.fillStyle(ARMY_GREEN, 1);
+    g.fillRect(cx + 1, 42, 5, 14);
+    
+    // === BOOTS ===
+    // Left boot
+    g.fillStyle(BOOTS_COLOR, 1);
+    g.fillRect(cx - 8, 54, 8, 8);
+    g.fillStyle(BOOTS_HIGHLIGHT, 1);
+    g.fillRect(cx - 7, 55, 3, 2);
+    
+    // Right boot
+    g.fillStyle(BOOTS_COLOR, 1);
+    g.fillRect(cx, 54, 8, 8);
+    g.fillStyle(BOOTS_HIGHLIGHT, 1);
+    g.fillRect(cx + 1, 55, 3, 2);
+    
+    // Boot soles
+    g.fillStyle(0x1a0a08, 1);
+    g.fillRect(cx - 8, 60, 8, 2);
+    g.fillRect(cx, 60, 8, 2);
+    
+    this.bakeSoldierTexture(g, 'worm-laser');
     g.destroy();
   }
 

@@ -8,6 +8,18 @@
 
 ## Changelog
 
+### [0.0.13] - 2026-09-26
+#### Added
+- **Laser Trooper**: a new specialist class with a Laser Rifle. The beam is instant and dead straight (no drop, no wind), pierces every soldier on its line (45 each, friendlies too) and burns a narrow channel through up to 80px of terrain. It also sets off barrels. The aim preview shows exactly where the beam goes, where it burns and who it hits (blue rings for teammates). The AI can aim it and closes in when a hill blocks the beam.
+- **Browser smoke tests** (`npm run test:e2e`, also run in CI): play the real game and check squad-screen clicks, right-drag pan at 1x/1.5x/2x display scale, wheel zoom, A/D pan and mouse aim + fire.
+
+#### Changed
+- Squad screen: units are grouped by role (close / mid / long / specialists), with power, reach and mobility bars worked out from the weapon numbers, one "small maps only" lock over the close-quarters column, a field-intel card, a Red -> Blue -> Deploy step tracker, and squad slots that show portraits and remove a unit when clicked.
+- Everything renders at the display's real resolution, and portraits and faction badges are baked at high resolution, so the menu and briefing are sharp on big and high-DPI screens.
+
+#### Fixed
+- Right-drag panning (and A/D, touch panning) on scaled-up displays: the view jumped when a drag started, part of the map was unreachable, and at 2x on a small map it did not pan sideways at all. The pan clamp ignored that Phaser zooms around the view centre.
+
 ### [0.0.12] - 2026-09-24
 #### Added
 - **Wind**: rolled every turn (calm / breeze / gale) and shown under the turn banner. It pushes grenades, rockets, mortars and demo charges through the shared ballistics step, so shots, the aim preview and the AI all agree. Basic keeps its full, now wind-accurate guide. In Operations a windy preview only shows the first 0.9s of the arc.

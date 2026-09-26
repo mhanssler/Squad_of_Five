@@ -41,6 +41,7 @@ const CLASS_PERKS: Record<string, string> = {
   rocket: 'Flat, fast, huge blast',
   mortar: 'Indirect fire over walls',
   pistol: 'Heals wounded allies',
+  laser: 'Pierces soldiers and cover',
 };
 
 const STAT_COLORS = { power: 0xe0864f, reach: 0x6fb7d6, mobility: 0x8fd49a };
@@ -396,22 +397,22 @@ export class MenuScene extends Phaser.Scene {
     this.closeColumnLock.add(hit);
   }
 
-  /** Detailed read-out of the focused class, filling the space under the Medic. */
+  /** Compact read-out of the focused class, in the free slot of the specialists column. */
   private createIntelPanel(): void {
     const { x, y, w, h } = MENU_INTEL_BOX;
     this.intelPanel = this.add.container(x, y);
 
     const frame = this.add.graphics();
     frame.fillStyle(0x0f1b21, 1);
-    frame.fillRoundedRect(0, 0, w, h, 4);
+    frame.fillRoundedRect(0, 0, w, h, 5);
     frame.lineStyle(1, 0x3d4f57, 1);
-    frame.strokeRoundedRect(0.5, 0.5, w - 1, h - 1, 4);
+    frame.strokeRoundedRect(0.5, 0.5, w - 1, h - 1, 5);
     frame.fillStyle(0x17262d, 1);
-    frame.fillRoundedRect(0, 0, w, 20, { tl: 4, tr: 4, bl: 0, br: 0 });
+    frame.fillRoundedRect(0, 0, w, 16, { tl: 5, tr: 5, bl: 0, br: 0 });
     this.intelPanel.add(frame);
 
-    this.intelPanel.add(this.add.text(8, 5, 'FIELD INTEL', {
-      font: 'bold 9px Arial',
+    this.intelPanel.add(this.add.text(8, 3, 'FIELD INTEL', {
+      font: 'bold 8px Arial',
       color: '#9eb0a8',
     }));
 
@@ -419,36 +420,20 @@ export class MenuScene extends Phaser.Scene {
     accent.setName('intelAccent');
     this.intelPanel.add(accent);
 
-    const portrait = this.add.image(w / 2, 62, 'worm');
-    portrait.setDisplaySize(76, 76);
-    portrait.setName('intelPortrait');
-    this.intelPanel.add(portrait);
-
-    const name = this.add.text(w / 2, 104, '', { font: 'bold 14px Arial', color: '#f5f3eb' }).setOrigin(0.5, 0);
+    const name = this.add.text(10, 21, '', { font: 'bold 12px Arial', color: '#f5f3eb' });
     name.setName('intelName');
-    const weapon = this.add.text(w / 2, 122, '', { font: 'bold 10px Arial', color: '#b9c7cf' }).setOrigin(0.5, 0);
+    const weapon = this.add.text(10, 37, '', { font: 'bold 9px Arial', color: '#b9c7cf' });
     weapon.setName('intelWeapon');
-    const desc = this.add.text(10, 142, '', {
-      font: '10px Arial',
+    const desc = this.add.text(10, 52, '', {
+      font: '9px Arial',
       color: '#95a7ad',
-      wordWrap: { width: w - 20 },
-      maxLines: 3,
-      lineSpacing: 1,
+      wordWrap: { width: w - 18 },
+      maxLines: 2,
     });
     desc.setName('intelDesc');
-    const factLabels = this.add.text(10, 186, 'ROLE\nMOVE\nBLAST', {
-      font: 'bold 9px Arial',
-      color: '#7f918b',
-      lineSpacing: 5,
-    });
-    const facts = this.add.text(52, 186, '', {
-      font: 'bold 9px Arial',
-      color: '#c6d4d9',
-      lineSpacing: 5,
-    });
+    const facts = this.add.text(10, 84, '', { font: 'bold 8px Arial', color: '#c6d4d9' });
     facts.setName('intelFacts');
-    this.intelPanel.add(factLabels);
-    const perk = this.add.text(w / 2, h - 12, '', { font: 'bold 9px Arial', color: '#d8bd68' }).setOrigin(0.5);
+    const perk = this.add.text(10, h - 17, '', { font: 'bold 9px Arial', color: '#d8bd68' });
     perk.setName('intelPerk');
     this.intelPanel.add([name, weapon, desc, facts, perk]);
   }
@@ -457,30 +442,25 @@ export class MenuScene extends Phaser.Scene {
     if (!this.intelPanel || !soldier) return;
     const { w } = MENU_INTEL_BOX;
     const stats = this.classStats.get(soldier.id)!;
-    const role = MENU_ROLE_COLUMNS.find(r => r.range === soldier.range)!;
 
     const accent = this.intelPanel.getByName('intelAccent') as Phaser.GameObjects.Graphics;
     accent.clear();
-    accent.fillStyle(soldier.color, 0.14);
-    accent.fillCircle(w / 2, 62, 40);
-    accent.lineStyle(2, soldier.color, 0.8);
-    accent.strokeCircle(w / 2, 62, 40);
+    accent.fillStyle(soldier.color, 0.9);
+    accent.fillRect(0, 16, 3, MENU_INTEL_BOX.h - 22);
 
-    (this.intelPanel.getByName('intelPortrait') as Phaser.GameObjects.Image)
-      .setTexture(this.getClassTextureKey(soldier.id))
-      .setDisplaySize(76, 76);
-    (this.intelPanel.getByName('intelName') as Phaser.GameObjects.Text).setText(soldier.name.toUpperCase());
+    const name = this.intelPanel.getByName('intelName') as Phaser.GameObjects.Text;
+    name.setFontSize(12);
+    name.setText(soldier.name.toUpperCase());
+    this.fitTextWidth(name, w - 18);
     (this.intelPanel.getByName('intelWeapon') as Phaser.GameObjects.Text).setText(soldier.weapon);
     (this.intelPanel.getByName('intelDesc') as Phaser.GameObjects.Text).setText(soldier.description);
-    (this.intelPanel.getByName('intelFacts') as Phaser.GameObjects.Text).setText([
-      role.label,
-      `${stats.movePx} px per turn`,
-      stats.blast >= 40 ? `${stats.blast} px radius` : 'Direct hit',
-    ].join('\n'));
+    (this.intelPanel.getByName('intelFacts') as Phaser.GameObjects.Text).setText(
+      `MOVE ${stats.movePx}  //  ${stats.blast >= 40 ? `BLAST ${stats.blast}` : 'DIRECT HIT'}`,
+    );
     const perk = this.intelPanel.getByName('intelPerk') as Phaser.GameObjects.Text;
     perk.setFontSize(9);
-    perk.setText(`\u2605 ${(CLASS_PERKS[soldier.id] ?? '').toUpperCase()}`);
-    this.fitTextWidth(perk, w - 12, 7);
+    perk.setText(`★ ${(CLASS_PERKS[soldier.id] ?? '').toUpperCase()}`);
+    this.fitTextWidth(perk, w - 16, 7);
   }
 
   private getClassTextureKey(classId: string): string {

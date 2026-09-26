@@ -51,6 +51,7 @@ export const SOLDIER_CLASSES: SoldierClass[] = [
   { id: 'carbine', name: 'Commando', weapon: 'Carbine', description: 'Mobile burst rifle for flanking', color: 0x99ffcc, range: 'mid' },
   { id: 'slug', name: 'Breacher', weapon: 'Slug Gun', description: 'Close-mid armor cracking shot', color: 0xffddaa, range: 'close' },
   { id: 'demo', name: 'Saboteur', weapon: 'Demo Charge', description: 'Short toss terrain demolition', color: 0xff66aa, range: 'mid' },
+  { id: 'laser', name: 'Laser Trooper', weapon: 'Laser Rifle', description: 'Instant beam: pierces soldiers, burns thin cover', color: 0xff2d55, range: 'support' },
 ];
 
 // The roster is laid out as role columns (Close | Mid x2 | Long | Support), three cards deep.
@@ -69,6 +70,7 @@ export const MENU_CLASS_GRID: { id: string; col: number; row: number }[] = [
   { id: 'rocket', col: 3, row: 1 },
   { id: 'mortar', col: 3, row: 2 },
   { id: 'pistol', col: 4, row: 0 },
+  { id: 'laser', col: 4, row: 1 },
 ];
 
 export const MENU_ORDERED_CLASS_IDS = MENU_CLASS_GRID.map(cell => cell.id);
@@ -77,7 +79,7 @@ export const MENU_ROLE_COLUMNS: { range: SoldierRange; label: string; cols: numb
   { range: 'close', label: 'CLOSE QUARTERS', cols: [0], color: 0xe0864f },
   { range: 'mid', label: 'MID RANGE', cols: [1, 2], color: 0xd8bd68 },
   { range: 'long', label: 'LONG RANGE', cols: [3], color: 0x6fb7d6 },
-  { range: 'support', label: 'SUPPORT', cols: [4], color: 0x8fd49a },
+  { range: 'support', label: 'SPECIALISTS', cols: [4], color: 0x8fd49a },
 ];
 
 export const MENU_CARD = {
@@ -132,13 +134,13 @@ export function getMenuClassGridPosition(index: number): { x: number; y: number;
   };
 }
 
-/** The "field intel" box fills the empty support column under the Medic. */
+/** The "field intel" box fills the free slot at the bottom of the specialists column. */
 export const MENU_INTEL_BOX: MenuLayoutBox = {
   id: 'intel',
   x: MENU_CARD.startX + 4 * (MENU_CARD.w + MENU_CARD.gapX),
-  y: MENU_CARD.startY + MENU_CARD.h + MENU_CARD.gapY,
+  y: MENU_CARD.startY + 2 * (MENU_CARD.h + MENU_CARD.gapY),
   w: MENU_CARD.w,
-  h: MENU_CARD.h * 2 + MENU_CARD.gapY,
+  h: MENU_CARD.h,
   layer: 'classes',
 };
 

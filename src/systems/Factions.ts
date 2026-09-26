@@ -282,6 +282,7 @@ export const FACTION_BASE_SPRITES = [
   'pistol',
   'smg',
   'minigun',
+  'laser',
 ] as const;
 
 export function getFaction(id: FactionId): FactionDefinition {
