@@ -145,7 +145,7 @@ export class BattlefieldSky {
   private spawnTracerBurst(): void {
     const camera = this.scene.cameras.main;
     const direction = Math.random() < 0.5 ? -1 : 1;
-    const startX = camera.scrollX + (direction > 0 ? -55 : camera.width + 55);
+    const startX = camera.worldView.x + (direction > 0 ? -55 : camera.worldView.width + 55);
     const travel = 360 + Math.random() * 420;
     const startY = 115 + Math.random() * Math.min(210, this.worldHeight * 0.35);
     const rise = (Math.random() - 0.5) * 95;
@@ -194,7 +194,7 @@ export class BattlefieldSky {
   private spawnSkyBurst(): void {
     const camera = this.scene.cameras.main;
     const x = Phaser.Math.Clamp(
-      camera.scrollX + camera.width * (0.16 + Math.random() * 0.68),
+      camera.worldView.x + camera.worldView.width * (0.16 + Math.random() * 0.68),
       50,
       this.worldWidth - 50,
     );

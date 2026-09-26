@@ -1,4 +1,5 @@
 import Phaser from 'phaser';
+import { fitScreenCamera } from '../utils/Resolution';
 import { SoundManager } from '../utils/SoundManager';
 import { GameMode, getModeLabel } from '../systems/GameRules';
 import {
@@ -60,6 +61,7 @@ export class MenuScene extends Phaser.Scene {
   }
 
   create(): void {
+    fitScreenCamera(this);
     this.cameras.main.setBackgroundColor('#081015');
     this.createCommandBackground();
 

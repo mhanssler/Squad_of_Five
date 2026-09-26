@@ -1,4 +1,5 @@
 import Phaser from 'phaser';
+import { fitScreenCamera } from '../utils/Resolution';
 import { getTouchButtons, type TouchButton, type TouchContext, type TouchKey } from '../systems/TouchLayout';
 import { isTouchUI } from '../utils/TouchSupport';
 
@@ -36,6 +37,7 @@ export class TouchControlsScene extends Phaser.Scene {
   }
 
   create(): void {
+    fitScreenCamera(this);
     // Always running, but only shows anything while in touch mode (see TouchSupport), so a
     // touchscreen laptop driven by mouse/keyboard keeps the normal desktop layout.
     // Room for two fingers on buttons plus one on the battlefield.

@@ -1,4 +1,5 @@
 import Phaser from 'phaser';
+import { fitScreenCamera } from '../utils/Resolution';
 import { Soldier } from '../entities/Soldier';
 import { Terrain } from '../systems/Terrain';
 import { Team } from '../systems/TurnManager';
@@ -20,6 +21,7 @@ export class VisualTestScene extends Phaser.Scene {
   constructor() { super('VisualTestScene'); }
 
   create(): void {
+    fitScreenCamera(this);
     this.walking = false;
     this.direction = 1;
     this.cameras.main.setBackgroundColor('#263b43');

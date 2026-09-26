@@ -5,6 +5,10 @@ import { GameScene } from './scenes/GameScene';
 import { UIScene } from './scenes/UIScene';
 import { VisualTestScene } from './scenes/VisualTestScene';
 import { TouchControlsScene } from './scenes/TouchControlsScene';
+import { DISPLAY_SCALE, installCrispText, LOGICAL_HEIGHT, LOGICAL_WIDTH } from './utils/Resolution';
+
+// Draw at the display's real resolution (see utils/Resolution) and keep text sharp.
+installCrispText();
 
 const config: Phaser.Types.Core.GameConfig = {
   type: Phaser.AUTO,
@@ -12,8 +16,8 @@ const config: Phaser.Types.Core.GameConfig = {
   scale: {
     mode: Phaser.Scale.FIT,
     autoCenter: Phaser.Scale.CENTER_BOTH,
-    width: 1280,
-    height: 720,
+    width: LOGICAL_WIDTH * DISPLAY_SCALE,
+    height: LOGICAL_HEIGHT * DISPLAY_SCALE,
   },
   backgroundColor: '#0a0a1a', // Dark night sky
   physics: {

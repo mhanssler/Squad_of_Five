@@ -1,4 +1,5 @@
 import Phaser from 'phaser';
+import { fitScreenCamera, LOGICAL_HEIGHT, LOGICAL_WIDTH } from '../utils/Resolution';
 import { createFactionTextures } from '../systems/FactionSprites';
 
 // Sprite size constant - 64x64 for better detail
@@ -34,8 +35,9 @@ export class BootScene extends Phaser.Scene {
 
   preload(): void {
     // Display loading progress
-    const width = this.cameras.main.width;
-    const height = this.cameras.main.height;
+    fitScreenCamera(this);
+    const width = LOGICAL_WIDTH;
+    const height = LOGICAL_HEIGHT;
 
     const progressBar = this.add.graphics();
     const progressBox = this.add.graphics();

@@ -1,4 +1,5 @@
 import Phaser from 'phaser';
+import { fitScreenCamera } from '../utils/Resolution';
 import { Team } from '../systems/TurnManager';
 import { GameMode, RelayControl } from '../systems/GameRules';
 import type { AbilityStatus } from '../systems/Abilities';
@@ -109,6 +110,7 @@ export class UIScene extends Phaser.Scene {
   }
 
   create(): void {
+    fitScreenCamera(this);
     const chrome = this.add.graphics();
     chrome.fillStyle(0x071019, 0.82);
     chrome.fillRect(0, 0, 1280, 96);

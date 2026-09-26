@@ -24,6 +24,7 @@ import { getWindAccel, isWindCalm, rollWind, WIND_PREVIEW_SECONDS } from '../sys
 import { HazardField } from '../entities/Hazards';
 import type { TouchContext } from '../systems/TouchLayout';
 import { isTouchUI } from '../utils/TouchSupport';
+import { DISPLAY_SCALE, LOGICAL_HEIGHT, LOGICAL_WIDTH } from '../utils/Resolution';
 import { BanterCategory, emptyShotStats, pickLine, pickShotBanter, ShotStats } from '../systems/Banter';
 import {
   rollSpecialWeapon,
@@ -86,7 +87,7 @@ const AI_FORMATION_SPACING = 78;
 
 const KEYBOARD_AIM_SPEED_DEG_PER_SEC = 68;
 const FINE_AIM_SPEED_DEG_PER_SEC = 16;
-const LOCAL_AIM_DEADZONE_PX = 28;
+const LOCAL_AIM_DEADZONE_PX = 28 * DISPLAY_SCALE;
 
 // Normalize an angle in degrees to [-180, 180].
 function wrapDeg(angle: number): number {
@@ -302,6 +303,11 @@ private gKey!: Phaser.Input.Keyboard.Key;
   private isGameOver: boolean = false;
 
   // Touch gestures on the battlefield (buttons live in TouchControlsScene).
+  /** Factory for screen-fixed overlays: they live on the HUD scene, laid out in 1280x720 logical space. */
+  private get hud(): Phaser.GameObjects.GameObjectFactory {
+    return this.scene.get('UIScene').add;
+  }
+
   private get touchUI(): boolean {
     return isTouchUI();
   }
@@ -640,17 +646,18 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
       }
       // Handle camera drag
       if (this.isDraggingCamera) {
-        const dx = this.dragStartX - pointer.x;
-        const dy = this.dragStartY - pointer.y;
+        // Pointer deltas are screen pixels; divide by zoom so the map tracks the cursor 1:1.
+        const dx = (this.dragStartX - pointer.x) / this.cameras.main.zoom;
+        const dy = (this.dragStartY - pointer.y) / this.cameras.main.zoom;
         this.cameras.main.scrollX = Phaser.Math.Clamp(
           this.cameraStartX + dx,
           0,
-          this.worldWidth - this.cameras.main.width
+          this.worldWidth - this.cameras.main.width / this.cameras.main.zoom
         );
         this.cameras.main.scrollY = Phaser.Math.Clamp(
           this.cameraStartY + dy,
           0,
-          Math.max(0, this.worldHeight - this.cameras.main.height)
+          Math.max(0, this.worldHeight - this.cameras.main.height / this.cameras.main.zoom)
         );
       }
       
@@ -747,7 +754,7 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
       if (origin) {
         const sx = cam.x + (origin.x - cam.worldView.x) * cam.zoom;
         const sy = cam.y + (origin.y - cam.worldView.y) * cam.zoom;
-        if (Phaser.Math.Distance.Between(pointer.x, pointer.y, sx, sy) < 110) {
+        if (Phaser.Math.Distance.Between(pointer.x, pointer.y, sx, sy) < 110 * DISPLAY_SCALE) {
           this.touchGesture = { ...gesture, mode: 'aim' };
           this.touchAimAt(pointer.x, pointer.y);
         }
@@ -765,7 +772,7 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
       if (touches.length < 2) return;
       const [a, b] = touches;
       const dist = Phaser.Math.Distance.Between(a.x, a.y, b.x, b.y);
-      cam.setZoom(Phaser.Math.Clamp(g.startZoom * dist / g.startDist, 0.3, 2.0));
+      cam.setZoom(Phaser.Math.Clamp(g.startZoom * dist / g.startDist, 0.3 * DISPLAY_SCALE, 2.0 * DISPLAY_SCALE));
       return;
     }
     if (pointer.id !== g.pointerId) return;
@@ -775,7 +782,7 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
       return;
     }
 
-    if (g.mode === 'pending' && Phaser.Math.Distance.Between(pointer.x, pointer.y, g.startX, g.startY) > 12) {
+    if (g.mode === 'pending' && Phaser.Math.Distance.Between(pointer.x, pointer.y, g.startX, g.startY) > 12 * DISPLAY_SCALE) {
       // Keep the camera on a shot that's still in the air.
       if (this.isShotResolving()) return;
       g.mode = 'pan';
@@ -845,7 +852,7 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
 
   private adjustZoom(delta: number): void {
     const currentZoom = this.cameras.main.zoom;
-    const newZoom = Phaser.Math.Clamp(currentZoom + delta, 0.3, 2.0);
+    const newZoom = Phaser.Math.Clamp(currentZoom + delta * DISPLAY_SCALE, 0.3 * DISPLAY_SCALE, 2.0 * DISPLAY_SCALE);
     
     // Smooth zoom transition
     this.tweens.add({
@@ -1015,7 +1022,7 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
   private showIntroSkipHint(): void {
     if (this.introHintText) this.introHintText.destroy();
 
-    this.introHintText = this.add.text(this.cameras.main.width - 24, this.cameras.main.height - 88, 'SPACE / CLICK  SKIP INTRO', {
+    this.introHintText = this.hud.text(LOGICAL_WIDTH - 24, LOGICAL_HEIGHT - 88, 'SPACE / CLICK  SKIP INTRO', {
       font: 'bold 12px Arial',
       color: '#ffffff',
       stroke: '#000000',
@@ -1203,14 +1210,14 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     const quote = quotes[Math.floor(Math.random() * quotes.length)];
     
     // Create dark overlay behind quote for better visibility
-    const cx = this.cameras.main.width / 2;
-    const overlay = this.add.rectangle(cx, 120, 1000, 180, 0x000000, 0.7);
+    const cx = LOGICAL_WIDTH / 2;
+    const overlay = this.hud.rectangle(cx, 120, 1000, 180, 0x000000, 0.7);
     overlay.setDepth(499);
     overlay.setScrollFactor(0); // Fixed to camera
     overlay.setAlpha(0);
     
     // Create dramatic text in center of screen (fixed to camera)
-    const quoteText = this.add.text(cx, 90, `"${quote.text}"`, {
+    const quoteText = this.hud.text(cx, 90, `"${quote.text}"`, {
       font: 'bold 28px Georgia',
       color: '#ffffff',
       stroke: '#000000',
@@ -1223,7 +1230,7 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     quoteText.setScrollFactor(0); // Fixed to camera
     quoteText.setAlpha(0);
     
-    const authorText = this.add.text(cx, 170, quote.author, {
+    const authorText = this.hud.text(cx, 170, quote.author, {
       font: 'italic 20px Georgia',
       color: '#ffdd88',
       stroke: '#000000',
@@ -2075,7 +2082,7 @@ private startParatrooperDrop(): void {
     
     this.tweens.add({
       targets: this.cameras.main,
-      zoom: 1,
+      zoom: DISPLAY_SCALE,
       duration: 500,
       ease: 'Power2',
     });
@@ -2266,7 +2273,7 @@ private startParatrooperDrop(): void {
       // Zoom in and pan to current soldier (a little closer on phones so units and speech stay legible)
       this.tweens.add({
         targets: this.cameras.main,
-        zoom: this.touchUI ? 1.35 : 1,
+        zoom: (this.touchUI ? 1.35 : 1) * DISPLAY_SCALE,
         duration: 800,
         ease: 'Power2',
       });
@@ -2446,7 +2453,7 @@ private startParatrooperDrop(): void {
           this.cameras.main.stopFollow();
           this.isPanningCamera = true;
         }
-        this.cameras.main.scrollX = Math.min(this.worldWidth - this.cameras.main.width, this.cameras.main.scrollX + panSpeed);
+        this.cameras.main.scrollX = Math.min(this.worldWidth - this.cameras.main.width / this.cameras.main.zoom, this.cameras.main.scrollX + panSpeed);
       } else if (this.isPanningCamera && !this.aKey.isDown && !this.dKey.isDown) {
         // Camera stays where user panned it - no auto-return to soldier
         this.isPanningCamera = false;
@@ -2669,7 +2676,7 @@ private startParatrooperDrop(): void {
       this.cameras.main.scrollX = Math.max(0, this.cameras.main.scrollX - panSpeed);
     }
     if (this.eKey.isDown || this.dKey.isDown) {
-      this.cameras.main.scrollX = Math.min(this.worldWidth - this.cameras.main.width, this.cameras.main.scrollX + panSpeed);
+      this.cameras.main.scrollX = Math.min(this.worldWidth - this.cameras.main.width / this.cameras.main.zoom, this.cameras.main.scrollX + panSpeed);
     }
     
     // Tab or arrow keys to cycle through characters
@@ -3188,7 +3195,7 @@ private startParatrooperDrop(): void {
     this.howitzerBarrel = barrel;
 
     if (this.howitzerHelpText) this.howitzerHelpText.destroy();
-    this.howitzerHelpText = this.add.text(this.cameras.main.width / 2, 52, 'HOWITZER: Aim + fire (SPACE/LMB). C/Esc cancel', {
+    this.howitzerHelpText = this.hud.text(LOGICAL_WIDTH / 2, 52, 'HOWITZER: Aim + fire (SPACE/LMB). C/Esc cancel', {
       font: 'bold 14px Arial',
       color: '#ffffff',
       stroke: '#000000',
@@ -3254,7 +3261,7 @@ private startParatrooperDrop(): void {
     this.airstrikeMarker.setDepth(220);
 
     if (this.airstrikeHelpText) this.airstrikeHelpText.destroy();
-    this.airstrikeHelpText = this.add.text(this.cameras.main.width / 2, 52, 'AIRSTRIKE: Click to designate target. X/Esc cancel', {
+    this.airstrikeHelpText = this.hud.text(LOGICAL_WIDTH / 2, 52, 'AIRSTRIKE: Click to designate target. X/Esc cancel', {
       font: 'bold 14px Arial',
       color: '#ffffff',
       stroke: '#000000',
@@ -3507,7 +3514,7 @@ private startParatrooperDrop(): void {
     const angle = Phaser.Math.DegToRad(this.aimAngle);
     const range = tool === 'grapple' || tool === 'jetpack' ? 350 : 92;
     this.specialTarget = { x: this.currentSoldier.x + Math.cos(angle) * range, y: this.currentSoldier.y + Math.sin(angle) * range };
-    this.specialLabel = this.add.text(this.scale.width / 2, this.scale.height - 108, '', {
+    this.specialLabel = this.hud.text(LOGICAL_WIDTH / 2, LOGICAL_HEIGHT - 108, '', {
       font: 'bold 15px Arial', color: '#aee5dc', stroke: '#142125', strokeThickness: 4,
     }).setOrigin(0.5).setScrollFactor(0).setDepth(350);
     this.drawSpecialPreview();
@@ -4144,7 +4151,7 @@ private startParatrooperDrop(): void {
     if (speed > 1000) {
       this.tweens.add({
         targets: this.cameras.main,
-        zoom: 0.9,
+        zoom: 0.9 * DISPLAY_SCALE,
         duration: 200,
         yoyo: true,
         hold: 500,
@@ -4608,8 +4615,7 @@ private startParatrooperDrop(): void {
   }
 
   private showWorldBanner(text: string, subtitle: string = 'Contest it to swing the fight'): void {
-    const cam = this.cameras.main;
-    const banner = this.add.text(cam.width / 2, 150, text, {
+    const banner = this.hud.text(LOGICAL_WIDTH / 2, 150, text, {
       font: 'bold 24px Arial',
       color: '#ffffff',
       stroke: '#000000',
@@ -4619,7 +4625,7 @@ private startParatrooperDrop(): void {
     banner.setScrollFactor(0);
     banner.setDepth(1000);
 
-    const sub = this.add.text(cam.width / 2, 182, subtitle, {
+    const sub = this.hud.text(LOGICAL_WIDTH / 2, 182, subtitle, {
       font: 'bold 14px Arial',
       color: '#d9e6ff',
       stroke: '#000000',
