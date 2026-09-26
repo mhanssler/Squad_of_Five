@@ -28,6 +28,7 @@ export class TouchControlsScene extends Phaser.Scene {
   private views = new Map<string, ButtonView>();
   private layoutKey = '';
   private heldKeys = new Map<TouchKey, number>(); // key -> number of buttons holding it
+  private fullscreenButton: Phaser.GameObjects.Container | null = null;
 
   constructor() {
     // Starts with the game and stays on top of every other scene.
@@ -35,10 +36,8 @@ export class TouchControlsScene extends Phaser.Scene {
   }
 
   create(): void {
-    if (!isTouchUI()) {
-      this.scene.sleep();
-      return;
-    }
+    // Always running, but only shows anything while in touch mode (see TouchSupport), so a
+    // touchscreen laptop driven by mouse/keyboard keeps the normal desktop layout.
     // Room for two fingers on buttons plus one on the battlefield.
     this.input.addPointer(3);
     this.createFullscreenButton();
@@ -54,7 +53,13 @@ export class TouchControlsScene extends Phaser.Scene {
       ? gameScene.getTouchContext()
       : { phase: 'menu', isOperations: false, isMedic: false, hasCrateWeapon: false, crateWeaponArmed: false, airstrikeCharges: 0, artilleryCharges: 0, canDetonate: false };
 
-    const defs = getTouchButtons(ctx);
+    const touch = isTouchUI();
+    if (this.fullscreenButton && this.fullscreenButton.visible !== touch) {
+      this.fullscreenButton.setVisible(touch);
+      const bg = this.fullscreenButton.getAt(0) as Phaser.GameObjects.Rectangle;
+      if (bg.input) bg.input.enabled = touch;
+    }
+    const defs = touch ? getTouchButtons(ctx) : [];
     const key = defs.map(d => `${d.id}:${d.label}`).join('|');
     if (key !== this.layoutKey) {
       this.layoutKey = key;
@@ -167,11 +172,13 @@ export class TouchControlsScene extends Phaser.Scene {
 
   private createFullscreenButton(): void {
     const button = this.add.container(30, 84).setDepth(1000);
+    this.fullscreenButton = button;
     const bg = this.add.rectangle(0, 0, 40, 40, 0x141c22, 0.6).setStrokeStyle(2, 0x6f8793, 0.8);
     const icon = this.add.text(0, 0, '⛶', { font: 'bold 24px Arial', color: '#dfe8ec' }).setOrigin(0.5);
     button.add([bg, icon]);
     bg.setInteractive();
     bg.on('pointerup', () => {
+      if (!button.visible) return;
       if (this.scale.isFullscreen) {
         this.scale.stopFullscreen();
         return;

@@ -25,6 +25,8 @@
 - Installable web app (manifest, icons, fullscreen landscape), bigger HUD text on touch, a rotate-to-landscape hint, and automatic GitHub Pages deploys from `main`.
 
 #### Fixed
+- Soldiers standing on very steep ground (about 60-70 degrees, e.g. tunnel edges) no longer flicker. The terrain sweep alternated "grounded" and "falling" every frame there, toggling gravity and the ground shadow. A body that can't sink any further now counts as standing.
+- Touchscreen PCs no longer get the phone buttons by default. Touch mode follows the input in use: touching the screen shows them, and a key press or mouse click hides them.
 - Standing soldiers' outlines no longer flicker. Pixel rounding snapped the sprite and its two outline layers to whole pixels independently, so they jittered against each other during the idle breathing animation and camera moves.
 - A soldier who falls off the map after firing no longer ends the turn while their shot is still in the air. The shot lands first, so it can't hit or credit the wrong side on the next turn.
 

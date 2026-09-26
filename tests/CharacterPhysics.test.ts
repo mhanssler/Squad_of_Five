@@ -54,4 +54,33 @@ describe('production character sweep', () => {
     expect(result.y).toBe(84);
     expect(result.grounded).toBe(false);
   });
+
+  it('stands still on steep slopes without flickering between grounded and falling', () => {
+    // Mirrors the game loop: Arcade applies gravity only while airborne, then the terrain sweep
+    // resolves from the previous position. 60-70 degree slopes used to flip every frame.
+    for (const deg of [20, 35, 45, 55, 60, 62, 65, 68, 70, 75, 80]) {
+      const tan = Math.tan(deg * Math.PI / 180);
+      const groundY = (x: number) => 300 - (x - 200) * tan;
+      const solid = (x: number, y: number) => y >= groundY(x) || y >= 715;
+      let pos = { x: 200, y: groundY(200) - 30, grounded: false };
+      let vy = 0;
+      let flips = 0;
+      let last = false;
+      const ys: number[] = [];
+      for (let frame = 0; frame < 120; frame++) {
+        vy = pos.grounded ? 0 : vy + 500 / 60;
+        const r = moveCharacter(pos, pos.x, pos.y + vy / 60, solid, 720, vy < 0);
+        if (r.blockedY || r.grounded) vy = 0;
+        if (frame > 30) {
+          if (r.grounded !== last) flips++;
+          ys.push(r.y);
+        }
+        last = r.grounded;
+        pos = { x: r.x, y: r.y, grounded: r.grounded };
+      }
+      expect(flips, `${deg} degree slope`).toBe(0);
+      expect(pos.grounded, `${deg} degree slope`).toBe(true);
+      expect(Math.max(...ys) - Math.min(...ys), `${deg} degree slope`).toBeLessThan(0.01);
+    }
+  });
 });

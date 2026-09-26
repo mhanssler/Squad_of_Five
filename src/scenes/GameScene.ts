@@ -302,7 +302,9 @@ private gKey!: Phaser.Input.Keyboard.Key;
   private isGameOver: boolean = false;
 
   // Touch gestures on the battlefield (buttons live in TouchControlsScene).
-  private readonly touchUI = isTouchUI();
+  private get touchUI(): boolean {
+    return isTouchUI();
+  }
   private touchIds = new Set<number>();
   private touchGesture: {
     mode: 'pending' | 'pan' | 'aim' | 'pinch';
@@ -573,7 +575,7 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
   private setupMouseControls(): void {
     // Right-click or middle-click drag to pan camera
     this.input.on('pointerdown', (pointer: Phaser.Input.Pointer) => {
-      if (this.touchUI && pointer.wasTouch) { this.onTouchDown(pointer); return; }
+      if (pointer.wasTouch) { this.onTouchDown(pointer); return; }
       if (this.specialTool) {
         if (pointer.rightButtonDown()) this.cancelSpecial();
         else if (pointer.leftButtonDown()) this.confirmSpecial();
@@ -630,7 +632,7 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     });
     
     this.input.on('pointermove', (pointer: Phaser.Input.Pointer) => {
-      if (this.touchUI && pointer.wasTouch) { this.onTouchMove(pointer); return; }
+      if (pointer.wasTouch) { this.onTouchMove(pointer); return; }
       if (this.specialTool && this.currentSoldier) {
         this.specialTarget = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
         this.aimAngle = Phaser.Math.RadToDeg(Math.atan2(this.specialTarget.y - this.currentSoldier.y, this.specialTarget.x - this.currentSoldier.x));
@@ -660,7 +662,7 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     });
     
     this.input.on('pointerup', (pointer: Phaser.Input.Pointer) => {
-      if (this.touchUI && pointer.wasTouch) { this.onTouchUp(pointer); return; }
+      if (pointer.wasTouch) { this.onTouchUp(pointer); return; }
       // Stop camera drag - camera stays where user left it
       if (!pointer.rightButtonDown() && !pointer.middleButtonDown()) {
         if (this.isDraggingCamera) {

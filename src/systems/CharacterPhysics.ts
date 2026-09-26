@@ -53,5 +53,9 @@ export function moveCharacter(previous: CharacterPosition, targetX: number, targ
       if (!rising && !grounded && solid(x, y + 17)) grounded = true;
     }
   }
+  // Resting against a steep slope (roughly 60-70 degrees) the floor probe finds nothing under the
+  // centre of the feet, but the body can't sink any further either. Without this the soldier
+  // alternated "grounded" / "falling" every frame, toggling gravity and the ground shadow (flicker).
+  if (!rising && !grounded && !bodyClear(x, y + 1, solid)) grounded = true;
   return { x, y, grounded, blockedX, blockedY };
 }
