@@ -1,5 +1,5 @@
 import Phaser from 'phaser';
-import { fitScreenCamera } from '../utils/Resolution';
+import { fitScreenCamera, hiResTextureKey } from '../utils/Resolution';
 import { Team } from '../systems/TurnManager';
 import { GameMode, RelayControl } from '../systems/GameRules';
 import type { AbilityStatus } from '../systems/Abilities';
@@ -364,21 +364,21 @@ export class UIScene extends Phaser.Scene {
       color: '#78aaff',
     }).setOrigin(0.5, 0);
 
-    const redEmblem = this.add.image(400, 257, `faction-emblem-${redFaction.id}`);
+    const redEmblem = this.add.image(400, 257, hiResTextureKey(this, `faction-emblem-${redFaction.id}`));
     redEmblem.setDisplaySize(42, 42);
-    const blueEmblem = this.add.image(880, 257, `faction-emblem-${blueFaction.id}`);
+    const blueEmblem = this.add.image(880, 257, hiResTextureKey(this, `faction-emblem-${blueFaction.id}`));
     blueEmblem.setDisplaySize(42, 42);
 
     const redPortrait = this.add.image(
       400,
       323,
-      getFactionSpriteTextureKey(redFaction.id, 'rifle'),
+      hiResTextureKey(this, getFactionSpriteTextureKey(redFaction.id, 'rifle')),
     );
     redPortrait.setDisplaySize(104, 104);
     const bluePortrait = this.add.image(
       880,
       323,
-      getFactionSpriteTextureKey(blueFaction.id, 'rifle'),
+      hiResTextureKey(this, getFactionSpriteTextureKey(blueFaction.id, 'rifle')),
     );
     bluePortrait.setDisplaySize(104, 104);
     bluePortrait.setFlipX(true);
@@ -682,7 +682,7 @@ export class UIScene extends Phaser.Scene {
     const portraitFrame = this.add.rectangle(panelWidth - 27, 52, 46, 46, 0x0a1115, 0.9);
     portraitFrame.setStrokeStyle(1, faction.palette.accent, 0.9);
     this.tacReadoutPanel.add(portraitFrame);
-    const portrait = this.add.image(panelWidth - 27, 53, info.soldier.portraitTextureKey);
+    const portrait = this.add.image(panelWidth - 27, 53, hiResTextureKey(this, info.soldier.portraitTextureKey));
     portrait.setDisplaySize(42, 42);
     this.tacReadoutPanel.add(portrait);
     

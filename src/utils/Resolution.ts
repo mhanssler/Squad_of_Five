@@ -35,6 +35,17 @@ export const DISPLAY_SCALE = typeof window === 'undefined' ? 1 : computeDisplayS
  */
 export const TEXT_RESOLUTION = Math.min(4, Math.ceil(DISPLAY_SCALE * 1.5 * 2) / 2);
 
+/**
+ * Soldier portraits and faction badges are shown at up to ~1.6x their 64px sprite size in logical
+ * pixels. They are baked at this multiple (as `<key>@hi` textures) so they stay sharp on the display.
+ */
+export const PORTRAIT_SCALE = Math.min(6, Math.max(2, Math.ceil(DISPLAY_SCALE * 1.6)));
+
+/** The high-resolution `@hi` version of a texture when one was baked, else the texture itself. */
+export function hiResTextureKey(scene: Phaser.Scene, key: string): string {
+  return scene.textures.exists(`${key}@hi`) ? `${key}@hi` : key;
+}
+
 /** For screen-space scenes (menus, HUD, touch buttons): show the 1280x720 logical layout at full resolution. */
 export function fitScreenCamera(scene: Phaser.Scene): void {
   const cam = scene.cameras.main;

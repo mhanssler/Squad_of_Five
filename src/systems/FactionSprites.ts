@@ -1,4 +1,5 @@
 import Phaser from 'phaser';
+import { PORTRAIT_SCALE } from '../utils/Resolution';
 import {
   FACTIONS,
   FACTION_BASE_SPRITES,
@@ -60,8 +61,10 @@ function recolorSprite(
   context: CanvasRenderingContext2D,
   faction: FactionDefinition,
   variantIndex: number,
+  scale: number = 1,
 ): void {
-  const image = context.getImageData(0, 0, SPRITE_SIZE, SPRITE_SIZE);
+  const size = SPRITE_SIZE * scale;
+  const image = context.getImageData(0, 0, size, size);
   const skin = faction.skinPalettes[variantIndex % faction.skinPalettes.length];
   const palette = faction.palette;
   const replacements = new Map<number, number>([
@@ -79,10 +82,13 @@ function recolorSprite(
     [0x4a5a4a, palette.pouch],
   ]);
 
-  for (let y = 0; y < SPRITE_SIZE; y++) {
-    for (let x = 0; x < SPRITE_SIZE; x++) {
-      const offset = (y * SPRITE_SIZE + x) * 4;
+  for (let py = 0; py < size; py++) {
+    for (let px = 0; px < size; px++) {
+      const offset = (py * size + px) * 4;
       if (image.data[offset + 3] === 0) continue;
+      // Zone checks below are in 64px sprite coordinates.
+      const x = px / scale;
+      const y = py / scale;
 
       const source = readRgb(image.data, offset);
       const inHeadgearZone = y <= 14 && x >= 18 && x <= 46;
@@ -541,6 +547,37 @@ function drawEmblem(context: CanvasRenderingContext2D, factionId: FactionId): vo
   }
 }
 
+/**
+ * High-resolution `<key>@hi` copy of a faction soldier for large portraits (briefing, TAC readout),
+ * built the same way as the 64px sprite but from the high-resolution base drawing.
+ */
+function createPortraitTexture(
+  scene: Phaser.Scene,
+  faction: FactionDefinition,
+  weaponId: string,
+  variantIndex: number,
+  textureKey: string,
+): void {
+  const key = `${textureKey}@hi`;
+  const sourceKey = `worm-${weaponId}@hi`;
+  if (scene.textures.exists(key) || !scene.textures.exists(sourceKey)) return;
+  const size = SPRITE_SIZE * PORTRAIT_SCALE;
+  const source = scene.textures.get(sourceKey).getSourceImage() as CanvasImageSource;
+  const texture = scene.textures.createCanvas(key, size, size);
+  if (!texture) return;
+  const context = texture.context;
+  context.imageSmoothingEnabled = true;
+  context.clearRect(0, 0, size, size);
+  context.drawImage(source, 0, 0, size, size);
+  recolorSprite(context, faction, variantIndex, PORTRAIT_SCALE);
+  context.save();
+  context.scale(PORTRAIT_SCALE, PORTRAIT_SCALE);
+  drawFactionDetails(context, faction);
+  drawHeadgear(context, faction);
+  context.restore();
+  texture.refresh();
+}
+
 export function createFactionTextures(scene: Phaser.Scene): void {
   FACTIONS.forEach(faction => {
     FACTION_BASE_SPRITES.forEach((weaponId, variantIndex) => {
@@ -559,6 +596,7 @@ export function createFactionTextures(scene: Phaser.Scene): void {
         drawHeadgear(context, faction);
         texture.refresh();
       }
+      createPortraitTexture(scene, faction, weaponId, variantIndex, textureKey);
 
       for (let frame = 0; frame < 8; frame++) {
         createWalkTexture(scene, faction, weaponId, frame);
@@ -571,6 +609,16 @@ export function createFactionTextures(scene: Phaser.Scene): void {
       if (!emblem) return;
       drawEmblem(emblem.context, faction.id);
       emblem.refresh();
+    }
+    const emblemHiKey = `${emblemKey}@hi`;
+    if (!scene.textures.exists(emblemHiKey)) {
+      const emblemHi = scene.textures.createCanvas(emblemHiKey, EMBLEM_SIZE * PORTRAIT_SCALE, EMBLEM_SIZE * PORTRAIT_SCALE);
+      if (!emblemHi) return;
+      emblemHi.context.save();
+      emblemHi.context.scale(PORTRAIT_SCALE, PORTRAIT_SCALE);
+      drawEmblem(emblemHi.context, faction.id);
+      emblemHi.context.restore();
+      emblemHi.refresh();
     }
   });
 }

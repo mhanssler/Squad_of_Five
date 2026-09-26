@@ -51,7 +51,7 @@ import {
   resolveKeyboardChargeInput,
 } from '../systems/AimControls';
 import { BattlefieldSky } from '../systems/BattlefieldSky';
-import { getBattlefieldRevealFrame } from '../systems/CameraFraming';
+import { clampCameraScroll, getBattlefieldRevealFrame } from '../systems/CameraFraming';
 import {
   FactionId,
   FactionMatchup,
@@ -578,6 +578,16 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
     });
   }
   
+  /**
+   * Move the camera by hand (right-drag, A/D, touch pan), kept inside the map. Zoom-aware: see
+   * clampCameraScroll for why a plain 0..(world - view) clamp breaks on scaled-up displays.
+   */
+  private setCameraScroll(x: number, y: number = this.cameras.main.scrollY): void {
+    const cam = this.cameras.main;
+    cam.scrollX = clampCameraScroll(x, cam.width, cam.zoom, this.worldWidth);
+    cam.scrollY = clampCameraScroll(y, cam.height, cam.zoom, this.worldHeight);
+  }
+
   private setupMouseControls(): void {
     // Right-click or middle-click drag to pan camera
     this.input.on('pointerdown', (pointer: Phaser.Input.Pointer) => {
@@ -644,21 +654,17 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
         this.aimAngle = Phaser.Math.RadToDeg(Math.atan2(this.specialTarget.y - this.currentSoldier.y, this.specialTarget.x - this.currentSoldier.x));
         return;
       }
+      // A release can be swallowed (e.g. a HUD panel popped up under the cursor mid-drag);
+      // never leave the camera stuck to the mouse once no pan button is held.
+      if (this.isDraggingCamera && !pointer.rightButtonDown() && !pointer.middleButtonDown()) {
+        this.isDraggingCamera = false;
+      }
       // Handle camera drag
       if (this.isDraggingCamera) {
         // Pointer deltas are screen pixels; divide by zoom so the map tracks the cursor 1:1.
         const dx = (this.dragStartX - pointer.x) / this.cameras.main.zoom;
         const dy = (this.dragStartY - pointer.y) / this.cameras.main.zoom;
-        this.cameras.main.scrollX = Phaser.Math.Clamp(
-          this.cameraStartX + dx,
-          0,
-          this.worldWidth - this.cameras.main.width / this.cameras.main.zoom
-        );
-        this.cameras.main.scrollY = Phaser.Math.Clamp(
-          this.cameraStartY + dy,
-          0,
-          Math.max(0, this.worldHeight - this.cameras.main.height / this.cameras.main.zoom)
-        );
+        this.setCameraScroll(this.cameraStartX + dx, this.cameraStartY + dy);
       }
       
       // Mouse aiming uses the pointer direction around the active soldier.
@@ -793,8 +799,7 @@ this.gKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.G);
       cam.stopFollow();
     }
     if (g.mode === 'pan') {
-      cam.scrollX = Phaser.Math.Clamp(g.camX + (g.startX - pointer.x) / cam.zoom, 0, Math.max(0, this.worldWidth - cam.width / cam.zoom));
-      cam.scrollY = Phaser.Math.Clamp(g.camY + (g.startY - pointer.y) / cam.zoom, -cam.height, Math.max(0, this.worldHeight - cam.height / cam.zoom));
+      this.setCameraScroll(g.camX + (g.startX - pointer.x) / cam.zoom, g.camY + (g.startY - pointer.y) / cam.zoom);
     }
   }
 
@@ -2431,13 +2436,13 @@ private startParatrooperDrop(): void {
           this.cameras.main.stopFollow();
           this.isPanningCamera = true;
         }
-        this.cameras.main.scrollX = Math.max(0, this.cameras.main.scrollX - panSpeed);
+        this.setCameraScroll(this.cameras.main.scrollX - panSpeed * DISPLAY_SCALE / this.cameras.main.zoom);
       } else if (this.dKey.isDown) {
         if (!this.isPanningCamera) {
           this.cameras.main.stopFollow();
           this.isPanningCamera = true;
         }
-        this.cameras.main.scrollX = Math.min(this.worldWidth - this.cameras.main.width / this.cameras.main.zoom, this.cameras.main.scrollX + panSpeed);
+        this.setCameraScroll(this.cameras.main.scrollX + panSpeed * DISPLAY_SCALE / this.cameras.main.zoom);
       } else if (this.isPanningCamera && !this.aKey.isDown && !this.dKey.isDown) {
         // Camera stays where user panned it - no auto-return to soldier
         this.isPanningCamera = false;
@@ -2657,10 +2662,10 @@ private startParatrooperDrop(): void {
     // Q/E or A/D to pan camera across battlefield for scouting
     const panSpeed = 15;
     if (this.qKey.isDown || this.aKey.isDown) {
-      this.cameras.main.scrollX = Math.max(0, this.cameras.main.scrollX - panSpeed);
+      this.setCameraScroll(this.cameras.main.scrollX - panSpeed * DISPLAY_SCALE / this.cameras.main.zoom);
     }
     if (this.eKey.isDown || this.dKey.isDown) {
-      this.cameras.main.scrollX = Math.min(this.worldWidth - this.cameras.main.width / this.cameras.main.zoom, this.cameras.main.scrollX + panSpeed);
+      this.setCameraScroll(this.cameras.main.scrollX + panSpeed * DISPLAY_SCALE / this.cameras.main.zoom);
     }
     
     // Tab or arrow keys to cycle through characters

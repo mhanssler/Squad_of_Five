@@ -1,12 +1,10 @@
 import Phaser from 'phaser';
-import { DISPLAY_SCALE, fitScreenCamera, LOGICAL_HEIGHT, LOGICAL_WIDTH } from '../utils/Resolution';
+import { PORTRAIT_SCALE, fitScreenCamera, LOGICAL_HEIGHT, LOGICAL_WIDTH } from '../utils/Resolution';
 import { createFactionTextures } from '../systems/FactionSprites';
 
 // Sprite size constant - 64x64 for better detail
 const SPRITE_SIZE = 64;
 const HALF = SPRITE_SIZE / 2;
-// Portraits are drawn at up to ~1.4x sprite size in logical pixels; bake them sharp for the display.
-const PORTRAIT_SCALE = Math.min(6, Math.max(2, Math.ceil(DISPLAY_SCALE * 1.5)));
 
 // Color constants for better contrast
 const ARMY_GREEN = 0x2d5016; // Dark army green for body

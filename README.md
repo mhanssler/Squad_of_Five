@@ -43,15 +43,26 @@ npm run preview
 
 ## Tests
 
+Unit tests (fast, run these all the time):
+
 ```powershell
 npm test
+```
+
+Browser smoke tests: these play the real game in Chromium and check the core controls still work
+(squad screen clicks, right-drag pan, mouse-wheel zoom, A/D pan, mouse aim and fire) at several
+display scales. They take about 10 minutes and also run in CI on every push.
+
+```powershell
+npx playwright install chromium   # first time only
+npm run test:e2e
 ```
 
 ## Controls
 
 Menu:
 
-- Left/Right: navigate soldiers
+- Arrow keys: move around the roster grid
 - Space: select/deselect
 - R: random squad
 - Enter: confirm team / start battle
