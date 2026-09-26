@@ -3,6 +3,12 @@ import {
   getMapPixelWidth,
   getMapPreviewRect,
   getMenuClassCardBoxes,
+  getMenuNeighbourIndex,
+  getMenuRoleHeaderRect,
+  MENU_CLASS_GRID,
+  MENU_INTEL_BOX,
+  MENU_ORDERED_CLASS_IDS,
+  MENU_ROLE_COLUMNS,
   MENU_LAYOUT_BOXES,
   MENU_OPTION_PERMUTATIONS,
   SOLDIER_CLASSES,
@@ -82,5 +88,48 @@ describe('Menu layout', () => {
       expect(rect.x + rect.w).toBeLessThanOrEqual(356);
       expect(rect.y + rect.h).toBeLessThanOrEqual(476);
     }
+  });
+
+  it('places every class in the column of its range band', () => {
+    expect(new Set(MENU_ORDERED_CLASS_IDS).size).toBe(SOLDIER_CLASSES.length);
+    for (const soldier of SOLDIER_CLASSES) {
+      const cell = MENU_CLASS_GRID.find(c => c.id === soldier.id);
+      expect(cell, soldier.id).toBeDefined();
+      const role = MENU_ROLE_COLUMNS.find(r => r.range === soldier.range)!;
+      expect(role.cols, soldier.id).toContain(cell!.col);
+    }
+  });
+
+  it('fits the intel box and role headers in the roster panel without covering cards', () => {
+    const classPanel = MENU_LAYOUT_BOXES.find(b => b.id === 'class-panel')!;
+    const cards = getMenuClassCardBoxes();
+    const headers = MENU_ROLE_COLUMNS.map(r => ({ id: r.label, layer: 'classes' as const, ...getMenuRoleHeaderRect(r.cols) }));
+    for (const box of [MENU_INTEL_BOX, ...headers]) {
+      expect(box.x).toBeGreaterThanOrEqual(classPanel.x);
+      expect(box.y).toBeGreaterThanOrEqual(classPanel.y + 48);
+      expect(box.x + box.w).toBeLessThanOrEqual(classPanel.x + classPanel.w);
+      expect(box.y + box.h).toBeLessThanOrEqual(classPanel.y + classPanel.h);
+      for (const card of cards) {
+        expect(overlaps(box, card), `${box.id} overlaps ${card.id}`).toBe(false);
+      }
+    }
+  });
+
+  it('navigates the roster grid spatially with the arrow keys', () => {
+    const at = (id: string) => MENU_ORDERED_CLASS_IDS.indexOf(id);
+    expect(getMenuNeighbourIndex(at('shotgun'), 'down')).toBe(at('flamer'));
+    expect(getMenuNeighbourIndex(at('flamer'), 'right')).toBe(at('smg'));
+    expect(getMenuNeighbourIndex(at('smg'), 'right')).toBe(at('minigun'));
+    expect(getMenuNeighbourIndex(at('mortar'), 'right')).toBe(at('pistol'));
+    expect(getMenuNeighbourIndex(at('pistol'), 'left')).toBe(at('sniper'));
+    expect(getMenuNeighbourIndex(at('shotgun'), 'up')).toBe(at('shotgun'));
+    expect(getMenuNeighbourIndex(at('pistol'), 'right')).toBe(at('pistol'));
+  });
+
+  it('skips the close-range column when those classes are unavailable', () => {
+    const at = (id: string) => MENU_ORDERED_CLASS_IDS.indexOf(id);
+    const notClose = (id: string) => SOLDIER_CLASSES.find(s => s.id === id)!.range !== 'close';
+    expect(getMenuNeighbourIndex(at('rifle'), 'left', notClose)).toBe(at('rifle'));
+    expect(getMenuNeighbourIndex(at('carbine'), 'left', notClose)).toBe(at('carbine'));
   });
 });

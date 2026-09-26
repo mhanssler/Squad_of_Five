@@ -61,6 +61,8 @@ export class TouchControlsScene extends Phaser.Scene {
       const bg = this.fullscreenButton.getAt(0) as Phaser.GameObjects.Rectangle;
       if (bg.input) bg.input.enabled = touch;
     }
+    // On the squad screen the top-left corner holds the title, so tuck the button top-right.
+    this.fullscreenButton?.setPosition(ctx.phase === 'menu' ? 1250 : 30, 84);
     const defs = touch ? getTouchButtons(ctx) : [];
     const key = defs.map(d => `${d.id}:${d.label}`).join('|');
     if (key !== this.layoutKey) {

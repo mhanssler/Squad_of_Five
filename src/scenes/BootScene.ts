@@ -1,10 +1,12 @@
 import Phaser from 'phaser';
-import { fitScreenCamera, LOGICAL_HEIGHT, LOGICAL_WIDTH } from '../utils/Resolution';
+import { DISPLAY_SCALE, fitScreenCamera, LOGICAL_HEIGHT, LOGICAL_WIDTH } from '../utils/Resolution';
 import { createFactionTextures } from '../systems/FactionSprites';
 
 // Sprite size constant - 64x64 for better detail
 const SPRITE_SIZE = 64;
 const HALF = SPRITE_SIZE / 2;
+// Portraits are drawn at up to ~1.4x sprite size in logical pixels; bake them sharp for the display.
+const PORTRAIT_SCALE = Math.min(6, Math.max(2, Math.ceil(DISPLAY_SCALE * 1.5)));
 
 // Color constants for better contrast
 const ARMY_GREEN = 0x2d5016; // Dark army green for body
@@ -68,6 +70,17 @@ export class BootScene extends Phaser.Scene {
 
   create(): void {
     this.scene.start(new URLSearchParams(location.search).has('visual-test') ? 'VisualTestScene' : 'MenuScene');
+  }
+
+  /**
+   * Bake a soldier drawing into its normal 64px texture, plus a high-resolution `<key>@hi` copy
+   * for places that show soldiers large on screen (the squad selection portraits).
+   */
+  private bakeSoldierTexture(g: Phaser.GameObjects.Graphics, key: string): void {
+    g.generateTexture(key, SPRITE_SIZE, SPRITE_SIZE);
+    g.setScale(PORTRAIT_SCALE);
+    g.generateTexture(`${key}@hi`, SPRITE_SIZE * PORTRAIT_SCALE, SPRITE_SIZE * PORTRAIT_SCALE);
+    g.setScale(1);
   }
 
   private createPlaceholderAssets(): void {
@@ -290,7 +303,7 @@ export class BootScene extends Phaser.Scene {
     g.fillRect(cx - 8, 60, 8, 2);
     g.fillRect(cx, 60, 8, 2);
     
-    g.generateTexture('worm-rifle', SPRITE_SIZE, SPRITE_SIZE);
+    this.bakeSoldierTexture(g, 'worm-rifle');
     g.destroy();
   }
 
@@ -425,7 +438,7 @@ export class BootScene extends Phaser.Scene {
     g.fillRect(cx - 12, 60, 8, 2);
     g.fillRect(cx + 4, 60, 8, 2);
     
-    g.generateTexture('worm-grenade', SPRITE_SIZE, SPRITE_SIZE);
+    this.bakeSoldierTexture(g, 'worm-grenade');
     g.destroy();
   }
 
@@ -586,7 +599,7 @@ export class BootScene extends Phaser.Scene {
     g.fillStyle(BOOTS_HIGHLIGHT, 1);
     g.fillRect(cx + 5, 57, 3, 2);
     
-    g.generateTexture('worm-rocket', SPRITE_SIZE, SPRITE_SIZE);
+    this.bakeSoldierTexture(g, 'worm-rocket');
     g.destroy();
   }
 
@@ -745,7 +758,7 @@ export class BootScene extends Phaser.Scene {
     g.fillRect(cx - 9, 60, 8, 2);
     g.fillRect(cx + 1, 60, 8, 2);
     
-    g.generateTexture('worm-shotgun', SPRITE_SIZE, SPRITE_SIZE);
+    this.bakeSoldierTexture(g, 'worm-shotgun');
     g.destroy();
   }
 
@@ -930,7 +943,7 @@ export class BootScene extends Phaser.Scene {
     g.fillStyle(BOOTS_HIGHLIGHT, 1);
     g.fillRect(cx + 9, 55, 3, 2);
     
-    g.generateTexture('worm-sniper', SPRITE_SIZE, SPRITE_SIZE);
+    this.bakeSoldierTexture(g, 'worm-sniper');
     g.destroy();
   }
 
@@ -1059,7 +1072,7 @@ export class BootScene extends Phaser.Scene {
     g.fillRect(cx - 5, 49, 3, 2);
     g.fillRect(cx + 7, 55, 3, 2);
     
-    g.generateTexture('worm-mortar', SPRITE_SIZE, SPRITE_SIZE);
+    this.bakeSoldierTexture(g, 'worm-mortar');
     g.destroy();
   }
 
@@ -1183,7 +1196,7 @@ export class BootScene extends Phaser.Scene {
     g.fillRect(cx - 7, 55, 3, 2);
     g.fillRect(cx + 1, 55, 3, 2);
     
-    g.generateTexture('worm-flamer', SPRITE_SIZE, SPRITE_SIZE);
+    this.bakeSoldierTexture(g, 'worm-flamer');
     g.destroy();
   }
 
@@ -1300,7 +1313,7 @@ export class BootScene extends Phaser.Scene {
     g.fillRect(cx - 7, 55, 4, 3);
     g.fillRect(cx + 1, 55, 4, 3);
     
-    g.generateTexture('worm-pistol', SPRITE_SIZE, SPRITE_SIZE);
+    this.bakeSoldierTexture(g, 'worm-pistol');
     g.destroy();
   }
 
@@ -1434,7 +1447,7 @@ export class BootScene extends Phaser.Scene {
     g.fillRect(cx - 8, 55, 3, 2);
     g.fillRect(cx + 2, 55, 3, 2);
     
-    g.generateTexture('worm-smg', SPRITE_SIZE, SPRITE_SIZE);
+    this.bakeSoldierTexture(g, 'worm-smg');
     g.destroy();
   }
 
@@ -1584,7 +1597,7 @@ export class BootScene extends Phaser.Scene {
     g.fillRect(cx - 11, 59, 4, 2);
     g.fillRect(cx + 3, 59, 4, 2);
     
-    g.generateTexture('worm-minigun', SPRITE_SIZE, SPRITE_SIZE);
+    this.bakeSoldierTexture(g, 'worm-minigun');
     g.destroy();
   }
 
@@ -1680,7 +1693,7 @@ export class BootScene extends Phaser.Scene {
     g.fillRect(cx - 8, 60, 8, 2);
     g.fillRect(cx, 60, 8, 2);
     
-    g.generateTexture('worm', SPRITE_SIZE, SPRITE_SIZE);
+    this.bakeSoldierTexture(g, 'worm');
     g.destroy();
   }
 }

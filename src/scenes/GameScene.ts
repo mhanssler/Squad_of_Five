@@ -7,6 +7,7 @@ import { Terrain } from '../systems/Terrain';
 import { TurnManager, Team } from '../systems/TurnManager';
 import { Projectile, createProjectile } from '../entities/Projectile';
 import { ALL_WEAPON_TYPES, WeaponConfig, WeaponType, WEAPONS } from '../systems/WeaponTypes';
+import { BASE_MOVEMENT_DISTANCE, CLOSE_RANGE_MOVEMENT_FLOOR } from '../systems/ClassStats';
 import { SoundManager } from '../utils/SoundManager';
 import {
   GameMode,
@@ -76,7 +77,6 @@ import {
 } from '../systems/AITactics';
 
 // Base movement distance (modified by weapon weight)
-const BASE_MOVEMENT_DISTANCE = 320;
 const POWER_MIN = 10;
 // One deliberate pass to full power gives the player a readable release window.
 const POWER_CHARGE_PER_SECOND = 32;
@@ -2146,23 +2146,7 @@ private startParatrooperDrop(): void {
   }
 
   private getCloseRangeMovementFloor(type: WeaponType): number {
-    switch (type) {
-      case WeaponType.FLAMER:
-        return 360;
-      case WeaponType.SHOTGUN:
-        return 340;
-      case WeaponType.SMG:
-      case WeaponType.CARBINE:
-        return 390;
-      case WeaponType.PISTOL:
-        return 380;
-      case WeaponType.SLUG:
-        return 340;
-      case WeaponType.DEMO:
-        return 300;
-      default:
-        return 0;
-    }
+    return CLOSE_RANGE_MOVEMENT_FLOOR[type] ?? 0;
   }
 
   private getSoldierMoveSpeed(type: WeaponType): number {
